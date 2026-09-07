@@ -178,7 +178,7 @@ wheels = [
 [[package]]
 name = "chiral"
 version = "0.1.0"
-source = { git = "ssh://git@github.com/TRI-ML/chiral#f7293d7ddf2209da8d49922dddb2f1f1bc9b4454" }
+source = { git = "https://github.com/TRI-ML/chiral#f7293d7ddf2209da8d49922dddb2f1f1bc9b4454" }
 dependencies = [
     { name = "eclipse-zenoh" },
     { name = "msgpack" },
@@ -1593,6 +1593,12 @@ wheels = [
 ]
 
 [[package]]
+name = "pure-python-adb"
+version = "0.3.0.dev0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0a/b7/1c4d6b2cbe499b4180177abcf3ae2bb2d8b36acf695ae7d8e9eb99ba00ea/pure-python-adb-0.3.0.dev0.tar.gz", hash = "sha256:0ecc89d780160cfe03260ba26df2c471a05263b2cad0318363573ee8043fb94d", size = 25680, upload-time = "2020-08-05T18:41:27.157Z" }
+
+[[package]]
 name = "pyarrow"
 version = "23.0.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1931,6 +1937,7 @@ dependencies = [
     { name = "numpy" },
     { name = "onnxscript" },
     { name = "opencv-contrib-python" },
+    { name = "pure-python-adb" },
     { name = "pyrealsense2" },
     { name = "pyroki" },
     { name = "pysondb" },
@@ -1990,7 +1997,7 @@ zed = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.42.66" },
-    { name = "chiral", git = "ssh://git@github.com/TRI-ML/chiral" },
+    { name = "chiral", git = "https://github.com/TRI-ML/chiral" },
     { name = "i2rt", directory = "third_party/i2rt" },
     { name = "iterfzf", specifier = ">=1.4.0" },
     { name = "jax" },
@@ -2012,6 +2019,7 @@ requires-dist = [
     { name = "onnxscript", marker = "extra == 'ffs-trt-cu12'", specifier = ">=0.6.2" },
     { name = "onnxscript", marker = "extra == 'ffs-trt-cu13'", specifier = ">=0.6.2" },
     { name = "opencv-contrib-python", specifier = ">=4.8" },
+    { name = "pure-python-adb", specifier = ">=0.3.0.dev0" },
     { name = "pyrealsense2", specifier = ">=2.56.5.9235" },
     { name = "pyrealsense2", marker = "extra == 'realsense'", specifier = ">=2.54" },
     { name = "pyroki", git = "https://github.com/chungmin99/pyroki.git" },

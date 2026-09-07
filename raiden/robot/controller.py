@@ -60,6 +60,8 @@ __all__ = [
 
 # Default home positions
 FOLLOWER_HOME_POS = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])  # 6 joints + gripper
+# Unfolded start pose for Cartesian teleop (elbow bent, clear of joint limits).
+CARTESIAN_READY_POSE = np.array([0.0, 1.0, 1.0, 0.0, 0.0, 0.0])
 LEADER_HOME_POS = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # 6 joints only
 
 # Follower PD gains — explicitly defined so recording, replay, and serving all
@@ -970,6 +972,141 @@ class RobotController:
                     thread.join(timeout=1.0)
                 self._teleop_threads.clear()
         self.stop_spacemouse_teleop()
+        self.stop_cartesian_teleop()
+
+    # -------------------------------------------------------------------------
+    # Cartesian pose teleop (Quest controllers)
+    # -------------------------------------------------------------------------
+
+    def _build_ik_mink(self, dt: float, site: str = "grasp_site"):
+        """Differential IK with mink on the YAM MuJoCo model (i2rt joint order).
+
+        Returns ``(fk, ik_step)``: ``fk(q6) -> 4x4`` site pose in the arm base
+        frame and ``ik_step(q6, T_target) -> q6`` (one velocity-IK QP step).
+        """
+        import mink
+        import mujoco
+
+        model = mujoco.MjModel.from_xml_path(_ARM_YAM_XML_PATH)
+        cfg = mink.Configuration(model)
+        task = mink.FrameTask(
+            frame_name=site,
+            frame_type="site",
+            position_cost=1.0,
+            orientation_cost=0.3,
+            lm_damping=1.0,
+            gain=0.15,
+        )
+        # Weak posture pull toward a bent elbow keeps the arm out of the fully
+        # extended singularity, where the end-effector task can no longer retract.
+        posture = mink.PostureTask(model, cost=1e-3)
+        posture.set_target(CARTESIAN_READY_POSE)
+        joints = [
+            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i)
+            for i in range(model.njnt)
+        ]
+        limits = [
+            mink.ConfigurationLimit(model),
+            mink.VelocityLimit(model, {j: 2.5 for j in joints}),
+        ]
+        lock = threading.Lock()
+
+        def fk(q: np.ndarray) -> np.ndarray:
+            with lock:
+                cfg.update(np.asarray(q, dtype=np.float64))
+                return cfg.get_transform_frame_to_world(site, "site").as_matrix()
+
+        def ik_step(q: np.ndarray, T_target: np.ndarray) -> np.ndarray:
+            with lock:
+                cfg.update(np.asarray(q, dtype=np.float64))
+                task.set_target(mink.SE3.from_matrix(T_target))
+                vel = mink.solve_ik(
+                    cfg, [task, posture], dt, "daqp", damping=1e-3, limits=limits
+                )
+                cfg.integrate_inplace(vel, dt)
+                return cfg.q.copy()
+
+        return fk, ik_step
+
+    def start_cartesian_teleop(self, target_fn, dt: float = 0.01) -> None:
+        """Start one IK loop per follower driven by ``target_fn``.
+
+        ``target_fn(side, T_current, gripper_actual) -> (T_target, gripper) | None``
+        is called every ``dt`` with the arm's current end-effector pose (4x4, arm
+        base frame) and gripper opening (0..1).  Return None to hold the arm
+        where it is, or a new pose target plus gripper opening.  It runs on the
+        control thread and must be fast and thread-safe.
+        """
+        self._cartesian_shutdown = threading.Event()
+        self._cartesian_threads: list = []
+        for side, follower in (("right", self.follower_r), ("left", self.follower_l)):
+            if follower is None:
+                continue
+            t = threading.Thread(
+                target=self._cartesian_control_loop,
+                args=(side, target_fn, dt),
+                name=f"cartesian-{side}",
+                daemon=True,
+            )
+            t.start()
+            self._cartesian_threads.append(t)
+        print("✓ Cartesian teleop active")
+
+    def stop_cartesian_teleop(self) -> None:
+        if hasattr(self, "_cartesian_shutdown"):
+            self._cartesian_shutdown.set()
+            for t in getattr(self, "_cartesian_threads", []):
+                t.join(timeout=1.0)
+            self._cartesian_threads = []
+
+    def _cartesian_control_loop(self, side: str, target_fn, dt: float) -> None:
+        follower = self.follower_r if side == "right" else self.follower_l
+        fk, ik_step = self._build_ik_mink(dt)
+        q_arm = follower.get_joint_pos()[:6].copy()
+        hold_pos: Optional[np.ndarray] = None
+        was_paused = False
+
+        while not self._cartesian_shutdown.is_set():
+            try:
+                loop_start = time.monotonic()
+
+                # --- soft pause (footpedal e-stop) ---
+                if time.monotonic() < self._pause_until:
+                    if not was_paused:
+                        hold_pos = follower.get_joint_pos().copy()
+                        was_paused = True
+                    follower.command_joint_pos(hold_pos)
+                    time.sleep(dt)
+                    continue
+                if self._session_estop_event.is_set():
+                    break
+                if was_paused:
+                    q_arm = follower.get_joint_pos()[:6].copy()
+                    was_paused = False
+
+                gripper_actual = follower.get_joint_pos()[6]
+                result = target_fn(side, fk(q_arm), gripper_actual)
+                if result is None:
+                    # Hold the virtual pose so the arm stays put without drifting.
+                    cmd = np.append(q_arm, gripper_actual)
+                else:
+                    T_target, gripper = result
+                    q_arm = ik_step(q_arm, T_target)
+                    gripper = np.clip(
+                        gripper,
+                        gripper_actual - 0.9 * _GRIPPER_SAFETY_THRESHOLD,
+                        gripper_actual + 0.9 * _GRIPPER_SAFETY_THRESHOLD,
+                    )
+                    cmd = np.append(q_arm, float(np.clip(gripper, 0.0, 1.0)))
+                follower.command_joint_pos(cmd)
+                self._last_commanded_pos[side] = cmd.copy()
+
+                remaining = dt - (time.monotonic() - loop_start)
+                if remaining > 0:
+                    time.sleep(remaining)
+            except Exception as e:
+                print(f"  Cartesian {side} loop error: {e}")
+                time.sleep(dt)
 
     # -------------------------------------------------------------------------
     # SpaceMouse Cartesian velocity teleop

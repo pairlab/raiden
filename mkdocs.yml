@@ -58,6 +58,7 @@ nav:
     - "4. Calibration": guide/calibration.md
     - "5. Console": guide/console.md
     - "6. Recording": guide/recording.md
+    - Quest Teleop: guide/oculus_teleop.md
     - "7. Conversion": guide/conversion.md
     - "8. Shardify": guide/shardify.md
     - "9. Evaluation": guide/serve.md

@@ -31,8 +31,8 @@ from raiden.visualizer import select_task_and_episode, visualize_recording
 class TeleopCommand:
     """Start bimanual teleoperation with improved synchronization"""
 
-    control: Literal["leader", "spacemouse"] = "leader"
-    """Control mode: leader-follower arms or SpaceMouse EE velocity control"""
+    control: Literal["leader", "spacemouse", "oculus"] = "leader"
+    """Control mode: leader-follower arms, SpaceMouse EE velocity, or Quest controllers"""
 
     arms: Literal["bimanual", "single"] = "bimanual"
     """Which arms to use: both (bimanual) or left arm only (single)"""
@@ -55,13 +55,25 @@ class TeleopCommand:
     invert_rotation: bool = False
     """Negate all SpaceMouse rotation axes (spacemouse mode only)"""
 
+    oculus_hand: Literal["l", "r"] = "l"
+    """Quest controller driving the left arm (oculus mode; the right arm always uses the right controller)"""
+
+    oculus_pos_scale: float = 0.7
+    """Robot metres per controller metre (oculus mode only)"""
+
+    oculus_rot_scale: float = 0.5
+    """Controller rotation gain 0..1; 0 = translation only (oculus mode only)"""
+
+    oculus_ip: str = ""
+    """Quest IP for Wi-Fi ADB; empty = USB (oculus mode only)"""
+
 
 @dataclass
 class RecordCommand:
     """Record a demonstration with cameras and robot data"""
 
-    control: Literal["leader", "spacemouse"] = "leader"
-    """Control mode: leader-follower arms or SpaceMouse EE velocity control"""
+    control: Literal["leader", "spacemouse", "oculus"] = "leader"
+    """Control mode: leader-follower arms, SpaceMouse EE velocity, or Quest controllers"""
 
     data_dir: str = "data"
     """Root data directory (default: ./data); episodes go to <data_dir>/raw/<task>/"""
@@ -86,6 +98,18 @@ class RecordCommand:
 
     invert_rotation: bool = False
     """Negate all SpaceMouse rotation axes (spacemouse mode only)"""
+
+    oculus_hand: Literal["l", "r"] = "l"
+    """Quest controller driving the left arm (oculus mode; the right arm always uses the right controller)"""
+
+    oculus_pos_scale: float = 0.7
+    """Robot metres per controller metre (oculus mode only)"""
+
+    oculus_rot_scale: float = 0.5
+    """Controller rotation gain 0..1; 0 = translation only (oculus mode only)"""
+
+    oculus_ip: str = ""
+    """Quest IP for Wi-Fi ADB; empty = USB (oculus mode only)"""
 
     arms: Literal["bimanual", "single"] = "bimanual"
     """Which arms to use: both (bimanual) or left arm only (single)"""
@@ -165,8 +189,8 @@ class RecordCalibrationPosesCommand:
     output_file: str = CALIBRATION_POSES_FILE
     """Path to save calibration poses"""
 
-    control: Literal["leader", "spacemouse"] = "leader"
-    """Control mode: leader-follower arms or SpaceMouse EE velocity control"""
+    control: Literal["leader", "spacemouse", "oculus"] = "leader"
+    """Control mode: leader-follower arms, SpaceMouse EE velocity, or Quest controllers"""
 
     spacemouse_path_r: str = "/dev/hidraw7"
     """hidraw path for the right-arm SpaceMouse (spacemouse mode only)"""
@@ -455,6 +479,10 @@ def main():
                 rot_scale=command.rot_scale,
                 invert_rotation=command.invert_rotation,
                 arms=command.arms,
+                oculus_hand=command.oculus_hand,
+                oculus_pos_scale=command.oculus_pos_scale,
+                oculus_rot_scale=command.oculus_rot_scale,
+                oculus_ip=command.oculus_ip,
             )  # teleop builds its own interface internally via build_interface()
 
         elif subcommand == "record":
@@ -478,6 +506,10 @@ def main():
                     vel_scale=command.vel_scale,
                     rot_scale=command.rot_scale,
                     invert_rotation=command.invert_rotation,
+                    oculus_hand=command.oculus_hand,
+                    oculus_pos_scale=command.oculus_pos_scale,
+                    oculus_rot_scale=command.oculus_rot_scale,
+                    oculus_ip=command.oculus_ip,
                 ),
                 arms=command.arms,
                 data_dir=command.data_dir,

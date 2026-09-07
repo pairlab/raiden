@@ -18,6 +18,10 @@ def run_bimanual_teleop(
     rot_scale: float = 3.0,
     invert_rotation: bool = False,
     arms: str = "bimanual",
+    oculus_hand: str = "l",
+    oculus_pos_scale: float = 0.7,
+    oculus_rot_scale: float = 0.5,
+    oculus_ip: str = "",
 ):
     """Run the bimanual teleoperation system"""
 
@@ -31,6 +35,10 @@ def run_bimanual_teleop(
         vel_scale=vel_scale,
         rot_scale=rot_scale,
         invert_rotation=invert_rotation,
+        oculus_hand=oculus_hand,
+        oculus_pos_scale=oculus_pos_scale,
+        oculus_rot_scale=oculus_rot_scale,
+        oculus_ip=oculus_ip,
     )
 
     robot_controller = RobotController(
