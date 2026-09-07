@@ -45,7 +45,7 @@ tri-stereo-trt-cu12 = ["kornia>=0.7", "tensorrt-cu12"]
 tri-stereo-trt-cu13 = ["kornia>=0.7", "tensorrt-cu13"]
 docs = [
   "mkdocs>=1.5,<2.0",
-  "mkdocs-material>=9.0",
+  "mkdocs-material>=9.7.7",
   "mkdocstrings[python]>=0.24",
 ]
 
