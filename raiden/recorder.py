@@ -608,6 +608,8 @@ def _wait_for_verdict(
     lines += ["    Middle pedal → success", "    Right pedal  → failure"]
     if interface.supports_verdict_button:
         lines += ["    Top button    → success", "    Bottom button → failure"]
+    if interface.verdict_hint:
+        lines += [interface.verdict_hint]
     lines += ["    Enter → success   f → failure   other key → skip"]
     print("\n".join(lines))
     print("-" * 60 + "\n")

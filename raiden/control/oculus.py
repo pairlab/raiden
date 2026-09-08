@@ -8,7 +8,10 @@ hand controllers are used.  Button layout follows pairlab/mesa-env:
 * hold trigger ............ clutch: the end-effector follows the controller
                             relative to where the trigger was pressed.
 * hold grip ............... gripper closed; release to open.
-* A (X) ................... trigger event (start/stop recording, record pose).
+* A (X) ................... trigger event (start/stop recording, record pose);
+                            after a recording stops, marks it a success.
+* joystick click / B (Y) .. while recording or awaiting the verdict: stop and
+                            mark the recording a failure.
 
 Targets are tracked by mink IK on the YAM MuJoCo model (gripper-tip
 ``grasp_site``) in ``RobotController.start_cartesian_teleop``.
@@ -24,7 +27,6 @@ from scipy.spatial.transform import Rotation
 
 from raiden._config import CONFIG_DIR
 from raiden.control.base import TeleopInterface
-from raiden.robot.controller import CARTESIAN_READY_POSE, smooth_move_joints
 from raiden.robot.footpedal import (
     PEDAL_LEFT,
     PEDAL_MIDDLE,
@@ -88,6 +90,8 @@ class OculusInterface(TeleopInterface):
         self._tracking: Dict[str, str] = {}
         self._stop = threading.Event()
         self._event = threading.Event()
+        self._failure = threading.Event()
+        self._phase: Optional[str] = None  # None | "recording" | "verdict"
         self._saved_R = self._load_calibration()
         self._reset_state()
 
@@ -174,26 +178,11 @@ class OculusInterface(TeleopInterface):
     # ------------------------------------------------------------------
 
     def setup(self, robot_controller) -> None:
-        # The all-zero home pose is folded against two joint limits; unfold first.
-        print("  - Moving to teleop ready pose (3 s)...", flush=True)
-        threads = []
-        for follower in (robot_controller.follower_r, robot_controller.follower_l):
-            if follower is None:
-                continue
-            target = np.append(CARTESIAN_READY_POSE, follower.get_joint_pos()[6])
-            t = threading.Thread(
-                target=smooth_move_joints,
-                args=(follower, target),
-                kwargs={"time_interval_s": 3.0, "steps": 300},
-                daemon=True,
-            )
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join()
+        """Teleop starts from the home pose; nothing to do."""
 
     def start(self, robot_controller) -> None:
         self._reset_state()
+        self._phase = None
         robot_controller.start_cartesian_teleop(self._target_fn, dt=_DT)
         self._stop.clear()
         threading.Thread(
@@ -202,7 +191,12 @@ class OculusInterface(TeleopInterface):
 
     def stop(self, robot_controller) -> None:
         self._stop.set()
+        self._phase = None
         robot_controller.stop_cartesian_teleop()
+
+    def set_active_recording(self, robot_controller=None) -> None:
+        super().set_active_recording(robot_controller)
+        self._phase = "recording" if robot_controller is not None else "verdict"
 
     def _tracking_loop(self) -> None:
         """Poll the OS tracking state ~1 Hz; it gates the clutch (see _target_fn)."""
@@ -242,9 +236,12 @@ class OculusInterface(TeleopInterface):
             return None
         pressed = lambda key: bool(buttons.get(key, False))
 
-        # Joystick click / B (rising edge): start calibration.
+        # Joystick click / B (rising edge): mark failure during an episode,
+        # otherwise start calibration.
         calib = any(pressed(k) for k in keys["calib"])
-        if calib and not self._prev[hand]["calib"] and self._calib[hand] is None:
+        if calib and not self._prev[hand]["calib"] and self._phase is not None:
+            self._failure.set()
+        elif calib and not self._prev[hand]["calib"] and self._calib[hand] is None:
             self._calib[hand] = {"stage": "x", "start": None}
             self._origin[hand] = None
             print(
@@ -420,6 +417,10 @@ class OculusInterface(TeleopInterface):
         return False
 
     def poll_success(self, robot_controller) -> bool:
+        if self._phase == "verdict" and self._event.is_set():
+            self._event.clear()
+            self._phase = None
+            return True
         ev = getattr(self, "_pedal_success", None)
         if ev is not None and ev.is_set():
             ev.clear()
@@ -427,11 +428,19 @@ class OculusInterface(TeleopInterface):
         return False
 
     def poll_failure(self, robot_controller) -> bool:
+        if self._failure.is_set():
+            self._failure.clear()
+            self._phase = None
+            return True
         ev = getattr(self, "_pedal_failure", None)
         if ev is not None and ev.is_set():
             ev.clear()
             return True
         return False
+
+    @property
+    def verdict_hint(self) -> str:
+        return "    A/X → success   joystick or B/Y → failure"
 
     @property
     def banner(self) -> str:
@@ -442,6 +451,7 @@ class OculusInterface(TeleopInterface):
             "  2. Press the joystick (or B/Y): hold A/X, move along robot +x, release;\n"
             "     hold A/X, move along robot +y, release\n"
             "  3. HOLD TRIGGER to move the arm; HOLD GRIP to close the gripper\n"
+            "  A/X stops the recording (press again = success); joystick/B/Y = failure\n"
             "  Press Ctrl+C for EMERGENCY STOP (hold 5 s, then go home)\n\n"
             + "=" * 60
             + "\n"

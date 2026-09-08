@@ -91,6 +91,11 @@ class TeleopInterface(ABC):
         return self.uses_leaders
 
     @property
+    def verdict_hint(self) -> str:
+        """Extra line(s) for the success/failure prompt, e.g. device buttons."""
+        return ""
+
+    @property
     def supports_verdict_button(self) -> bool:
         """True if leader-arm buttons can be used to mark success/failure."""
         return self.uses_leaders
