@@ -19,6 +19,7 @@ Processed (``lowdim/<frame>.pkl``)
     back to right-arm base coordinates using the bimanual calibration before IK.
 """
 
+import json
 import pickle
 import threading
 import time
@@ -51,6 +52,31 @@ def _load_raw_joints(
     joints_r = joints_r_raw.astype(np.float32) if joints_r_raw is not None else None
     timestamps = data["timestamps"].astype(np.int64)
     return joints_l, joints_r, timestamps
+
+
+def _sanitize_timestamps(timestamps: np.ndarray, ep_dir: Path) -> np.ndarray:
+    """Replace unusable timestamps with uniform spacing over the recorded duration.
+
+    Robot frames are stamped with the reference camera's latest frame time, so a
+    stalled camera yields duplicate or non-monotonic stamps that would make the
+    replay run at the wrong speed.
+    """
+    dt = np.diff(timestamps)
+    n_dup = int((dt == 0).sum())
+    if (dt < 0).any() or n_dup > 0.1 * len(dt):
+        meta_path = ep_dir / "metadata.json"
+        duration_s = None
+        if meta_path.exists():
+            with open(meta_path) as f:
+                duration_s = json.load(f).get("duration_s")
+        if not duration_s:
+            duration_s = len(timestamps) / 100.0
+        print(
+            f"Warning: {n_dup} duplicate / {(dt < 0).sum()} non-monotonic timestamps; "
+            f"using uniform spacing over {duration_s:.1f} s from metadata"
+        )
+        return (timestamps[0] + np.linspace(0, duration_s * 1e9, len(timestamps))).astype(np.int64)
+    return timestamps
 
 
 def _resample_joints(
@@ -315,6 +341,7 @@ def _run_raw_replay(
 ) -> None:
     """Replay directly from raw joint commands in robot_data.npz (no IK)."""
     joints_l, joints_r, timestamps = _load_raw_joints(recording_dir)
+    timestamps = _sanitize_timestamps(timestamps, recording_dir)
     use_right = arms == "bimanual" and joints_r is not None
 
     if stride > 1:
