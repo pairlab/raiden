@@ -49,6 +49,7 @@ docs = [
   "mkdocs-material>=9.0",
   "mkdocstrings[python]>=0.24",
 ]
+lerobot = ["lerobot>=0.4"]
 
 [project.scripts]
 rd = "raiden.cli:main"
