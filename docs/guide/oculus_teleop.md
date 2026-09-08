@@ -20,7 +20,7 @@ controller buttons in parentheses.
 
 | Input | Action |
 |---|---|
-| Joystick click or B (Y) | Calibrate headset→robot axes: hold A (X) and move ~20 cm along the robot's +x, release; hold A (X) and move along the robot's +y, release. Once per session. |
+| Joystick click or B (Y) | Calibrate headset→robot axes: hold A (X) and move ~20 cm along the robot's +x, release; hold A (X) and move along the robot's +y, release. Saved to `~/.config/raiden/oculus_calibration.json` and reused; redo it if the headset moves. |
 | Hold trigger | Clutch: the end-effector follows the controller relative to where you pressed. Release to re-position your hand. |
 | Hold grip | Gripper closed; release to open. |
 | A (X) | Trigger event (start/stop recording, record calibration pose). |

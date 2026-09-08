@@ -14,6 +14,7 @@ Targets are tracked by mink IK on the YAM MuJoCo model (gripper-tip
 ``grasp_site``) in ``RobotController.start_cartesian_teleop``.
 """
 
+import json
 import threading
 import time
 from typing import Dict, Optional, Tuple
@@ -21,6 +22,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from raiden._config import CONFIG_DIR
 from raiden.control.base import TeleopInterface
 from raiden.robot.controller import CARTESIAN_READY_POSE, smooth_move_joints
 from raiden.robot.footpedal import (
@@ -56,6 +58,7 @@ _MAX_LEAD_ROT = 0.5  # rad
 _MAX_REACH = 0.74  # m gripper tip from the shoulder (max 0.81); keeps the arm off full extension
 _SHOULDER = np.array([0.0, 0.0, 0.067])
 _DT = 0.01
+_CALIB_FILE = CONFIG_DIR / "oculus_calibration.json"
 
 
 class OculusInterface(TeleopInterface):
@@ -85,12 +88,13 @@ class OculusInterface(TeleopInterface):
         self._tracking: Dict[str, str] = {}
         self._stop = threading.Event()
         self._event = threading.Event()
+        self._saved_R = self._load_calibration()
         self._reset_state()
 
     def _reset_state(self) -> None:
         hands = ("l", "r")
         self._R: Dict[str, Optional[np.ndarray]] = {
-            h: None for h in hands
+            h: self._saved_R.get(h) for h in hands
         }  # headset -> robot axes
         self._calib: Dict[str, Optional[dict]] = {h: None for h in hands}
         self._origin: Dict[str, Optional[Tuple[np.ndarray, np.ndarray]]] = {
@@ -124,6 +128,10 @@ class OculusInterface(TeleopInterface):
             )
         else:
             print("  ✓ Quest controllers streaming")
+        if self._saved_R:
+            print(
+                f"  ✓ Using saved calibration ({_CALIB_FILE}); press the joystick (or B/Y) to redo it"
+            )
 
         self._pedal_trigger = threading.Event()
         self._pedal_success = threading.Event()
@@ -350,10 +358,25 @@ class OculusInterface(TeleopInterface):
         else:
             self._R[hand] = np.array([c["x"], axis, np.cross(c["x"], axis)])
             self._calib[hand] = None
+            self._save_calibration(hand)
             print(
                 f"  [Oculus {hand.upper()}] calibrated. Hold the trigger to move the arm.",
                 flush=True,
             )
+
+    @staticmethod
+    def _load_calibration() -> Dict[str, np.ndarray]:
+        try:
+            with open(_CALIB_FILE) as f:
+                return {h: np.array(R, dtype=np.float64) for h, R in json.load(f).items()}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_calibration(self, hand: str) -> None:
+        self._saved_R[hand] = self._R[hand]
+        _CALIB_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_CALIB_FILE, "w") as f:
+            json.dump({h: R.tolist() for h, R in self._saved_R.items()}, f)
 
     def _to_robot(self, hand: str, T: np.ndarray) -> np.ndarray:
         R = self._R[hand]
