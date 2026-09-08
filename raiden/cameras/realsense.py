@@ -226,21 +226,6 @@ class RealSenseCamera(Camera):
         except RuntimeError:
             return False
 
-    def get_current_timestamp_ns(self) -> int:
-        """Return the capture timestamp of the most recently grabbed frame.
-
-        With global_time_enabled the RealSense SDK stamps frames with system
-        wall-clock time, so this is on the same clock as time.time_ns() and
-        can be used directly to align robot data with camera frames.
-        """
-        if self._latest_frames is not None:
-            frame = self._latest_frames.get_color_frame()
-            if frame:
-                return int(frame.get_timestamp() * 1_000_000)
-        import time
-
-        return time.time_ns()
-
     def get_frame(self) -> CameraFrame:
         if self._latest_frames is None:
             raise RuntimeError("No frames available. Call grab() first.")
