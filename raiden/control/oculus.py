@@ -53,7 +53,7 @@ _STALE_AFTER = 0.5  # s without controller data -> hold the arm
 _SMOOTHING_TAU = 0.05  # s low-pass on the controller pose
 _MAX_LEAD_POS = 0.15  # m the IK target may lead the arm (bounds peak speed)
 _MAX_LEAD_ROT = 0.5  # rad
-_MAX_REACH = 0.55  # m from the shoulder; keeps the arm off full extension
+_MAX_REACH = 0.74  # m gripper tip from the shoulder (max 0.81); keeps the arm off full extension
 _SHOULDER = np.array([0.0, 0.0, 0.067])
 _DT = 0.01
 

@@ -987,8 +987,19 @@ class RobotController:
         import mink
         import mujoco
 
-        model = mujoco.MjModel.from_xml_path(_ARM_YAM_XML_PATH)
+        from raiden._xml_paths import get_yam_4310_linear_xml_path
+
+        # Arm + gripper model: grasp_site is the gripper tip and joint6 has the
+        # physical sign (the bare arm XML flips it).  Gripper joints stay at zero.
+        model = mujoco.MjModel.from_xml_path(get_yam_4310_linear_xml_path())
         cfg = mink.Configuration(model)
+        nq = model.nq
+
+        def _pad(q6: np.ndarray) -> np.ndarray:
+            q = np.zeros(nq, dtype=np.float64)
+            q[:6] = q6
+            return q
+
         task = mink.FrameTask(
             frame_name=site,
             frame_type="site",
@@ -1000,7 +1011,7 @@ class RobotController:
         # Weak posture pull toward a bent elbow keeps the arm out of the fully
         # extended singularity, where the end-effector task can no longer retract.
         posture = mink.PostureTask(model, cost=1e-3)
-        posture.set_target(CARTESIAN_READY_POSE)
+        posture.set_target(_pad(CARTESIAN_READY_POSE))
         joints = [
             mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i)
             for i in range(model.njnt)
@@ -1013,18 +1024,19 @@ class RobotController:
 
         def fk(q: np.ndarray) -> np.ndarray:
             with lock:
-                cfg.update(np.asarray(q, dtype=np.float64))
+                cfg.update(_pad(np.asarray(q, dtype=np.float64)))
                 return cfg.get_transform_frame_to_world(site, "site").as_matrix()
 
         def ik_step(q: np.ndarray, T_target: np.ndarray) -> np.ndarray:
             with lock:
-                cfg.update(np.asarray(q, dtype=np.float64))
+                cfg.update(_pad(np.asarray(q, dtype=np.float64)))
                 task.set_target(mink.SE3.from_matrix(T_target))
                 vel = mink.solve_ik(
                     cfg, [task, posture], dt, "daqp", damping=1e-3, limits=limits
                 )
+                vel[6:] = 0.0
                 cfg.integrate_inplace(vel, dt)
-                return cfg.q.copy()
+                return cfg.q[:6].copy()
 
         return fk, ik_step
 
