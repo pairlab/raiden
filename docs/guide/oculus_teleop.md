@@ -24,7 +24,7 @@ controller buttons in parentheses.
 | Hold trigger | Clutch: the end-effector follows the controller relative to where you pressed. Release to re-position your hand. |
 | Hold grip | Gripper closed; release to open. |
 | A (X) | Trigger event (start/stop recording, record calibration pose). After a recording stops, marks it a success. |
-| Joystick click or B (Y) while recording | Stop and mark the recording a failure (also answers the success/failure prompt). |
+| Joystick click or B (Y) at the success/failure prompt | Mark the recording a failure. |
 | Ctrl-C | Emergency stop: hold 5 s, then return home. |
 
 The arm starts from its home pose and holds until the clutch is engaged

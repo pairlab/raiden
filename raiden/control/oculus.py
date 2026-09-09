@@ -10,8 +10,7 @@ hand controllers are used.  Button layout follows pairlab/mesa-env:
 * hold grip ............... gripper closed; release to open.
 * A (X) ................... trigger event (start/stop recording, record pose);
                             after a recording stops, marks it a success.
-* joystick click / B (Y) .. while recording or awaiting the verdict: stop and
-                            mark the recording a failure.
+* joystick click / B (Y) .. at the success/failure prompt: mark it a failure.
 
 Targets are tracked by mink IK on the YAM MuJoCo model (gripper-tip
 ``grasp_site``) in ``RobotController.start_cartesian_teleop``.
@@ -236,10 +235,10 @@ class OculusInterface(TeleopInterface):
             return None
         pressed = lambda key: bool(buttons.get(key, False))
 
-        # Joystick click / B (rising edge): mark failure during an episode,
-        # otherwise start calibration.
+        # Joystick click / B (rising edge): failure verdict after a recording
+        # stops, otherwise start calibration.
         calib = any(pressed(k) for k in keys["calib"])
-        if calib and not self._prev[hand]["calib"] and self._phase is not None:
+        if calib and not self._prev[hand]["calib"] and self._phase == "verdict":
             self._failure.set()
         elif calib and not self._prev[hand]["calib"] and self._calib[hand] is None:
             self._calib[hand] = {"stage": "x", "start": None}
@@ -451,7 +450,7 @@ class OculusInterface(TeleopInterface):
             "  2. Press the joystick (or B/Y): hold A/X, move along robot +x, release;\n"
             "     hold A/X, move along robot +y, release\n"
             "  3. HOLD TRIGGER to move the arm; HOLD GRIP to close the gripper\n"
-            "  A/X stops the recording (press again = success); joystick/B/Y = failure\n"
+            "  A/X stops the recording; then A/X = success, joystick/B/Y = failure\n"
             "  Press Ctrl+C for EMERGENCY STOP (hold 5 s, then go home)\n\n"
             + "=" * 60
             + "\n"
