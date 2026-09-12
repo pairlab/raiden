@@ -19,6 +19,7 @@ from raiden.calibration.recorder import run_calibration_pose_recording
 from raiden.calibration.runner import CalibrationRunner
 from raiden.control import build_interface
 from raiden.converter import convert_task, select_tasks
+from raiden.lerobot_export import export_task_to_lerobot
 from raiden.recorder import run_recording
 from raiden.robot.replay import run_replay
 from raiden.robot.teleop import run_bimanual_teleop
@@ -36,6 +37,20 @@ class TeleopCommand:
 
     arms: Literal["bimanual", "single"] = "bimanual"
     """Which arms to use: both (bimanual) or left arm only (single)"""
+
+    monitor: bool = False
+    """Show the frames being recorded live in Rerun (plus the task panel when --sim)"""
+
+    monitor_view: str = ""
+    """Sim only: also stream an operator view (agentview, behindview, frontview, birdview,
+    sideview). Costs extra renders on the sim server; implies --monitor"""
+
+    monitor_web: bool = False
+    """Serve the monitor in a browser (Rerun) instead of the local OpenCV window"""
+
+    sim_fps: int = 30
+    """Sim only: camera rate. 30 matches the real D435 so sim and real episodes have the
+    same temporal density; raise it to collect faster if the server can render that fast"""
 
     bilateral_kp: float = 0.0
     """Bilateral force feedback gain (default: 0.0 for no feedback)"""
@@ -66,6 +81,9 @@ class TeleopCommand:
 
     oculus_ip: str = ""
     """Quest IP for Wi-Fi ADB; empty = USB (oculus mode only)"""
+
+    sim: str = ""
+    """Drive the MESA digital twin instead of the robot: address of a running raiden_sim_server (e.g. 127.0.0.1:5599)"""
 
 
 @dataclass
@@ -111,8 +129,27 @@ class RecordCommand:
     oculus_ip: str = ""
     """Quest IP for Wi-Fi ADB; empty = USB (oculus mode only)"""
 
+    sim: str = ""
+    """Drive the MESA digital twin instead of the robot: address of a running raiden_sim_server (e.g. 127.0.0.1:5599).
+    Every episode records from a scene reset; success saves it, failure discards it, both reset the scene"""
+
     arms: Literal["bimanual", "single"] = "bimanual"
     """Which arms to use: both (bimanual) or left arm only (single)"""
+
+    monitor: bool = False
+    """Show the frames being recorded live in Rerun (plus the task panel when --sim)"""
+
+    monitor_view: str = ""
+    """Sim only: operator view shown in place of the scene camera, never recorded. Default
+    leftshoulder (MESA's); also rightshoulder, midshoulder, egocentric, agentview, behindview,
+    frontview, birdview, sideview; 'none' shows the scene camera. Implies --monitor"""
+
+    monitor_web: bool = False
+    """Serve the monitor in a browser (Rerun) instead of the local OpenCV window"""
+
+    sim_fps: int = 30
+    """Sim only: camera rate. 30 matches the real D435 so sim and real episodes have the
+    same temporal density; raise it to collect faster if the server can render that fast"""
 
 
 _CAN_BITRATE = 1000000
@@ -167,6 +204,29 @@ class MakeTriStereoEngineCommand:
 
     fp16: bool = True
     """Use FP16 precision"""
+
+
+@dataclass
+class LerobotCommand:
+    """Export converted episodes to a LeRobot dataset (requires the lerobot extra)"""
+
+    data_dir: str = "data"
+    """Root data directory (default: ./data); reads from <data_dir>/processed/"""
+
+    output_dir: str = "data/lerobot"
+    """Output root; the dataset is written to <output_dir>/<task_name> (default: data/lerobot)"""
+
+    repo_id: Optional[str] = None
+    """Hugging Face repo id stored in the dataset metadata (default: raiden/<task_name>)"""
+
+    vcodec: str = "libsvtav1"
+    """Video codec for the camera streams: libsvtav1 (LeRobot default) or libx264"""
+
+    image_writer_threads: int = 4
+    """Threads used to write frames to disk before encoding (default: 4)"""
+
+    overwrite: bool = False
+    """Replace an existing dataset directory (default: False)"""
 
 
 @dataclass
@@ -438,6 +498,9 @@ def _print_help() -> None:
     print(
         "  shardify                    Export converted episodes to WebDataset shards"
     )
+    print(
+        "  lerobot                     Export converted episodes to a LeRobot dataset"
+    )
     print("  console                     Open the interactive metadata console (TUI)")
     print("  reset_can                   Reset CAN interfaces (bring down then up)")
     print(
@@ -483,6 +546,7 @@ def main():
                 oculus_pos_scale=command.oculus_pos_scale,
                 oculus_rot_scale=command.oculus_rot_scale,
                 oculus_ip=command.oculus_ip,
+                sim=command.sim,
             )  # teleop builds its own interface internally via build_interface()
 
         elif subcommand == "record":
@@ -499,6 +563,7 @@ def main():
             run_recording(
                 s3_bucket=command.s3_bucket,
                 s3_prefix=command.s3_prefix,
+                sim=command.sim,
                 interface=build_interface(
                     command.control,
                     spacemouse_path_r=command.spacemouse_path_r,
@@ -513,6 +578,10 @@ def main():
                 ),
                 arms=command.arms,
                 data_dir=command.data_dir,
+                monitor=command.monitor,
+                monitor_view=command.monitor_view,
+                monitor_web=command.monitor_web,
+                sim_fps=command.sim_fps,
             )
 
         elif subcommand == "replay":
@@ -679,6 +748,25 @@ def main():
                     cfg,
                     s3_bucket=command.s3_bucket,
                     s3_prefix=s3_full_prefix,
+                )
+
+        elif subcommand == "lerobot":
+            sys.argv.pop(1)
+            command = tyro.cli(
+                LerobotCommand,
+                description="Export converted episodes to a LeRobot dataset",
+            )
+            from pathlib import Path
+
+            for task_dir, episode_dirs in select_processed_task(command.data_dir):
+                export_task_to_lerobot(
+                    task_dir,
+                    episode_dirs,
+                    output_dir=Path(command.output_dir),
+                    repo_id=command.repo_id,
+                    vcodec=command.vcodec,
+                    image_writer_threads=command.image_writer_threads,
+                    overwrite=command.overwrite,
                 )
 
         elif subcommand == "console":
