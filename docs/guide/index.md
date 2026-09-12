@@ -13,6 +13,9 @@
 9. **[Replay](replay.md)** - replay recorded follower arm motion on the physical hardware to verify a recording.
 10. **[Visualize](visualization.md)** - inspect converted recordings interactively in Rerun.
 
+Without the hardware, **[Simulation](sim.md)** replaces steps 2, 4 and 5: raiden drives
+a MuJoCo twin of the rig and records from it into the same dataset schema.
+
 ## Commands
 
 | Command | Description |

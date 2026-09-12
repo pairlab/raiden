@@ -59,6 +59,7 @@ nav:
     - "5. Console": guide/console.md
     - "6. Recording": guide/recording.md
     - Quest Teleop: guide/oculus_teleop.md
+    - Simulation: guide/sim.md
     - "7. Conversion": guide/conversion.md
     - "8. Shardify": guide/shardify.md
     - LeRobot Export: guide/lerobot.md
