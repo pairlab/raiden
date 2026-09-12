@@ -112,6 +112,10 @@ the table, and that has never been tested against the 0.74 m teleop clamp. The s
 walls have no collision, so a sim-only check would not catch a real collision either.
 Check reach before collecting anything on the oven.
 
+Photos of the real oven, the sim review sheets and the measurements they settle are in
+`reference/oven/`. They are checked in because `data/` is not, and the photos cannot be
+retaken without the physical oven.
+
 ## Init states and evaluation
 
 Teleoperation does not need init states — every reset re-samples the scene. Fixed
