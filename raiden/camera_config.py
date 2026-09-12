@@ -116,6 +116,34 @@ class CameraConfig:
             return entry.get("role")
         return None
 
+    def get_crop(self, name: str) -> Optional[tuple[int, int, int, int]]:
+        """Return the (x, y, width, height) crop window for a camera, or None."""
+        entry = self.cameras.get(name)
+        if isinstance(entry, dict) and entry.get("crop"):
+            crop = entry["crop"]
+            if len(crop) != 4:
+                raise ValueError(
+                    f"Camera '{name}': crop must be [x, y, width, height], got {crop!r}"
+                )
+            return tuple(int(v) for v in crop)
+        return None
+
+    def get_resolution(self, name: str) -> Optional[tuple[int, int]]:
+        """Return the (width, height) a RealSense camera streams at, or None for other cameras.
+
+        Without a ``resolution`` entry this is the RealSense default (640x480).
+        """
+        entry = self.cameras.get(name)
+        if not isinstance(entry, dict) or self.get_camera_type(name) != "realsense":
+            return None
+        from raiden.cameras.realsense import RealSenseCamera
+
+        res = entry.get("resolution") or (
+            RealSenseCamera._COLOR_W,
+            RealSenseCamera._COLOR_H,
+        )
+        return int(res[0]), int(res[1])
+
     def get_camera_by_role(self, role: str) -> Optional[str]:
         """Return the name of the unique camera with the given role, or None.
 
@@ -208,7 +236,15 @@ class CameraConfig:
         if cam_type == "realsense":
             from raiden.cameras.realsense import RealSenseCamera
 
-            return RealSenseCamera(name, str(serial), fps=fps)
+            resolution = entry.get("resolution") if isinstance(entry, dict) else None
+            return RealSenseCamera(
+                name,
+                str(serial),
+                fps=fps,
+                resolution=tuple(resolution) if resolution else None,
+                crop=self.get_crop(name),
+                depth=entry.get("depth", True) if isinstance(entry, dict) else True,
+            )
 
         raise ValueError(
             f"Unknown camera type '{cam_type}' for camera '{name}'. "

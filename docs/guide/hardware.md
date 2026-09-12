@@ -12,6 +12,14 @@ Run `rd list_devices` to detect all connected cameras and generate a starter `~/
 }
 ```
 
+RealSense entries accept three optional fields:
+
+- `"depth": false` — record color only. The `.bag` holds no depth stream, so bags are smaller and the USB link carries less; `rd convert` then writes no `depth/`. Default `true`.
+- `"resolution": [848, 480]` — stream size for color and depth (default `[640, 480]`, which is a centre crop of the D435 sensor; `848×480` keeps the full 69° horizontal field of view).
+- `"crop": [x, y, width, height]` — window cut from every frame (live, and when converting `.bag` files). Intrinsics are shifted to match. Use it to re-centre an off-axis mount, e.g. a wrist camera between the gripper fingers: `"resolution": [848, 480], "crop": [208, 0, 640, 480]`.
+
+Check the result live with `uv run python scripts/camera_preview.py --grid`.
+
 ZED Mini cameras are mounted on the follower arm wrist links via 3D-printed mounts ([left](https://tri-ml.github.io/raiden/assets/zed_mounter_left.STL), [right](https://tri-ml.github.io/raiden/assets/zed_mounter_right.STL)). The ZED 2i is used as a fixed overhead or scene camera. Any Intel RealSense D400-series camera can be used as an alternative wrist or scene camera. The D405 in particular is well-suited for wrist mounting due to its compact form factor and close-range depth optimization.
 
 <div style="display: flex; gap: 1rem;">

@@ -1,7 +1,7 @@
 """Intel RealSense camera implementation (e.g. D405).
 
 Recording mode opens by serial number and records to .bag via the SDK recorder.
-Playback mode opens a .bag file and reads color + depth frames;
+Playback mode opens a .bag file and reads color (+ depth, if recorded) frames;
 use ``RealSenseCamera.from_bag()`` to create a playback instance.
 
 .. warning:: **For dynamic tasks, prefer ZED cameras over RealSense.**
@@ -70,10 +70,35 @@ class RealSenseCamera(Camera):
     _COLOR_W, _COLOR_H = 640, 480
     _DEPTH_W, _DEPTH_H = 640, 480
 
-    def __init__(self, camera_name: str, serial_number: str, fps: int = 30):
+    def __init__(
+        self,
+        camera_name: str,
+        serial_number: str,
+        fps: int = 30,
+        resolution: Optional[Tuple[int, int]] = None,
+        crop: Optional[Tuple[int, int, int, int]] = None,
+        depth: bool = True,
+    ):
+        """
+        Args:
+            depth: stream and record depth too.  False records color only
+                (smaller bags, less USB bandwidth); frames then carry no depth.
+            resolution: (width, height) for the color and depth streams.
+                Default 640×480.  848×480 uses the full sensor width of a
+                D435 (69° instead of ~55° horizontal FOV).
+            crop: (x, y, width, height) window, in stream pixels, applied to
+                every frame returned by ``get_frame()``; intrinsics are
+                shifted accordingly.  Use it to re-centre a camera whose
+                mount is off-axis (e.g. a wrist camera between the fingers).
+        """
         self._name = camera_name
         self._serial = serial_number
         self._fps = fps
+        self._depth = depth
+        if resolution is not None:
+            self._COLOR_W, self._COLOR_H = int(resolution[0]), int(resolution[1])
+            self._DEPTH_W, self._DEPTH_H = self._COLOR_W, self._COLOR_H
+        self._crop = tuple(int(v) for v in crop) if crop is not None else None
         self._pipeline: Optional[rs.pipeline] = None
         self._config: Optional[rs.config] = None
         self._profile: Optional[rs.pipeline_profile] = None
@@ -118,17 +143,20 @@ class RealSenseCamera(Camera):
         self._color_w = color_stream.width()
         self._color_h = color_stream.height()
 
-    def open(self) -> None:
-        self._pipeline = rs.pipeline()
+    def _stream_config(self, color_w: int, color_h: int) -> "rs.config":
+        """Color, plus depth unless it is turned off."""
         cfg = rs.config()
         cfg.enable_device(self._serial)
-        cfg.enable_stream(
-            rs.stream.color, self._COLOR_W, self._COLOR_H, rs.format.bgr8, self._fps
-        )
-        cfg.enable_stream(
-            rs.stream.depth, self._DEPTH_W, self._DEPTH_H, rs.format.z16, self._fps
-        )
-        self._start_pipeline(cfg)
+        cfg.enable_stream(rs.stream.color, color_w, color_h, rs.format.bgr8, self._fps)
+        if self._depth:
+            cfg.enable_stream(
+                rs.stream.depth, self._DEPTH_W, self._DEPTH_H, rs.format.z16, self._fps
+            )
+        return cfg
+
+    def open(self) -> None:
+        self._pipeline = rs.pipeline()
+        self._start_pipeline(self._stream_config(self._COLOR_W, self._COLOR_H))
         print(
             f"  [{self._name}] opened: "
             f"BGR8 {self._color_w}×{self._color_h} @ {self._fps}fps"
@@ -149,20 +177,14 @@ class RealSenseCamera(Camera):
         if self._pipeline:
             self._pipeline.stop()
 
-        cfg = rs.config()
-        cfg.enable_device(self._serial)
-        cfg.enable_stream(
-            rs.stream.color, self._COLOR_W, self._COLOR_H, rs.format.bgr8, self._fps
-        )
-        cfg.enable_stream(
-            rs.stream.depth, self._DEPTH_W, self._DEPTH_H, rs.format.z16, self._fps
-        )
+        cfg = self._stream_config(self._COLOR_W, self._COLOR_H)
         cfg.enable_record_to_file(str(path))
         self._start_pipeline(cfg)
         _enable_global_time(self._profile.get_device())
         print(
             f"  [{self._name}] recording: "
             f"BGR8 {self._color_w}×{self._color_h} @ {self._fps}fps"
+            + ("" if self._depth else " (no depth)")
         )
         self._measure_clock_offset()
 
@@ -195,14 +217,7 @@ class RealSenseCamera(Camera):
         # Rebuild config without enable_record_to_file — there is no
         # disable_record_and_playback() in the pyrealsense2 Python bindings.
         # Use the same color resolution that was negotiated in start_recording().
-        cfg = rs.config()
-        cfg.enable_device(self._serial)
-        cfg.enable_stream(
-            rs.stream.color, self._color_w, self._color_h, rs.format.bgr8, self._fps
-        )
-        cfg.enable_stream(
-            rs.stream.depth, self._DEPTH_W, self._DEPTH_H, rs.format.z16, self._fps
-        )
+        cfg = self._stream_config(self._color_w, self._color_h)
         self._config = cfg
         self._profile = self._pipeline.start(cfg)
         _enable_global_time(self._profile.get_device())
@@ -236,11 +251,18 @@ class RealSenseCamera(Camera):
             frames = align.process(frames)
 
         color_frame = frames.get_color_frame()
-        depth_frame = frames.get_depth_frame()
+        depth_frame = frames.get_depth_frame()  # empty when depth is off
 
         color = np.asanyarray(color_frame.get_data())  # BGR uint8
-        depth_raw = np.asanyarray(depth_frame.get_data())  # uint16 raw units
-        depth = (depth_raw * self._depth_scale).astype(np.float32)
+        depth = None
+        if depth_frame:
+            depth_raw = np.asanyarray(depth_frame.get_data())  # uint16 raw units
+            depth = (depth_raw * self._depth_scale).astype(np.float32)
+        if self._crop is not None:
+            x, y, w, h = self._crop
+            color = color[y : y + h, x : x + w]
+            if depth is not None:
+                depth = depth[y : y + h, x : x + w]
 
         # RealSense timestamp is in milliseconds
         timestamp_ns = int(color_frame.get_timestamp() * 1_000_000)
@@ -261,27 +283,50 @@ class RealSenseCamera(Camera):
             rs.stream.color
         ).as_video_stream_profile()
         intr = color_stream.get_intrinsics()
+        ppx, ppy, width, height = self._cropped_intrinsics(intr)
 
         camera_matrix = np.array(
-            [[intr.fx, 0.0, intr.ppx], [0.0, intr.fy, intr.ppy], [0.0, 0.0, 1.0]],
+            [[intr.fx, 0.0, ppx], [0.0, intr.fy, ppy], [0.0, 0.0, 1.0]],
             dtype=np.float64,
         )
         # Brown-Conrady: [k1, k2, p1, p2, k3]
         dist_coeffs = np.array(intr.coeffs[:5], dtype=np.float64)
-        image_size = (intr.width, intr.height)
+        image_size = (width, height)
         return camera_matrix, dist_coeffs, image_size
+
+    def _cropped_intrinsics(self, intr) -> Tuple[float, float, int, int]:
+        """Return (ppx, ppy, width, height) after applying the crop window."""
+        if self._crop is None:
+            return intr.ppx, intr.ppy, intr.width, intr.height
+        x, y, w, h = self._crop
+        if x < 0 or y < 0 or x + w > intr.width or y + h > intr.height:
+            raise ValueError(
+                f"[{self._name}] crop {self._crop} exceeds the "
+                f"{intr.width}×{intr.height} stream"
+            )
+        return intr.ppx - x, intr.ppy - y, w, h
 
     # ------------------------------------------------------------------
     # Playback from .bag file
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_bag(cls, camera_name: str, bag_path: Path) -> "RealSenseCamera":
-        """Open a .bag file for frame-by-frame extraction."""
+    def from_bag(
+        cls,
+        camera_name: str,
+        bag_path: Path,
+        crop: Optional[Tuple[int, int, int, int]] = None,
+    ) -> "RealSenseCamera":
+        """Open a .bag file for frame-by-frame extraction.
+
+        The bag holds the full stream; *crop* (same meaning as in
+        ``__init__``) is applied to the frames read back from it.
+        """
         cam = cls.__new__(cls)
         cam._name = camera_name
         cam._serial = ""
         cam._fps = 30
+        cam._crop = tuple(int(v) for v in crop) if crop is not None else None
         cam._depth_scale = 0.001
         cam._latest_frames = None
 
@@ -302,8 +347,11 @@ class RealSenseCamera(Camera):
         except Exception:
             pass
 
-        # Align depth to color so they share the same pixel grid
-        cam._align = rs.align(rs.stream.color)
+        # Align depth to color so they share the same pixel grid; a color-only bag has none.
+        cam._depth = any(
+            s.stream_type() == rs.stream.depth for s in cam._profile.get_streams()
+        )
+        cam._align = rs.align(rs.stream.color) if cam._depth else None
         cam._is_playback = True
 
         return cam
@@ -316,16 +364,17 @@ class RealSenseCamera(Camera):
             rs.stream.color
         ).as_video_stream_profile()
         intr = color_stream.get_intrinsics()
+        ppx, ppy, width, height = self._cropped_intrinsics(intr)
         return {
             "serial_number": self._serial,
             "model": "RealSense",
             "fps": self._fps,
-            "width": intr.width,
-            "height": intr.height,
+            "width": width,
+            "height": height,
             "fx": intr.fx,
             "fy": intr.fy,
-            "cx": intr.ppx,
-            "cy": intr.ppy,
+            "cx": ppx,
+            "cy": ppy,
             "k1": intr.coeffs[0],
             "k2": intr.coeffs[1],
             "p1": intr.coeffs[2],
