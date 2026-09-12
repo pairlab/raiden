@@ -61,6 +61,7 @@ nav:
     - Quest Teleop: guide/oculus_teleop.md
     - "7. Conversion": guide/conversion.md
     - "8. Shardify": guide/shardify.md
+    - LeRobot Export: guide/lerobot.md
     - "9. Evaluation": guide/serve.md
     - "10. Replay": guide/replay.md
     - "11. Visualization": guide/visualization.md
