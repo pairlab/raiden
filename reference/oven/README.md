@@ -62,11 +62,19 @@ In the *asset* sheets, MuJoCo azimuth 90 is the front, 0 the left side and 180 t
 side — the opening faces the model's local -y. This is unrelated to the arena rotation,
 where the class rotation is -pi/2.
 
-These were produced by `make_oven_review.py`, `make_scene_review.py` and `check_oven.py`,
-which currently live in `/var/tmp/mesa_check/oven_assets/` and are **not yet in any
-repository**. `/var/tmp` is cleared after 30 days without use. Moving them into MESA
-alongside `scripts/raiden_lab/` is an open task; until then, regenerating these renders
-on another machine means rewriting them.
+These were produced by `scripts/raiden_lab/oven/` in MESA, which reads and writes this
+folder and defaults to finding it at `../raiden`:
+
+```bash
+cd ~/robot/vla-benchmark
+MUJOCO_GL=egl uv run python scripts/raiden_lab/oven/make_oven_review.py   # the 3 sheets
+MUJOCO_GL=egl uv run python scripts/raiden_lab/oven/make_scene_review.py  # the arena renders
+MUJOCO_GL=egl uv run python scripts/raiden_lab/oven/check_oven.py         # door + rack physics
+```
+
+Regenerating is not byte-identical: the arena re-samples the oven and croissant
+placement on every reset, so a rerun gives a different valid layout. Only commit a
+regenerated sheet if you meant to replace the reviewed set.
 
 ## The task does not run yet
 
