@@ -22,11 +22,18 @@ def run_bimanual_teleop(
     oculus_pos_scale: float = 0.7,
     oculus_rot_scale: float = 0.5,
     oculus_ip: str = "",
+    sim: str = "",
 ):
-    """Run the bimanual teleoperation system"""
+    """Run the bimanual teleoperation system.
+
+    ``sim`` = address of a running MESA ``raiden_sim_server`` -> drive the digital twin.
+    """
 
     use_right = arms == "bimanual"
     use_left = True
+    if sim and use_right:
+        print("Simulator provides a single left arm; using arms='single'.")
+        use_right = False
 
     interface: TeleopInterface = build_interface(
         control,
@@ -46,6 +53,7 @@ def run_bimanual_teleop(
         use_left_leader=interface.uses_leaders and use_left,
         use_right_follower=use_right,
         use_left_follower=use_left,
+        sim=sim or None,
     )
 
     interface.open()
@@ -66,6 +74,16 @@ def run_bimanual_teleop(
 
         print(interface.banner)
 
+        task = None
+        if sim:
+            from raiden.sim import TaskMonitor
+
+            task = TaskMonitor(sim)
+            task.poll()
+            if task.status:
+                print(f"\nTask: {task.status['language']}")
+                print(f"  subtask: {task.current}")
+
         while True:
             if robot_controller.session_estop_requested:
                 print("\n[FootPedal] Returning arms to home and exiting.")
@@ -73,6 +91,11 @@ def run_bimanual_teleop(
             if interface.poll(robot_controller):
                 time.sleep(0.5)  # debounce
                 break
+            if task is not None and task.poll():
+                for event in task.drain_events():
+                    print(f"  {event}")
+                if task.current:
+                    print(f"  subtask: {task.current}")
             time.sleep(0.1)
 
         interface.stop(robot_controller)

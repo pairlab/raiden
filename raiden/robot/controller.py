@@ -71,6 +71,13 @@ LEADER_HOME_POS = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # 6 joints only
 FOLLOWER_KP = np.array([80.0, 80.0, 80.0, 40.0, 10.0, 10.0, 20.0])
 FOLLOWER_KD = np.array([5.0, 5.0, 5.0, 1.5, 1.5, 1.5, 0.5])
 
+# Sim reset: time for the re-sampled objects to land before the next episode records.
+_SIM_SETTLE_S = 0.2
+
+# Keep roughly 20 mm between the LINEAR_4310 jaws at the most-closed command.
+# The model's two 47.5 mm finger strokes give a total opening range of 95 mm.
+_GRIPPER_MIN_OPENING = 20.0 / 95.0
+
 # Gripper closing safety threshold in normalized [0,1] gripper space.
 # Gripper is stopped from closing further when commanded position is more than
 # this amount below the actual position (indicating the fingers are blocked).
@@ -368,6 +375,7 @@ class RobotController:
         use_left_leader: bool = True,
         use_right_follower: bool = True,
         use_left_follower: bool = True,
+        sim: Optional[str] = None,
     ):
         """Initialize robot controller
 
@@ -376,11 +384,18 @@ class RobotController:
             use_left_leader: Initialize left leader arm
             use_right_follower: Initialize right follower arm
             use_left_follower: Initialize left follower arm
+            sim: address of a running ``raiden_sim_server`` (``host:port``); when set the
+                left follower is the MESA digital twin instead of the CAN-bus arm.
         """
         self.use_right_leader = use_right_leader
         self.use_left_leader = use_left_leader
         self.use_right_follower = use_right_follower
         self.use_left_follower = use_left_follower
+        self.sim = sim or None
+        if self.sim and (use_right_leader or use_left_leader or use_right_follower):
+            raise ValueError(
+                "the simulator provides a single left follower; use arms='single'"
+            )
 
         # Robot references
         self.leader_r: Optional[YAMLeaderRobot] = None
@@ -423,6 +438,9 @@ class RobotController:
 
     def check_can_interfaces(self) -> bool:
         """Check if required CAN interfaces are available"""
+        if self.sim:
+            print(f"✓ Simulated robot ({self.sim}); no CAN interfaces needed")
+            return True
         required_interfaces = []
 
         if self.use_right_follower:
@@ -460,6 +478,12 @@ class RobotController:
         results: Dict[str, object] = {}
         errors: Dict[str, Exception] = {}
 
+        if self.sim:
+            from raiden.sim import SimFollower
+
+            print(f"  - Connecting to sim follower at {self.sim}...")
+            results["left follower"] = SimFollower(self.sim)
+
         def _init(name: str, channel: str, gripper_type) -> None:
             print(f"  - Initializing {name}...")
             try:
@@ -480,7 +504,7 @@ class RobotController:
                     daemon=True,
                 )
             )
-        if self.use_left_follower:
+        if self.use_left_follower and not self.sim:
             threads.append(
                 threading.Thread(
                     target=_init,
@@ -605,9 +629,23 @@ class RobotController:
     def move_to_home_positions(self, simultaneous: bool = True) -> None:
         """Move all robots to home positions
 
+        A simulated follower is snapped home instead: the 2 s interpolation exists to keep
+        the real arm safe, and ``reset_scene`` additionally re-samples the task objects,
+        which is what makes the next episode start from a clean scene.
+
         Args:
             simultaneous: If True, move all arms simultaneously using threads
         """
+        sim_followers = [
+            f for f in (self.follower_r, self.follower_l) if hasattr(f, "reset_scene")
+        ]
+        if sim_followers:
+            print("\nResetting simulator to home...")
+            for follower in sim_followers:
+                follower.reset_scene()
+            print("✓ Simulator reset (arm at home, objects re-sampled)")
+            return
+
         print("\nMoving all arms to home positions...")
 
         if simultaneous:
@@ -922,7 +960,9 @@ class RobotController:
                 leader.command_joint_pos(leader_pos[:6])
 
                 # Gripper control: map leader encoder (0–1) directly to follower.
-                follower_gripper_cmd = float(np.clip(leader_pos[6], 0.0, 1.0))
+                follower_gripper_cmd = float(
+                    np.clip(leader_pos[6], _GRIPPER_MIN_OPENING, 1.0)
+                )
                 follower_cmd = np.append(leader_pos[:6], follower_gripper_cmd)
 
                 follower.command_joint_pos(follower_cmd)
@@ -1109,7 +1149,10 @@ class RobotController:
                         gripper_actual - 0.9 * _GRIPPER_SAFETY_THRESHOLD,
                         gripper_actual + 0.9 * _GRIPPER_SAFETY_THRESHOLD,
                     )
-                    cmd = np.append(q_arm, float(np.clip(gripper, 0.0, 1.0)))
+                    cmd = np.append(
+                        q_arm,
+                        float(np.clip(gripper, _GRIPPER_MIN_OPENING, 1.0)),
+                    )
                 follower.command_joint_pos(cmd)
                 self._last_commanded_pos[side] = cmd.copy()
 
@@ -1385,7 +1428,8 @@ class RobotController:
                 buttons = getattr(state, "buttons", [])
                 if len(buttons) > 0 and buttons[0]:
                     gripper = max(
-                        0.0, gripper_actual - 0.9 * _GRIPPER_SAFETY_THRESHOLD
+                        _GRIPPER_MIN_OPENING,
+                        gripper_actual - 0.9 * _GRIPPER_SAFETY_THRESHOLD,
                     )  # close
                 elif len(buttons) > 1 and buttons[1]:
                     gripper = min(
@@ -1411,7 +1455,7 @@ class RobotController:
         print("  - Signalling ready: closing and opening grippers...")
 
         closed_pos = FOLLOWER_HOME_POS.copy()
-        closed_pos[6] = 0.0  # closed
+        closed_pos[6] = _GRIPPER_MIN_OPENING
 
         def cycle(robot: Robot) -> None:
             for _ in range(2):
@@ -1547,6 +1591,22 @@ class RobotController:
             self.leader_r.update_kp_kd(kp=np.zeros(6), kd=np.zeros(6))
         if self.leader_l:
             self.leader_l.update_kp_kd(kp=np.zeros(6), kd=np.zeros(6))
+
+    def reset_sim_episode(self) -> None:
+        """Sim only: stop the teleop loops, snap the arm home and re-sample the task objects.
+
+        The Cartesian IK loop integrates its own joint state, so it must not run across the
+        reset (it would drive the arm back); the caller restarts teleop and it re-reads the
+        arm at home.  The last command is cleared so the next episode does not inherit it.
+        """
+        if not self.sim:
+            raise RuntimeError("reset_sim_episode needs the simulator")
+        self.stop_teleoperation()
+        self.move_to_home_positions()
+        self._last_commanded_pos = {"right": None, "left": None}
+        # The reset places the objects ~10 mm above the table; they land and settle in
+        # ~80 ms (sim time = wall time).  Wait so an episode never opens on falling objects.
+        time.sleep(_SIM_SETTLE_S)
 
     def shutdown(self):
         """Complete shutdown: stop teleop -> restore control -> go home -> close robots"""
