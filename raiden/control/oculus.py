@@ -5,12 +5,29 @@ hand controllers are used.  Button layout follows pairlab/mesa-env:
 
 * joystick click / B (Y) .. calibrate headset->robot axes: hold A (X), move
                             ~20 cm along robot +x, release; repeat along robot +y.
+                            Press it again to cancel.  The result is saved and
+                            reused; redo it only when the headset moves.
 * hold trigger ............ clutch: the end-effector follows the controller
                             relative to where the trigger was pressed.
 * hold grip ............... gripper closed; release to open.
 * A (X) ................... trigger event (start/stop recording, record pose);
                             after a recording stops, marks it a success.
 * joystick click / B (Y) .. at the success/failure prompt: mark it a failure.
+
+Real recording (``rd record``): teleop starts at the READY prompt with the arm held
+at home, so calibration happens there, before A (X) or Enter starts the recording.
+During a recording the calibration buttons do nothing.
+
+Sim collection (``auto_reset``, set by ``rd record --sim``) records from every reset:
+
+* B (Y) ................... save the episode as a success, then reset.
+* A (X) ................... discard the episode, then reset.
+* joystick click .......... discard the episode and calibrate; the scene resets
+                            when the calibration is done.
+
+Calibration and the clutch use the controller only while the headset has 6-DoF
+(camera) tracking of it; the app keeps streaming a pose for a controller it cannot
+see.  The OS tracking state is polled once a second.
 
 Targets are tracked by mink IK on the YAM MuJoCo model (gripper-tip
 ``grasp_site``) in ``RobotController.start_cartesian_teleop``.
@@ -53,13 +70,24 @@ _KEYS = {
 _GRIP_THRESHOLD = 0.2  # analog grip above this counts as pressed (mesa-env)
 _MIN_CALIB_MOVE = 0.08  # m; shorter calibration moves are rejected
 _STALE_AFTER = 0.5  # s without controller data -> hold the arm
+_STALL_WARN = 2.0  # s without controller data -> tell the operator
 _SMOOTHING_TAU = 0.05  # s low-pass on the controller pose
 _MAX_LEAD_POS = 0.15  # m the IK target may lead the arm (bounds peak speed)
 _MAX_LEAD_ROT = 0.5  # rad
-_MAX_REACH = 0.74  # m gripper tip from the shoulder (max 0.81); keeps the arm off full extension
+# m gripper tip from the shoulder (max 0.81); keeps the arm off full extension
+_MAX_REACH = 0.74
 _SHOULDER = np.array([0.0, 0.0, 0.067])
 _DT = 0.01
 _CALIB_FILE = CONFIG_DIR / "oculus_calibration.json"
+# What to do when the headset has no 6-DoF tracking of a controller (OS TrackingStatus).
+_TRACKING_HELP = {
+    "ORIENTATION": "the headset cameras cannot see it; hold it in front of the headset",
+    "NONE": "it is asleep or off; press any button on it",
+}
+
+
+def _help(state: Optional[str]) -> str:
+    return _TRACKING_HELP.get(state or "", "hold it in view of the headset")
 
 
 class OculusInterface(TeleopInterface):
@@ -82,16 +110,24 @@ class OculusInterface(TeleopInterface):
         """
         self._ip = ip_address
         self._hand = {"left": hand_for_left_arm, "right": hand_for_right_arm}
+        self._active_hands: set = set()  # controllers driving an arm; set per episode
         self._pos_scale = pos_scale
         self._rot_scale = float(np.clip(rot_scale, 0.0, 1.0))
         self._alpha = 1.0 - float(np.exp(-_DT / _SMOOTHING_TAU))
         self._reader: Optional[OculusReader] = None
         self._tracking: Dict[str, str] = {}
         self._stop = threading.Event()
+        self._tracker: Optional[threading.Thread] = None
         self._event = threading.Event()
+        self._success = threading.Event()
         self._failure = threading.Event()
-        self._phase: Optional[str] = None  # None | "recording" | "verdict"
+        self._phase: Optional[str] = None  # None | "ready" | "recording" | "verdict"
         self._saved_R = self._load_calibration()
+        # Last seen button states, for rising edges.  Kept across episodes: a button
+        # still held from the previous episode must not fire in the next one.
+        self._prev: Dict[str, Dict[str, bool]] = {
+            h: {"calib": False, "face": False, "btn": False} for h in ("l", "r")
+        }
         self._reset_state()
 
     def _reset_state(self) -> None:
@@ -104,9 +140,6 @@ class OculusInterface(TeleopInterface):
             h: None for h in hands
         }
         self._smooth: Dict[str, Optional[np.ndarray]] = {h: None for h in hands}
-        self._prev: Dict[str, Dict[str, bool]] = {
-            h: {"calib": False, "btn": False} for h in hands
-        }
         self._warned: Dict[str, float] = {h: 0.0 for h in hands}
 
     @property
@@ -133,8 +166,14 @@ class OculusInterface(TeleopInterface):
             print("  ✓ Quest controllers streaming")
         if self._saved_R:
             print(
-                f"  ✓ Using saved calibration ({_CALIB_FILE}); press the joystick (or B/Y) to redo it"
+                f"  ✓ Using saved calibration ({_CALIB_FILE}); redo it ({self._calib_buttons}) only if the headset moved"
             )
+        # Tracking state is session-level: one poller for the whole session, not per episode.
+        self._stop.clear()
+        self._tracker = threading.Thread(
+            target=self._tracking_loop, name="oculus-tracking", daemon=True
+        )
+        self._tracker.start()
 
         self._pedal_trigger = threading.Event()
         self._pedal_success = threading.Event()
@@ -161,6 +200,7 @@ class OculusInterface(TeleopInterface):
             )
 
     def close(self) -> None:
+        self._stop.set()
         if getattr(self, "_footpedal", None) is not None:
             self._footpedal.close()
             self._footpedal = None
@@ -180,38 +220,72 @@ class OculusInterface(TeleopInterface):
         """Teleop starts from the home pose; nothing to do."""
 
     def start(self, robot_controller) -> None:
+        self._begin(robot_controller, phase=None)
+
+    def start_ready(self, robot_controller) -> bool:
+        # The recorder's READY prompt: the arm holds at home until the recording starts, so
+        # calibration happens here instead of inside a recording.
+        self._begin(robot_controller, phase="ready")
+        return True
+
+    def _begin(self, robot_controller, phase: Optional[str]) -> None:
         self._reset_state()
-        self._phase = None
+        self._phase = phase
+        arms = (
+            ("left", robot_controller.follower_l),
+            ("right", robot_controller.follower_r),
+        )
+        self._active_hands = {self._hand[side] for side, arm in arms if arm is not None}
+        # Presses made while no episode ran (e.g. during a sim reset) belong to no episode.
+        self._clear_events()
         robot_controller.start_cartesian_teleop(self._target_fn, dt=_DT)
-        self._stop.clear()
-        threading.Thread(
-            target=self._tracking_loop, name="oculus-tracking", daemon=True
-        ).start()
 
     def stop(self, robot_controller) -> None:
-        self._stop.set()
         self._phase = None
         robot_controller.stop_cartesian_teleop()
 
     def set_active_recording(self, robot_controller=None) -> None:
         super().set_active_recording(robot_controller)
         self._phase = "recording" if robot_controller is not None else "verdict"
+        # A press from the previous phase must not stop this recording or decide its verdict.
+        self._clear_events()
+
+    def _clear_events(self) -> None:
+        for ev in (self._event, self._success, self._failure):
+            ev.clear()
+
+    @property
+    def calibrating(self) -> bool:
+        return any(c is not None for c in self._calib.values())
 
     def _tracking_loop(self) -> None:
-        """Poll the OS tracking state ~1 Hz; it gates the clutch (see _target_fn)."""
+        """Poll the OS tracking state ~1 Hz; it gates the clutch and calibration (see _target_fn).
+
+        Also reports a stalled data stream, which otherwise looks like a frozen arm.
+        """
+        stalled = False
         while not self._stop.wait(1.0):
             reader = self._reader
             if reader is None:
                 continue
+            if (reader.age > _STALL_WARN) != stalled:
+                stalled = not stalled
+                msg = (
+                    "no data from the Quest app; the arm holds until it is back"
+                    if stalled
+                    else "Quest data back"
+                )
+                print(f"\n  [Oculus] {msg}", flush=True)
             tracking = reader.controller_tracking()
             for hand, state in tracking.items():
-                if hand not in self._hand.values() or state == self._tracking.get(hand):
+                if hand not in self._active_hands or state == self._tracking.get(hand):
                     continue
                 if state == "POSITION":
                     print(f"\n  [Oculus {hand.upper()}] tracking locked", flush=True)
-                elif self._tracking.get(hand) == "POSITION":
+                else:
                     print(
-                        f"\n  [Oculus {hand.upper()}] tracking lost ({state}); clutch ignored until it re-locks",
+                        f"\n  [Oculus {hand.upper()}] tracking {state}: {_help(state)}. "
+                        "The arm holds until it locks.",
                         flush=True,
                     )
             if tracking:
@@ -234,30 +308,32 @@ class OculusInterface(TeleopInterface):
             self._origin[hand] = None
             return None
         pressed = lambda key: bool(buttons.get(key, False))
+        track = self._tracking.get(hand)  # None until the first OS reading: trusted
 
-        # Joystick click / B (rising edge): failure verdict after a recording
-        # stops, otherwise start calibration.
-        calib = any(pressed(k) for k in keys["calib"])
-        if calib and not self._prev[hand]["calib"] and self._phase == "verdict":
-            self._failure.set()
-        elif calib and not self._prev[hand]["calib"] and self._calib[hand] is None:
-            self._calib[hand] = {"stage": "x", "start": None}
-            self._origin[hand] = None
-            print(
-                f"\n  [Oculus {hand.upper()}] CALIBRATION 1/2: hold {keys['btn']} and move ~20 cm along the "
-                "ROBOT's +x (straight out from its base), then release.",
-                flush=True,
-            )
+        # Joystick click / B (rising edge): failure verdict after a recording stops,
+        # otherwise start or cancel calibration.  In sim collection B saves the
+        # episode instead, so only the joystick calibrates.
+        stick, face = (pressed(k) for k in keys["calib"])
+        calib = stick or (face and not self.auto_reset)
+        if calib and not self._prev[hand]["calib"]:
+            self._on_calib_press(hand)
         self._prev[hand]["calib"] = calib
+        if self.auto_reset and face and not self._prev[hand]["face"]:
+            if self._calib[hand] is None:
+                self._success.set()
+        self._prev[hand]["face"] = face
 
         btn = pressed(keys["btn"])
         if self._calib[hand] is not None:
-            self._calibrate(hand, btn, T_raw[:3, 3])
+            self._calibrate(hand, btn, T_raw[:3, 3], track)
             self._prev[hand]["btn"] = btn
             return None  # arm holds still while calibrating
         if btn and not self._prev[hand]["btn"]:
-            self._event.set()
+            # Sim collection: A discards the episode and resets the scene.
+            (self._failure if self.auto_reset else self._event).set()
         self._prev[hand]["btn"] = btn
+        if self._phase == "ready":
+            return None  # every recording starts from home: hold until it starts
 
         # Gripper (binary, like mesa-env): grip held -> closed (0), else open (1).
         val = buttons.get(keys["grip_val"], (0.0,))
@@ -271,17 +347,13 @@ class OculusInterface(TeleopInterface):
             return hold
         if self._R[hand] is None:
             self._warn(
-                hand, "press the joystick (or B/Y) and calibrate before moving the arm"
+                hand, f"press {self._calib_buttons} and calibrate before moving the arm"
             )
             return hold
         # Only follow while the headset has 6-DoF (camera) tracking of the
         # controller; orientation-only means the position is gyro drift.
-        track = self._tracking.get(hand)
         if track is not None and track != "POSITION":
-            self._warn(
-                hand,
-                f"tracking is {track}, not POSITION; hold the controller in view of the headset",
-            )
+            self._warn(hand, f"tracking is {track}: {_help(track)}")
             self._origin[hand] = None
             self._smooth[hand] = None
             return hold
@@ -314,26 +386,71 @@ class OculusInterface(TeleopInterface):
         T_target[:3, :3] = _rotmat(rotvec) @ T_current[:3, :3]
         return T_target, gripper
 
-    def _calibrate(self, hand: str, btn: bool, pos: np.ndarray) -> None:
+    def _on_calib_press(self, hand: str) -> None:
+        H = hand.upper()
+        if self._phase == "verdict":
+            self._failure.set()
+        elif self._calib[hand] is not None:
+            self._calib[hand] = None
+            kept = (
+                "; the previous calibration stays" if self._R[hand] is not None else ""
+            )
+            print(f"\n  [Oculus {H}] calibration cancelled{kept}.", flush=True)
+        elif self._phase == "recording" and not self.auto_reset:
+            print(
+                f"\n  [Oculus {H}] calibrate at the READY prompt, before the next recording.",
+                flush=True,
+            )
+        else:
+            self._calib[hand] = {"stage": "x", "start": None}
+            self._origin[hand] = None
+            print(
+                f"\n  [Oculus {H}] CALIBRATION 1/2: hold {_KEYS[hand]['btn']} and move ~20 cm along the "
+                f"ROBOT's +x (straight out from its base), then release. Press {self._calib_buttons} "
+                "again to cancel.",
+                flush=True,
+            )
+
+    def _calibrate(
+        self, hand: str, btn: bool, pos: np.ndarray, track: Optional[str]
+    ) -> None:
         """mesa-env's calibrate_controller as a non-blocking state machine.
 
         Stage x: hold the button, move along robot +x, release.  Stage y: same
         for +y.  The dominant headset axis of each move (with sign) becomes that
         robot axis; z = x cross y.  Only the headset frame is used, so how the
-        controller is held does not matter.
+        controller is held does not matter.  A move counts only if the headset
+        tracked the controller (6-DoF) from press to release.
         """
         c = self._calib[hand]
+        H = hand.upper()
         name = _KEYS[hand]["btn"]
+        tracked = track is None or track == "POSITION"
         if btn and not self._prev[hand]["btn"]:
-            c["start"] = pos.copy()
+            if tracked:
+                c.update(start=pos.copy(), lost=False)
+            else:
+                print(
+                    f"  [Oculus {H}] tracking is {track}: {_help(track)}. Then hold {name} and move again.",
+                    flush=True,
+                )
             return
-        if btn or c["start"] is None:
+        if c["start"] is None:
+            return
+        c["lost"] = c["lost"] or not tracked
+        if btn:
             return
         delta = pos - c["start"]
         c["start"] = None
+        if c["lost"]:
+            print(
+                f"  [Oculus {H}] tracking dropped during the move; hold {name} and redo it.",
+                flush=True,
+            )
+            return
         if np.linalg.norm(delta) < _MIN_CALIB_MOVE:
             print(
-                f"  [Oculus {hand.upper()}] moved only {np.linalg.norm(delta) * 100:.0f} cm; hold {name} and move further."
+                f"  [Oculus {H}] moved only {np.linalg.norm(delta) * 100:.0f} cm; hold {name} and move further."
             )
             return
         k = int(np.argmax(np.abs(delta)))
@@ -342,13 +459,13 @@ class OculusInterface(TeleopInterface):
         if c["stage"] == "x":
             c.update(stage="y", x=axis, kx=k)
             print(
-                f"  [Oculus {hand.upper()}] CALIBRATION 2/2: hold {name} and move ~20 cm along the ROBOT's +y "
+                f"  [Oculus {H}] CALIBRATION 2/2: hold {name} and move ~20 cm along the ROBOT's +y "
                 "(its left), then release.",
                 flush=True,
             )
         elif k == c["kx"]:
             print(
-                f"  [Oculus {hand.upper()}] same headset axis as +x; redo the +y move.",
+                f"  [Oculus {H}] same headset axis as +x; redo the +y move.",
                 flush=True,
             )
         else:
@@ -356,7 +473,7 @@ class OculusInterface(TeleopInterface):
             self._calib[hand] = None
             self._save_calibration(hand)
             print(
-                f"  [Oculus {hand.upper()}] calibrated. Hold the trigger to move the arm.",
+                f"  [Oculus {H}] calibrated. Hold the trigger to move the arm.",
                 flush=True,
             )
 
@@ -364,7 +481,9 @@ class OculusInterface(TeleopInterface):
     def _load_calibration() -> Dict[str, np.ndarray]:
         try:
             with open(_CALIB_FILE) as f:
-                return {h: np.array(R, dtype=np.float64) for h, R in json.load(f).items()}
+                return {
+                    h: np.array(R, dtype=np.float64) for h, R in json.load(f).items()
+                }
         except (OSError, ValueError):
             return {}
 
@@ -416,6 +535,9 @@ class OculusInterface(TeleopInterface):
         return False
 
     def poll_success(self, robot_controller) -> bool:
+        if self._success.is_set():
+            self._success.clear()
+            return True
         if self._phase == "verdict" and self._event.is_set():
             self._event.clear()
             self._phase = None
@@ -439,7 +561,31 @@ class OculusInterface(TeleopInterface):
 
     @property
     def verdict_hint(self) -> str:
+        if self.auto_reset:
+            return "    B/Y → save as success   A/X → discard   joystick click → discard and calibrate"
         return "    A/X → success   joystick or B/Y → failure"
+
+    @property
+    def ready_hint(self) -> str:
+        lines = [
+            f"  Quest: A/X also starts and stops. Calibrate with {self._calib_buttons},"
+            " only if the headset moved."
+        ]
+        for hand in sorted(self._active_hands):
+            state = self._tracking.get(hand)
+            if state == "POSITION":
+                status = "tracked"
+            elif state:
+                status = f"tracking {state}: {_help(state)}"
+            else:
+                status = "tracking unknown"
+            calib = "calibrated" if self._R[hand] is not None else "NOT calibrated"
+            lines.append(f"  {hand.upper()} controller: {status}; {calib}")
+        return "\n".join(lines)
+
+    @property
+    def _calib_buttons(self) -> str:
+        return "the joystick" if self.auto_reset else "the joystick (or B/Y)"
 
     @property
     def banner(self) -> str:
@@ -447,8 +593,9 @@ class OculusInterface(TeleopInterface):
             "\n" + "=" * 60 + "\n"
             "  OCULUS TELEOPERATION ACTIVE\n" + "=" * 60 + "\n\n"
             "  1. Wait for 'tracking locked'\n"
-            "  2. Press the joystick (or B/Y): hold A/X, move along robot +x, release;\n"
-            "     hold A/X, move along robot +y, release\n"
+            "  2. Only if the headset moved (the calibration is saved): press the joystick\n"
+            "     (or B/Y); hold A/X, move along robot +x, release; hold A/X, move along\n"
+            "     robot +y, release\n"
             "  3. HOLD TRIGGER to move the arm; HOLD GRIP to close the gripper\n"
             "  A/X stops the recording; then A/X = success, joystick/B/Y = failure\n"
             "  Press Ctrl+C for EMERGENCY STOP (hold 5 s, then go home)\n\n"

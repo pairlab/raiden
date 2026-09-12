@@ -40,6 +40,11 @@ class TeleopInterface(ABC):
     # Optional overrides — defaults suit most future interfaces
     # ------------------------------------------------------------------
 
+    #: Sim collection (``rd record --sim``): recording runs from every scene reset,
+    #: ``poll_success`` saves the episode and ``poll_failure`` discards it.  Set by the
+    #: recorder before ``open()``; an interface may remap its buttons for it.
+    auto_reset: bool = False
+
     def open(self) -> None:
         """Open session-level peripherals (footpedal, etc.).
 
@@ -60,6 +65,26 @@ class TeleopInterface(ABC):
         Pass None when the episode ends.  Default: no-op.
         """
         self._recording_controller = robot_controller
+
+    def start_ready(self, robot_controller: "RobotController") -> bool:
+        """Start before the recorder's READY prompt, holding the arm until the recording starts.
+
+        The operator can then set the device up (e.g. calibrate the Quest) before a recording
+        instead of during one, and ``poll`` both starts and stops the recording.  Returns False
+        if the interface does not do this; the recorder then calls ``start()`` when recording
+        starts.  Default: False.
+        """
+        return False
+
+    @property
+    def calibrating(self) -> bool:
+        """True while the operator calibrates the device; no recording may start meanwhile."""
+        return False
+
+    @property
+    def ready_hint(self) -> str:
+        """Extra line(s) for the READY prompt, e.g. device status."""
+        return ""
 
     def poll(self, robot_controller: "RobotController") -> bool:
         """Return True on a trigger event (button press, footpedal left, etc.).

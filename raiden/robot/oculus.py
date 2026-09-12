@@ -81,6 +81,14 @@ def parse_line(data: str) -> Tuple[Dict[str, np.ndarray], Dict[str, object]]:
     return poses, parse_buttons(buttons_str)
 
 
+def _is_online(device) -> bool:
+    """True if adb reports the device as ``device`` (offline ones raise)."""
+    try:
+        return device.get_state() == "device"
+    except Exception:
+        return False
+
+
 class OculusReader:
     """Streams controller poses/buttons from the Quest app via ``adb logcat``."""
 
@@ -102,7 +110,14 @@ class OculusReader:
                     f"`adb tcpip {port}`, then `adb shell ip route` to find its IP."
                 )
         else:
-            usb = [d for d in client.devices() if d.serial.count(".") < 3]
+            usb = [
+                d
+                for d in client.devices()
+                if d.serial.count(".") < 3 and not d.serial.startswith("emulator-")
+            ]
+            # adb scans localhost ports 5554-5585 for emulators, so a raiden_sim_server on
+            # 5555 shows up as an offline "emulator-5554"; only keep devices that answer.
+            usb = [d for d in usb if _is_online(d)]
             if not usb:
                 raise RuntimeError(
                     "No Quest found over USB. `adb devices` must list the headset as 'device' "
@@ -180,16 +195,22 @@ class OculusReader:
     def start(self) -> None:
         self._running = True
         self._launch_app()
-        threading.Thread(
-            target=self.device.shell,
-            args=("logcat -T 0", self._read_logcat),
-            daemon=True,
-        ).start()
+        threading.Thread(target=self._stream, name="oculus-logcat", daemon=True).start()
         # The app only streams while it is the foreground immersive app; the
         # Quest shell steals focus whenever the worn state flips or a menu opens.
         threading.Thread(
             target=self._watchdog, name="oculus-watchdog", daemon=True
         ).start()
+
+    def _stream(self) -> None:
+        """Keep a logcat stream open; reopen it when adb drops it (USB hiccup, adb restart)."""
+        while self._running:
+            try:
+                self.device.shell("logcat -T 0", handler=self._read_logcat)
+            except Exception:
+                pass
+            if self._running:
+                time.sleep(1.0)
 
     def _watchdog(self) -> None:
         while self._running:

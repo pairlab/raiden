@@ -39,7 +39,7 @@ import tty
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import boto3
 import numpy as np
@@ -96,8 +96,12 @@ class DemonstrationRecorder:
         task_name: str,
         task_instruction: str,
         interface: TeleopInterface,
+        extra_metadata: Optional[Dict] = None,
+        monitor=None,
     ):
         self.cameras = cameras
+        self.monitor = monitor
+        self.extra_metadata = dict(extra_metadata or {})
         self.robot_controller = robot_controller
         self.recording_dir = recording_dir
         self.task_name = task_name
@@ -118,7 +122,9 @@ class DemonstrationRecorder:
     # Public API
     # ------------------------------------------------------------------
 
-    def start_recording(self) -> None:
+    def start_recording(
+        self, hint: str = "  Press the button again to stop recording"
+    ) -> None:
         if self.is_recording:
             return
 
@@ -177,9 +183,11 @@ class DemonstrationRecorder:
         print("\n" + "!" * 60)
         print("  RECORDING STARTED")
         print("!" * 60)
-        print("  Press the button again to stop recording\n")
+        print(hint + "\n")
 
-    def stop_recording(self, complete: bool = True) -> Path:
+    def stop_recording(
+        self, complete: bool = True, shutdown_robots: bool = True
+    ) -> Path:
         """Stop the current recording episode and persist data.
 
         Shuts down the robot controller (returns home + closes motor connections)
@@ -191,6 +199,8 @@ class DemonstrationRecorder:
             complete: Set to True when the episode was cleanly stopped by the
                       user.  Set to False on crash / Ctrl-C so the directory
                       can be detected as incomplete and overridden next run.
+            shutdown_robots: Set to False to keep the robots up (sim collection,
+                      where the next episode starts from a scene reset).
         """
         if not self.is_recording:
             return self.recording_dir
@@ -199,11 +209,37 @@ class DemonstrationRecorder:
         self._stop_event.set()
         duration = time.monotonic() - self._start_time
 
-        # Shut down robot (return home + close motor connections).
-        # Motors must be closed between episodes — keeping them alive idle
-        # causes DM4310 CAN watchdog errors due to lack of regular commands.
-        self.robot_controller.shutdown()
+        # Finalize the camera files before shutdown moves the robot home.  Otherwise
+        # the video contains homing motion after robot telemetry has already stopped.
+        self._stop_streams()
 
+        if shutdown_robots:
+            # Motors must be closed between episodes — keeping them alive idle
+            # causes DM4310 CAN watchdog errors due to lack of regular commands.
+            self.robot_controller.shutdown()
+
+        print("\n" + "!" * 60)
+        print("  RECORDING STOPPED")
+        print(f"  Duration : {duration:.2f} s")
+        print(f"  Robot frames : {len(self._robot_frames)}")
+        print("!" * 60 + "\n")
+
+        self._save_robot_data()
+        self._save_metadata(duration, complete=complete)
+
+        return self.recording_dir
+
+    def discard(self) -> None:
+        """Stop the episode without saving it and delete its directory; robots stay up."""
+        if not self.is_recording:
+            return
+        self.is_recording = False
+        self._stop_event.set()
+        self._stop_streams()
+        shutil.rmtree(self.recording_dir, ignore_errors=True)
+        print("\n  Episode discarded\n")
+
+    def _stop_streams(self) -> None:
         # Wait for threads (camera grab threads will exit within one frame period)
         for t in self._threads:
             t.join(timeout=3.0)
@@ -219,18 +255,6 @@ class DemonstrationRecorder:
         for t in stop_threads:
             t.join()
 
-        print("\n" + "!" * 60)
-        print("  RECORDING STOPPED")
-        print(f"  Duration : {duration:.2f} s")
-        print(f"  Robot frames : {len(self._robot_frames)}")
-        print("!" * 60 + "\n")
-
-        # Persist robot data
-        self._save_robot_data()
-        self._save_metadata(duration, complete=complete)
-
-        return self.recording_dir
-
     # ------------------------------------------------------------------
     # Background threads
     # ------------------------------------------------------------------
@@ -238,7 +262,12 @@ class DemonstrationRecorder:
     def _camera_loop(self, camera: Camera, stop_event: threading.Event) -> None:
         """Grab loop – camera SDK rate-limits to its own FPS (30 Hz)."""
         while not stop_event.is_set():
-            camera.grab()
+            if not camera.grab():
+                continue
+            if self.monitor is not None:
+                # Hands over the frame already captured; encoding happens on the monitor
+                # thread so this loop keeps the camera's own rate.
+                self.monitor.log(camera.name, camera.get_frame().color)
 
     def _robot_loop(self, stop_event: threading.Event, ref_camera) -> None:
         """Read joint observations at ~100 Hz and buffer them.
@@ -263,6 +292,11 @@ class DemonstrationRecorder:
                 obs = self.robot_controller.get_all_observations()
                 cmd = self.robot_controller.get_last_commanded_positions()
                 self._robot_frames.append({"t": ts_ns, "obs": obs, "cmd": cmd})
+                if self.monitor is not None:
+                    # Parks the array for the grasp guides; FK happens on the monitor thread.
+                    for arm in ("follower_l", "follower_r"):
+                        if arm in obs and "joint_pos" in obs[arm]:
+                            self.monitor.log_joints(arm, obs[arm]["joint_pos"])
             except Exception as e:
                 print(f"  Warning: robot observation failed: {e}")
 
@@ -372,6 +406,7 @@ class DemonstrationRecorder:
         }
         if rs_offsets:
             meta_dict["realsense_clock_offsets"] = rs_offsets
+        meta_dict.update(self.extra_metadata)
 
         with open(output_file, "w") as f:
             json.dump(meta_dict, f, indent=2)
@@ -525,7 +560,8 @@ def _next_recording_dir(task_dir: Path) -> Path:
             last_dir.mkdir()
             return last_dir
 
-    episode_idx = f"{len(existing):04d}"
+    # After the highest number, not the count: deleted episodes leave gaps.
+    episode_idx = f"{int(existing[-1].name) + 1 if existing else 0:04d}"
     new_dir = task_dir / episode_idx
     new_dir.mkdir()
     return new_dir
@@ -560,6 +596,8 @@ def _wait_for_enter_or_quit(
 ) -> bool:
     """Wait for Enter/Space (proceed) or 'q' (quit session).
 
+    A start is ignored while the device is calibrating: calibration stays out of recordings.
+
     Returns:
         True  — 'q' pressed or footpedal e-stop; caller should end the session.
         False — Enter/Space or footpedal left fired; caller should proceed.
@@ -571,14 +609,16 @@ def _wait_for_enter_or_quit(
         while True:
             if robot_controller.session_estop_requested:
                 return True
-            if interface.poll(robot_controller):
+            if interface.poll(robot_controller) and not interface.calibrating:
                 return False
             if select.select([sys.stdin], [], [], 0)[0]:
                 ch = sys.stdin.read(1)
                 if ch.lower() == "q":
                     return True
                 if ch in ("\r", "\n", " "):
-                    return False
+                    if not interface.calibrating:
+                        return False
+                    print("  Finish or cancel the calibration first.")
             time.sleep(0.05)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -671,6 +711,157 @@ def _wait_for_start_or_quit(
 
 
 # ---------------------------------------------------------------------------
+# Sim collection
+# ---------------------------------------------------------------------------
+
+
+def _wait_for_sim_action(
+    robot_controller: RobotController,
+    interface: TeleopInterface,
+    task,
+    use_stdin: bool,
+) -> str:
+    """Block until the operator saves ("save"), discards ("discard"), calibrates ("calibrate")
+    or ends ("quit").
+
+    Prints the sim's subtask completions meanwhile, so the operator sees when the task is done.
+    """
+    while True:
+        if robot_controller.session_estop_requested:
+            return "quit"
+        if interface.calibrating:
+            return "calibrate"
+        if interface.poll_success(robot_controller):
+            return "save"
+        if interface.poll_failure(robot_controller):
+            return "discard"
+        if use_stdin and select.select([sys.stdin], [], [], 0)[0]:
+            ch = sys.stdin.read(1).lower()
+            if ch in ("\r", "\n"):
+                return "save"
+            if ch == "r":
+                return "discard"
+            if ch == "q":
+                return "quit"
+        if task.poll():
+            for event in task.drain_events():
+                print(f"  {event}")
+        time.sleep(0.05)
+
+
+def _run_sim_episodes(
+    cameras: List[Camera],
+    interface: TeleopInterface,
+    sim: str,
+    task_dir: Path,
+    task_name: str,
+    task_instruction: str,
+    monitor,
+    on_saved: Callable[[Path], None],
+    active_ctrl: List[Optional[RobotController]],
+) -> Optional[Path]:
+    """Sim collection: record from every scene reset; only a success is saved.
+
+    - success (Quest B/Y, middle pedal, Enter) → save the episode, reset, record the next one
+    - failure (Quest A/X, right pedal, 'r')   → discard the episode, reset, record the next one
+    - calibration (Quest joystick)             → discard the episode; reset once it is done
+    - 'q' or a soft pause (left pedal)        → discard the episode and end the session
+
+    Only saved episodes keep a directory, so episode numbers stay contiguous.  The controller
+    stays up for the whole session (the sim has no CAN watchdog), so a reset is a snap home
+    and a new object layout, not a re-initialisation.  Returns the last saved episode.
+    """
+    from raiden.sim import TaskMonitor
+
+    robot_controller = RobotController(
+        use_right_leader=False,
+        use_left_leader=interface.uses_leaders,
+        use_right_follower=False,
+        use_left_follower=True,
+        sim=sim,
+    )
+    active_ctrl[0] = robot_controller
+    task = TaskMonitor(sim)
+    hint = "\n".join(
+        line
+        for line in (
+            interface.verdict_hint,
+            "    Middle pedal → save   Right pedal → discard",
+            "    Enter → save   r → discard   q → discard and end the session",
+        )
+        if line
+    )
+
+    use_stdin = sys.stdin.isatty()
+    old_settings = termios.tcgetattr(sys.stdin.fileno()) if use_stdin else None
+    recorder: Optional[DemonstrationRecorder] = None
+    last_saved: Optional[Path] = None
+    n_saved = 0
+    try:
+        robot_controller.setup_for_teleop_recording()
+        interface.setup(robot_controller)
+        if use_stdin:
+            tty.setcbreak(sys.stdin.fileno())
+        while True:
+            recording_dir = _next_recording_dir(task_dir)
+            recorder = DemonstrationRecorder(
+                cameras=cameras,
+                robot_controller=robot_controller,
+                recording_dir=recording_dir,
+                task_name=task_name,
+                task_instruction=task_instruction,
+                interface=interface,
+                extra_metadata={"simulator": {"address": sim}},
+                monitor=monitor,
+            )
+            interface.start(robot_controller)
+            interface.set_active_recording(robot_controller)
+            robot_controller.enable_estop()
+            recorder.start_recording(hint=f"  Episode {recording_dir.name}\n{hint}")
+
+            action = _wait_for_sim_action(robot_controller, interface, task, use_stdin)
+            if action == "save":
+                saved_dir = recorder.stop_recording(
+                    complete=True, shutdown_robots=False
+                )
+                on_saved(saved_dir)
+                last_saved, n_saved = saved_dir, n_saved + 1
+                print(f"✓ Saved as success → {saved_dir}  ({n_saved} this session)")
+                task.poll(force=True)
+                if not task.status.get("success"):
+                    print("  Note: the sim does not score this episode a success.")
+            else:
+                recorder.discard()
+            recorder = None
+            if action == "quit":
+                print("\nEnding session.\n")
+                break
+            if action == "calibrate":
+                # Calibration stays out of recordings: finish it, then record from a fresh reset.
+                print("  Calibrating. The scene resets when it is done.")
+                while (
+                    interface.calibrating
+                    and not robot_controller.session_estop_requested
+                ):
+                    time.sleep(0.05)
+
+            interface.stop(robot_controller)
+            robot_controller.reset_sim_episode()
+    except Exception as e:
+        print(f"\nError during recording: {e}")
+        if recorder is not None and recorder.is_recording:
+            recorder.discard()
+    finally:
+        if old_settings is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+        interface.set_active_recording(None)
+        task.close()
+        robot_controller.shutdown()
+        active_ctrl[0] = None
+    return last_saved
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -683,8 +874,18 @@ def run_recording(
     calibration_file: str = CALIBRATION_FILE,
     arms: str = "bimanual",
     data_dir: str = "data",
+    sim: str = "",
+    monitor: bool = False,
+    monitor_view: str = "",
+    monitor_web: bool = False,
+    sim_fps: int = 30,
 ) -> None:
     """Run teleoperation with continuous demonstration recording.
+
+    ``sim`` = address of a running MESA ``raiden_sim_server``: the left follower and both
+    cameras are the digital twin; teleop, timing and files are unchanged.  The episode
+    flow differs: recording runs from every scene reset and only a success is saved
+    (:func:`_run_sim_episodes`).
 
     Cameras and robots are fully instantiated and torn down each episode so
     every demonstration starts from a clean state.
@@ -725,25 +926,70 @@ def run_recording(
     calibration_result_id = latest_calib["id"] if latest_calib else None
 
     def _copy_calibration(dest_dir: Path) -> None:
+        if sim:
+            from raiden.sim import write_sim_files
+
+            write_sim_files(dest_dir, sim)
+            print(f"✓ Sim calibration and model written → {dest_dir}")
+            return
+        from raiden.sim import table_pose
+
         calib_src = Path(calibration_file)
-        if calib_src.exists():
-            shutil.copy(calib_src, dest_dir / calib_src.name)
-            print(f"✓ Calibration copied → {dest_dir / calib_src.name}")
-        else:
+        calib = json.loads(calib_src.read_text()) if calib_src.exists() else {}
+        if not calib:
             print(f"  Warning: calibration file not found at {calib_src}")
+        # The table pose comes from the taped rig layout, the same file the sim table is built from.
+        layout = Path(data_dir) / "real2sim" / "calibration" / "layout.json"
+        if "table" not in calib and layout.exists():
+            calib["table"] = {
+                "T_base_table": table_pose(json.loads(layout.read_text())).tolist()
+            }
+        if calib:
+            (dest_dir / "calibration_results.json").write_text(
+                json.dumps(calib, indent=2)
+            )
+            print(f"✓ Calibration written → {dest_dir / 'calibration_results.json'}")
 
     # ── optional footpedal (once per session) ────────────────────────────
+    interface.auto_reset = bool(sim)
     interface.open()
 
     # ── one-time camera + robot initialisation ───────────────────────────
     print("Initializing cameras...")
     try:
-        cameras = load_cameras_from_config(camera_config_file)
+        if sim:
+            from raiden.sim import load_sim_cameras
+
+            cameras = load_sim_cameras(sim, camera_config_file, fps=sim_fps)
+        else:
+            cameras = load_cameras_from_config(camera_config_file)
     except Exception as e:
         print(f"Error initialising cameras: {e}")
         interface.close()
         return
     print(f"✓ {len(cameras)} camera(s) ready\n")
+
+    live_monitor = None
+    if monitor or monitor_view:
+        from raiden.guides import make_guides
+        from raiden.monitor import make_monitor
+
+        # The grasp guides MESA's collector draws on the gripper, projected into the views
+        # the operator is actually watching.  Overlay only -- recorded frames are untouched.
+        try:
+            guides = make_guides(cameras, sim=sim)
+        except Exception as exc:
+            print(f"  grasp guides unavailable ({type(exc).__name__}: {exc})")
+            guides = None
+        # Sim: an operator view (default MESA's leftshoulder) takes the scene camera's panel;
+        # the wrist camera stays.  Display only -- what is recorded does not change.
+        view = {"": "leftshoulder" if sim else "", "none": ""}.get(
+            monitor_view, monitor_view
+        )
+        shown = [c.name for c in cameras if not view or "wrist" in c.name]
+        live_monitor = make_monitor(
+            shown, sim=sim, view=view, web=monitor_web, guides=guides
+        )
 
     # Signal handler updated each episode to point at the current controller.
     _active_ctrl: List[Optional[RobotController]] = [None]
@@ -755,6 +1001,44 @@ def run_recording(
     signal.signal(signal.SIGTERM, emergency_stop)
     signal.signal(signal.SIGINT, emergency_stop)
 
+    def _close_session() -> None:
+        for cam in cameras:
+            cam.close()
+        if live_monitor is not None:
+            live_monitor.close()
+        interface.close()
+
+    if sim:
+
+        def _save_demo(saved_dir: Path) -> None:
+            _copy_calibration(saved_dir)
+            if task_id is not None:
+                demo_id = db.add_demonstration(
+                    teacher_id=teacher_id,
+                    task_id=task_id,
+                    raw_data_path=str(saved_dir),
+                    camera_config_id=camera_config_id,
+                    calibration_result_id=calibration_result_id,
+                )
+                db.update_demonstration(demo_id, status="success", converted=False)
+
+        try:
+            last_saved_dir = _run_sim_episodes(
+                cameras=cameras,
+                interface=interface,
+                sim=sim,
+                task_dir=task_dir,
+                task_name=task_name,
+                task_instruction=task_instruction,
+                monitor=live_monitor,
+                on_saved=_save_demo,
+                active_ctrl=_active_ctrl,
+            )
+        finally:
+            _close_session()
+        _report_session(last_saved_dir, s3_bucket, s3_prefix)
+        return
+
     # ── continuous episode loop ──────────────────────────────────────────
     # Cameras stay open for the whole session (SDK init is slow).
     # Robot controller is reinited each episode — keeping motor CAN threads
@@ -763,7 +1047,7 @@ def run_recording(
     recorder: Optional[DemonstrationRecorder] = None
     robot_controller: Optional[RobotController] = None
 
-    use_right = arms == "bimanual"
+    use_right = arms == "bimanual" and not sim
     use_left = True
 
     try:
@@ -776,6 +1060,7 @@ def run_recording(
                 use_left_leader=interface.uses_leaders and use_left,
                 use_right_follower=use_right,
                 use_left_follower=use_left,
+                sim=sim or None,
             )
             _active_ctrl[0] = robot_controller
 
@@ -787,6 +1072,9 @@ def run_recording(
 
             # Setup interface (warmup IK, attach devices, etc.)
             interface.setup(robot_controller)
+            # Quest: teleop runs from here with the arm held at home, so the operator can
+            # calibrate before the recording instead of during it.
+            started = interface.start_ready(robot_controller)
 
             # Flush stdout so any SDK log output has time to drain before
             # printing the READY banner.
@@ -802,6 +1090,8 @@ def run_recording(
                 print("\n  Press button on any leader arm or left pedal to START.")
             else:
                 print("\n  Press Enter or left pedal to START recording.")
+            if interface.ready_hint:
+                print(interface.ready_hint)
             print("  Press 'q' to end session.\n")
             print("=" * 60 + "\n")
 
@@ -820,6 +1110,10 @@ def run_recording(
             recording_dir = _next_recording_dir(task_dir)
             print(f"\n  Output: {recording_dir}")
 
+            # Sim object poses, task flags and state are logged per frame by the cameras.
+            extra_meta: Dict[str, object] = (
+                {"simulator": {"address": sim}} if sim else {}
+            )
             recorder = DemonstrationRecorder(
                 cameras=cameras,
                 robot_controller=robot_controller,
@@ -827,8 +1121,11 @@ def run_recording(
                 task_name=task_name,
                 task_instruction=task_instruction,
                 interface=interface,
+                extra_metadata=extra_meta,
+                monitor=live_monitor,
             )
-            interface.start(robot_controller)
+            if not started:
+                interface.start(robot_controller)
             recorder.start_recording()
             robot_controller.enable_estop()
             interface.set_active_recording(robot_controller)
@@ -852,14 +1149,15 @@ def run_recording(
                     if interface.poll_failure(robot_controller):
                         forced_failure = True
                         break
-                    if needs_stdin:
-                        if select.select([sys.stdin], [], [], 0)[0]:
-                            ch = sys.stdin.read(1)
-                            if ch in ("\r", "\n", " "):
-                                break
-                    else:
-                        if interface.poll(robot_controller):
+                    if needs_stdin and select.select([sys.stdin], [], [], 0)[0]:
+                        ch = sys.stdin.read(1)
+                        if ch in ("\r", "\n", " "):
                             break
+                    # Leader button, or the Quest's A/X (started at READY) stops the recording.
+                    if (started or not needs_stdin) and interface.poll(
+                        robot_controller
+                    ):
+                        break
                     time.sleep(0.05)
             finally:
                 if old_settings is not None:
@@ -939,10 +1237,14 @@ def run_recording(
         # Robots are shut down per-episode; only cameras and interface remain.
         if robot_controller is not None:
             robot_controller.shutdown()
-        for cam in cameras:
-            cam.close()
-        interface.close()
+        _close_session()
 
+    _report_session(last_saved_dir, s3_bucket, s3_prefix)
+
+
+def _report_session(
+    last_saved_dir: Optional[Path], s3_bucket: Optional[str], s3_prefix: str
+) -> None:
     # ── optional S3 upload ───────────────────────────────────────────────
     if s3_bucket and last_saved_dir:
         print("\nUploading to S3...")
