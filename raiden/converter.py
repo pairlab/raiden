@@ -56,6 +56,9 @@ from raiden.camera_config import CameraConfig
 
 _SEQUENCE_NAME = "0000"
 _IMG_EXT = ".png"
+# Per-frame camera-to-base poses, written next to a sim camera's rendered frames so that they
+# follow the frames through timestamp selection and trimming.
+_POSES_FILE = "camera_poses.npy"
 
 # Cameras whose images are physically mounted upside-down and need a 180° correction.
 _FLIP_CAMERAS = {"right_wrist_camera"}
@@ -68,6 +71,30 @@ _ROLE_TO_JOINT_KEY: Dict[str, str] = {
 
 # Lazily-loaded kinematics instance (MuJoCo FK for YAM arm).
 _kinematics: Any = None
+
+# Unix timestamp for 2020-01-01 in nanoseconds — anything below this is a
+# hardware-relative counter, not wall-clock.
+_WALL_CLOCK_MIN_NS = 1_577_836_800_000_000_000
+
+
+class ConversionError(RuntimeError):
+    """Raised when a recording cannot be converted into a consistent episode."""
+
+
+def _apply_rs_clock_offset(
+    ts_arr: np.ndarray, clock_offset: Optional[int]
+) -> np.ndarray:
+    """Shift RealSense frame timestamps onto the host clock if they are not already.
+
+    With ``global_time_enabled`` the bag timestamps are wall-clock and the
+    offset measured at record time is just pipeline latency (tens to hundreds
+    of ms, different per camera) — applying it would skew the cameras against
+    each other and against the robot data.  Only apply it to hardware-clock
+    timestamps.
+    """
+    if clock_offset is None or len(ts_arr) == 0 or int(ts_arr[0]) > _WALL_CLOCK_MIN_NS:
+        return ts_arr
+    return ts_arr + int(clock_offset)
 
 
 def _get_kinematics() -> Any:
@@ -329,7 +356,7 @@ def _extract_bag(
     flip: bool = False,
     max_frames: Optional[int] = None,
 ) -> Tuple[np.ndarray, Optional[dict]]:
-    """Extract color and depth frames from a RealSense .bag file.
+    """Extract color (and depth, if recorded) frames from a RealSense .bag file.
 
     Returns (timestamps_ns, camera_info).  timestamps_ns is an int64 array of
     per-frame wall-clock timestamps (nanoseconds since Unix epoch) saved by the
@@ -343,10 +370,12 @@ def _extract_bag(
         return np.array([], dtype=np.int64), None
 
     rgb_dir.mkdir(parents=True, exist_ok=True)
-    depth_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"  Opening {bag_path.name} ...")
-    camera = RealSenseCamera.from_bag(bag_path.stem, bag_path)
+    crop = CameraConfig(CAMERA_CONFIG).get_crop(bag_path.stem)
+    if crop is not None:
+        print(f"    crop {crop}")
+    camera = RealSenseCamera.from_bag(bag_path.stem, bag_path, crop=crop)
 
     timestamps: List[int] = []
     idx = 0
@@ -359,10 +388,12 @@ def _extract_bag(
         color = cv2.rotate(frame.color, cv2.ROTATE_180) if flip else frame.color
         cv2.imwrite(str(rgb_dir / f"{idx:010d}{_IMG_EXT}"), color)
 
-        depth_mm = (frame.depth * 1000.0).clip(0, 65535).astype(np.uint16)
-        if flip:
-            depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_180)
-        np.savez_compressed(str(depth_dir / f"{idx:010d}.npz"), depth=depth_mm)
+        if frame.depth is not None:  # bags recorded with depth off have none
+            depth_mm = (frame.depth * 1000.0).clip(0, 65535).astype(np.uint16)
+            if flip:
+                depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_180)
+            depth_dir.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(str(depth_dir / f"{idx:010d}.npz"), depth=depth_mm)
 
         timestamps.append(frame.timestamp_ns)
         idx += 1
@@ -394,6 +425,111 @@ def _extract_bag(
     return ts_arr, camera_info
 
 
+def _extract_simrec(
+    sim_dir: Path,
+    rgb_dir: Path,
+    model_xml: Path,
+    T_world_base: Optional[np.ndarray],
+) -> Tuple[np.ndarray, Optional[dict]]:
+    """Write a :class:`raiden.sim.SimCamera` recording into the sequence layout.
+
+    ``sim_dir`` holds ``timestamps.npy`` (host ns), ``camera_info.json`` and ``sim_state.npz``,
+    the state each frame was rendered from.  The frames are rendered again from those states in
+    ``model_xml`` (the episode's ``sim_model.xml``), and each frame's camera pose is read from
+    the same state into ``rgb_dir/camera_poses.npy``.
+    """
+    ts_path = sim_dir / "timestamps.npy"
+    ts_arr = (
+        np.load(str(ts_path)).astype(np.int64)
+        if ts_path.exists()
+        else np.array([], dtype=np.int64)
+    )
+    info: Optional[dict] = None
+    info_path = sim_dir / "camera_info.json"
+    if info_path.exists():
+        with open(info_path) as f:
+            info = json.load(f)
+    rgb_dir.parent.mkdir(parents=True, exist_ok=True)
+    if (sim_dir / "sim_state.npz").exists():
+        from raiden.sim.render import render_states
+
+        if not model_xml.exists() or info is None:
+            raise ConversionError(
+                f"{sim_dir.name}: needs {model_xml.name} and camera_info.json to render its frames"
+            )
+        states = np.load(str(sim_dir / "sim_state.npz"))["state"]
+        poses = render_states(
+            model_xml,
+            info["mujoco_camera"],
+            states,
+            info["width"],
+            info["height"],
+            rgb_dir,
+        )
+        if T_world_base is None:
+            raise ConversionError(
+                f"{sim_dir.name}: the sim model is not placed in the base frame"
+            )
+        np.save(
+            str(rgb_dir / _POSES_FILE),
+            (np.linalg.inv(T_world_base) @ poses).astype(np.float32),
+        )
+        print(f"    {len(poses)} frames rendered from the logged sim states")
+    else:
+        rgb_dir.mkdir(parents=True, exist_ok=True)
+    np.save(str(rgb_dir / "timestamps.npy"), ts_arr)
+    if len(ts_arr) > 1:
+        duration_s = (int(ts_arr[-1]) - int(ts_arr[0])) / 1e9
+        fps = (len(ts_arr) - 1) / duration_s if duration_s > 0 else 0.0
+        print(f"    Actual FPS: {fps:.1f}  duration: {duration_s:.2f}s")
+    return ts_arr, info
+
+
+def _sim_base_frame(
+    simrec_dirs: List[Path], model_xml: Path, calib: Optional[dict]
+) -> Optional[np.ndarray]:
+    """Place the episode's sim model in the arm base frame, or ``None`` if nothing is rendered."""
+    if not model_xml.exists() or not any(
+        (d / "sim_state.npz").exists() for d in simrec_dirs
+    ):
+        return (
+            None  # nothing to render, or _extract_simrec will report the missing model
+        )
+    from raiden.sim.calibration import base_in_world
+
+    cameras: Dict[str, str] = {}
+    for d in simrec_dirs:
+        info_path = d / "camera_info.json"
+        if info_path.exists():
+            with open(info_path) as f:
+                mujoco_camera = json.load(f).get("mujoco_camera")
+            if mujoco_camera:
+                cameras[d.stem] = mujoco_camera
+    return base_in_world(model_xml, cameras, calib or {})
+
+
+def _load_sim_log(simrec_dirs: List[Path]) -> Optional[Dict[str, np.ndarray]]:
+    """Merge every sim camera's ``sim_state.npz`` into one log sorted by time.
+
+    Each file holds the state its camera's frames were rendered from, so the reference camera's
+    frames find their own snapshot exactly.
+    """
+    parts = [
+        dict(np.load(d / "sim_state.npz"))
+        for d in simrec_dirs
+        if (d / "sim_state.npz").exists()
+    ]
+    if not parts:
+        return None
+    order = np.argsort(np.concatenate([p["t_ns"] for p in parts]), kind="stable")
+    log = {
+        k: np.concatenate([p[k] for p in parts])[order]
+        for k in ("t_ns", "state", "object_poses", "subtask_done", "success")
+    }
+    log["objects"], log["subtasks"] = parts[0]["objects"], parts[0]["subtasks"]
+    return log
+
+
 # ---------------------------------------------------------------------------
 # Cross-camera temporal alignment
 # ---------------------------------------------------------------------------
@@ -405,120 +541,169 @@ def _align_cameras_by_timestamp(
     frame_counts: Dict[str, int],
     camera_start_times_ns: Optional[Dict[str, int]] = None,
     camera_fps: float = 30.0,
+    robot_timestamps: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[str, Optional[np.ndarray]], Dict[str, int]]:
-    """Trim per-camera frames to their overlapping recording window.
+    """Resample cameras onto one timestamp grid inside the telemetry window.
 
-    Strategy (tried in order):
-
-    1. **Wall-clock timestamp alignment** — if every camera's ``timestamps.npy``
-       contains Unix-epoch nanoseconds (> year 2020), find the common time range
-       and trim each camera to it.  This is the most accurate method.
-
-    2. **Recording start-time alignment** — fall back to ``camera_start_times_ns``
-       from ``metadata.json`` (wall-clock time recorded just before each
-       ``camera.start_recording()`` call).  The per-camera start offset in
-       frames is ``(t_start[cam] - t_start_min) * fps / 1e9``.  Less accurate
-       than per-frame timestamps but works even when bag timestamps are not
-       wall-clock (e.g. RealSense hardware clock).
-
-    Renames on-disk jpg/npz files so that frame 0 of every camera corresponds
-    to the same point in time.
-
-    Returns updated (cam_timestamps, frame_counts).
+    The first camera is the reference clock. Every other camera is mapped to
+    its nearest frame rather than paired by array index. When robot timestamps
+    are available, the reference grid is intersected with their range so robot
+    values are never extrapolated into a trailing camera-only interval.
     """
-    # Unix timestamp for 2020-01-01 in nanoseconds — anything below this is
-    # almost certainly a hardware-relative counter, not wall-clock.
-    _WALL_CLOCK_MIN_NS = 1_577_836_800_000_000_000
+    if not frame_counts:
+        return cam_timestamps, frame_counts
 
-    # --- Strategy 1: per-frame wall-clock timestamps ----------------------
-    wall_ts = {
-        name: ts
-        for name, ts in cam_timestamps.items()
-        if ts is not None and len(ts) > 0 and int(ts[0]) > _WALL_CLOCK_MIN_NS
-    }
+    missing = []
+    raw_ts: Dict[str, np.ndarray] = {}
+    for name, count in frame_counts.items():
+        timestamps = cam_timestamps.get(name)
+        if timestamps is None or len(timestamps) != count:
+            missing.append(name)
+        else:
+            raw_ts[name] = np.asarray(timestamps, dtype=np.int64)
+    if missing:
+        raise ConversionError(
+            "cannot align cameras without one timestamp per frame: "
+            + ", ".join(missing)
+        )
 
-    if len(wall_ts) >= 2:
-        # At least two cameras have wall-clock timestamps — align all of them.
-        t_start = max(int(ts[0]) for ts in wall_ts.values())
-        t_end = min(int(ts[-1]) for ts in wall_ts.values())
+    for name, ts in raw_ts.items():
+        if len(ts) == 0 or np.any(np.diff(ts) < 0):
+            raise ConversionError(f"{name} has empty or non-monotonic timestamps")
 
-        if t_start < t_end:
-            new_timestamps = dict(cam_timestamps)
-            new_frame_counts = dict(frame_counts)
-
-            for name, ts in wall_ts.items():
-                start_idx = int(np.searchsorted(ts, t_start))
-                end_idx = int(np.searchsorted(ts, t_end, side="right"))
-                _apply_camera_trim(seq_dir, name, start_idx, end_idx, ts)
-                new_timestamps[name] = ts[start_idx:end_idx]
-                new_frame_counts[name] = end_idx - start_idx
-
-            print(
-                f"  Timestamp alignment: common window {(t_end - t_start) / 1e9:.2f}s"
+    wall_clock = {name: int(ts[0]) > _WALL_CLOCK_MIN_NS for name, ts in raw_ts.items()}
+    if all(wall_clock.values()):
+        aligned_ts = raw_ts
+        clock_is_wall = True
+    elif camera_start_times_ns and all(
+        name in camera_start_times_ns for name in raw_ts
+    ):
+        # Map only hardware clocks onto the host clock; wall-clock streams are
+        # already comparable and must not be shifted to camera startup time.
+        aligned_ts = {
+            name: (
+                ts
+                if wall_clock[name]
+                else ts - ts[0] + int(camera_start_times_ns[name])
             )
-            return new_timestamps, new_frame_counts
-
-    # --- Strategy 2: recording start-time alignment -----------------------
-    if camera_start_times_ns and len(camera_start_times_ns) >= 2:
-        t_min = min(camera_start_times_ns.values())
-        offsets = {
-            name: int(round((t - t_min) * camera_fps / 1e9))
-            for name, t in camera_start_times_ns.items()
-            if name in frame_counts
+            for name, ts in raw_ts.items()
         }
-        if any(off > 0 for off in offsets.values()):
-            new_timestamps = dict(cam_timestamps)
-            new_frame_counts = dict(frame_counts)
+        clock_is_wall = True
+    elif not any(wall_clock.values()):
+        # Legacy recordings without start metadata can still align camera-to-camera.
+        aligned_ts = {name: ts - ts[0] for name, ts in raw_ts.items()}
+        clock_is_wall = False
+    else:
+        raise ConversionError(
+            "camera timestamps use mixed clock domains and recording start times are unavailable"
+        )
 
-            for name, start_idx in offsets.items():
-                if start_idx == 0:
-                    continue
-                n_total = frame_counts[name]
-                end_idx = n_total  # keep all frames after the offset
-                ts = cam_timestamps.get(name)
-                _apply_camera_trim(seq_dir, name, start_idx, end_idx, ts)
-                new_timestamps[name] = ts[start_idx:end_idx] if ts is not None else None
-                new_frame_counts[name] = end_idx - start_idx
-
-            offsets_str = ", ".join(
-                f"{n}={off}fr" for n, off in offsets.items() if off > 0
+    t_start = max(int(ts[0]) for ts in aligned_ts.values())
+    t_end = min(int(ts[-1]) for ts in aligned_ts.values())
+    if robot_timestamps is not None and len(robot_timestamps) > 0:
+        robot_ts = np.asarray(robot_timestamps, dtype=np.int64)
+        if np.any(np.diff(robot_ts) < 0):
+            raise ConversionError("robot timestamps are non-monotonic")
+        robot_is_wall = int(robot_ts[0]) > _WALL_CLOCK_MIN_NS
+        if clock_is_wall != robot_is_wall:
+            raise ConversionError(
+                "camera and robot timestamps use different clock domains"
             )
-            print(f"  Start-time alignment: skipped {offsets_str}")
-            return new_timestamps, new_frame_counts
+        t_start = max(t_start, int(robot_ts[0]))
+        t_end = min(t_end, int(robot_ts[-1]))
 
-    return cam_timestamps, frame_counts
+    if t_start > t_end:
+        raise ConversionError("camera and robot timestamp ranges do not overlap")
+
+    reference = next(iter(frame_counts))
+    ref_ts = aligned_ts[reference]
+    ref_indices = np.flatnonzero((ref_ts >= t_start) & (ref_ts <= t_end))
+    if len(ref_indices) == 0:
+        raise ConversionError("no reference-camera frames overlap robot telemetry")
+    grid = ref_ts[ref_indices]
+
+    selections: Dict[str, np.ndarray] = {}
+    max_allowed_ns = int(round(1e9 / camera_fps))
+    for name, ts in aligned_ts.items():
+        eligible = np.flatnonzero((ts >= t_start) & (ts <= t_end))
+        if len(eligible) == 0:
+            raise ConversionError(f"{name} has no frames inside robot telemetry")
+        if name == reference:
+            indices = ref_indices
+        else:
+            candidate_ts = ts[eligible]
+            right = np.searchsorted(candidate_ts, grid, side="left")
+            right = np.clip(right, 0, len(candidate_ts) - 1)
+            left = np.maximum(right - 1, 0)
+            choose_left = np.abs(grid - candidate_ts[left]) <= np.abs(
+                candidate_ts[right] - grid
+            )
+            indices = eligible[np.where(choose_left, left, right)]
+
+        residual_ns = np.abs(ts[indices] - grid)
+        max_residual_ns = int(np.max(residual_ns))
+        median_ms = float(np.median(residual_ns)) / 1e6
+        max_ms = max_residual_ns / 1e6
+        print(
+            f"  Timestamp sync {name}: median {median_ms:.2f} ms, max {max_ms:.2f} ms"
+        )
+        if max_residual_ns > max_allowed_ns:
+            raise ConversionError(
+                f"{name} residual timestamp error {max_ms:.2f} ms exceeds "
+                f"one {1000.0 / camera_fps:.2f} ms frame"
+            )
+        selections[name] = indices
+
+    selected: Dict[str, np.ndarray] = {}
+    for name, indices in selections.items():
+        ts = aligned_ts[name]
+        _apply_camera_selection(seq_dir, name, indices, ts[indices])
+        selected[name] = ts[indices]
+
+    print(
+        f"  Timestamp grid: {reference}, {len(grid)} frames over "
+        f"{(int(grid[-1]) - int(grid[0])) / 1e9:.2f}s"
+    )
+    return selected, {name: len(grid) for name in frame_counts}
 
 
-def _apply_camera_trim(
+def _apply_camera_selection(
     seq_dir: Path,
     name: str,
-    start_idx: int,
-    end_idx: int,
-    ts: Optional[np.ndarray],
+    indices: np.ndarray,
+    timestamps: np.ndarray,
 ) -> None:
-    """Rename frame files and update timestamps.npy for one camera."""
-    n_new = end_idx - start_idx
-    if start_idx > 0:
-        rgb_dir = seq_dir / "rgb" / name
-        depth_dir = seq_dir / "depth" / name
-        # Rename in forward order: source indices (start_idx+i) are always
-        # higher than destination indices (i), so no conflicts.
-        for i in range(n_new):
-            src = start_idx + i
-            for d, ext in ((rgb_dir, _IMG_EXT), (depth_dir, ".npz")):
-                src_f = d / f"{src:010d}{ext}"
-                dst_f = d / f"{i:010d}{ext}"
-                if src_f.exists():
-                    src_f.rename(dst_f)
-        print(
-            f"  Aligned {name}: skipped {start_idx} leading frame(s) "
-            f"(~{start_idx / 30:.2f}s)"
-        )
-    if ts is not None:
-        np.save(
-            str(seq_dir / "rgb" / name / "timestamps.npy"),
-            ts[start_idx:end_idx],
-        )
+    """Reindex one camera stream according to nearest-timestamp selection."""
+    # Reindexing rebuilds rgb/<name>, so hold the poses and write them back afterwards.
+    poses_path = seq_dir / "rgb" / name / _POSES_FILE
+    poses = np.load(str(poses_path))[indices] if poses_path.exists() else None
+    for stream, ext in (("rgb", _IMG_EXT), ("depth", ".npz")):
+        stream_dir = seq_dir / stream / name
+        if not stream_dir.exists():
+            continue
+        temp_dir = stream_dir.with_name(f".{name}.timestamp-selection")
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        temp_dir.mkdir(parents=True)
+        try:
+            for new_idx, old_idx in enumerate(indices):
+                src = stream_dir / f"{int(old_idx):010d}{ext}"
+                if not src.exists():
+                    raise ConversionError(f"missing camera frame: {src}")
+                dst = temp_dir / f"{new_idx:010d}{ext}"
+                try:
+                    dst.hardlink_to(src)
+                except OSError:
+                    shutil.copy2(src, dst)
+            shutil.rmtree(stream_dir)
+            temp_dir.rename(stream_dir)
+        except Exception:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+
+    np.save(str(seq_dir / "rgb" / name / "timestamps.npy"), timestamps)
+    if poses is not None:
+        np.save(str(poses_path), poses)
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +723,7 @@ def _build_lowdim(
     right_base_to_left_base: Optional[np.ndarray],
     cam_timestamps: Dict[str, Optional[np.ndarray]],
     wrist_camera_joint_keys: Optional[Dict[str, str]] = None,
+    sim_log: Optional[Dict[str, np.ndarray]] = None,
 ) -> None:
     """Write seq_dir/lowdim.npz with all cameras' intrinsics/extrinsics plus joints, action, language.
 
@@ -547,6 +733,7 @@ def _build_lowdim(
     ------------------------------------------
     ``intrinsics``           dict[camera_name → (3, 3) float32]  camera matrix K per camera.
     ``extrinsics``           dict[camera_name → (4, 4) float32]  cam-to-left_arm_base.
+                             Sim cameras: read from the model and state that rendered the frame.
                              Wrist cameras: computed per-frame via FK + hand-eye calibration.
                              Scene cameras: static calibrated extrinsics.
     ``joints``               (14,) float32  follower joint positions at this frame:
@@ -556,8 +743,16 @@ def _build_lowdim(
                              [l_pos(3), l_rot9(9), l_gripper(1), r_pos(3), r_rot9(9), r_gripper(1)].
     ``language_task``        str  task name.
     ``language_prompt``      str  task instruction.
+    ``table_pose``           (4, 4) float32  table-to-left_arm_base, from calibration
+                             ``table.T_base_table``; identity when the calibration has none.
+
+    Sim recordings add, from the snapshot rendered nearest to the frame (see ``_load_sim_log``):
+    ``sim_state``            (1 + nq + nv,) float64  MuJoCo ``[time, qpos, qvel]``; replay it in
+                             the episode's ``sim_model.xml`` to re-render from any camera.
+    ``object_poses``         dict[str → (4, 4) float32]  task objects in the left_arm_base frame.
+    ``subtasks``             dict[str → bool]  BDDL subtask predicates, in task order.
+    ``success``              bool  task goal satisfied.
     """
-    _WALL_CLOCK_MIN_NS = 1_577_836_800_000_000_000
 
     # ── reference timestamp grid for interpolating robot data ─────────────
     # Prefer wall-clock timestamps; fall back to any available camera timestamps.
@@ -565,30 +760,41 @@ def _build_lowdim(
     for name in cameras:
         ts = cam_timestamps.get(name)
         if ts is not None and len(ts) == n_frames and int(ts[0]) > _WALL_CLOCK_MIN_NS:
-            ref_ts = ts.astype(np.float64)
+            ref_ts = ts.astype(np.int64)
             break
     if ref_ts is None:
         for name in cameras:
             ts = cam_timestamps.get(name)
             if ts is not None and len(ts) == n_frames:
-                ref_ts = ts.astype(np.float64)
+                ref_ts = ts.astype(np.int64)
                 break
+
+    sim_ref_ts = ref_ts.copy() if ref_ts is not None else None
 
     robot_ts: Optional[np.ndarray] = None
     if robot_data is not None and n_frames > 0:
         robot_ts_raw = robot_data.get("timestamps")
-        if (
-            ref_ts is not None
-            and robot_ts_raw is not None
-            and robot_ts_raw.dtype == np.int64
-        ):
-            robot_ts = robot_ts_raw.astype(np.float64)
+        if ref_ts is not None and robot_ts_raw is not None:
+            robot_ts_i64 = np.asarray(robot_ts_raw, dtype=np.int64)
+            ref_ts_i64 = np.asarray(ref_ts, dtype=np.int64)
+            if ref_ts_i64[0] < robot_ts_i64[0] or ref_ts_i64[-1] > robot_ts_i64[-1]:
+                raise ConversionError(
+                    "camera timestamp grid extends beyond robot telemetry; refusing to extrapolate"
+                )
+            # Subtract a shared origin before float conversion. This preserves
+            # sub-millisecond precision for Unix-epoch nanosecond timestamps.
+            origin = int(robot_ts_i64[0])
+            robot_ts = (robot_ts_i64 - origin).astype(np.float64)
+            ref_ts = (ref_ts_i64 - origin).astype(np.float64)
         else:
             # Legacy: uniform linspace over the recording duration.
-            duration = rec_meta.get("duration_s", 1.0)
-            ref_ts = np.linspace(0.0, duration, n_frames, endpoint=False)
             if robot_ts_raw is not None:
-                robot_ts = robot_ts_raw.astype(np.float64)
+                robot_ts_i64 = np.asarray(robot_ts_raw, dtype=np.int64)
+                robot_ts = (robot_ts_i64 - int(robot_ts_i64[0])).astype(np.float64)
+                duration = float(robot_ts[-1])
+            else:
+                duration = float(rec_meta.get("duration_s", 1.0)) * 1e9
+            ref_ts = np.linspace(0.0, duration, n_frames, endpoint=True)
 
     def interp_to_cam(key: str) -> Optional[np.ndarray]:
         if robot_data is None or robot_ts is None or ref_ts is None:
@@ -596,6 +802,10 @@ def _build_lowdim(
         arr = robot_data.get(key)
         if arr is None:
             return None
+        if len(arr) != len(robot_ts):
+            raise ConversionError(
+                f"robot field {key} has {len(arr)} rows for {len(robot_ts)} timestamps"
+            )
         if arr.ndim == 1:
             arr = arr[:, None]
         return np.stack(
@@ -632,6 +842,17 @@ def _build_lowdim(
     kin = None  # lazily loaded
     extrinsics: Dict[str, np.ndarray] = {}
     for name in cameras:
+        # A rendered sim camera brought its own pose, read from the state that drew its pixels.
+        poses_path = seq_dir / "rgb" / name / _POSES_FILE
+        if poses_path.exists():
+            poses = np.load(str(poses_path))
+            if len(poses) != n_frames:
+                raise ConversionError(
+                    f"{name}: {len(poses)} rendered camera poses for {n_frames} frames"
+                )
+            extrinsics[name] = poses
+            continue
+
         flip = name in flip_cameras
         static_ext = np.eye(4, dtype=np.float32)
         he = None
@@ -808,6 +1029,24 @@ def _build_lowdim(
         np.concatenate(action_joints_parts, axis=1) if action_joints_parts else None
     )
 
+    # ── table: static table-to-base pose ─────────────────────────────────
+    table_pose = np.eye(4, dtype=np.float32)
+    if calib and "table" in calib:
+        table_pose = np.array(calib["table"]["T_base_table"], dtype=np.float32)
+
+    # ── sim: nearest snapshot per frame (exact for the reference camera) ──
+    sim_idx: Optional[np.ndarray] = None
+    if (
+        sim_log is not None
+        and sim_ref_ts is not None
+        and int(sim_ref_ts[0]) > _WALL_CLOCK_MIN_NS
+    ):
+        t = sim_log["t_ns"]
+        j = np.clip(np.searchsorted(t, sim_ref_ts), 1, len(t) - 1)
+        sim_idx = np.where(sim_ref_ts - t[j - 1] <= t[j] - sim_ref_ts, j - 1, j)
+        gap_ms = np.abs(t[sim_idx] - sim_ref_ts).max() / 1e6
+        print(f"  sim state: nearest snapshot at most {gap_ms:.1f} ms from its frame")
+
     # ── language ──────────────────────────────────────────────────────────
     language_task = np.array(rec_meta.get("task_name", ""), dtype=object)
     language_prompt = np.array(rec_meta.get("task_instruction", ""), dtype=object)
@@ -819,7 +1058,21 @@ def _build_lowdim(
         frame_data: Dict[str, Any] = {
             "intrinsics": intrinsics,
             "extrinsics": {name: ext_arr[i] for name, ext_arr in extrinsics.items()},
+            "table_pose": table_pose,
         }
+        if sim_idx is not None:
+            j = sim_idx[i]
+            frame_data["sim_state"] = sim_log["state"][j]
+            frame_data["object_poses"] = dict(
+                zip(
+                    sim_log["objects"].tolist(),
+                    sim_log["object_poses"][j].astype(np.float32),
+                )
+            )
+            frame_data["subtasks"] = dict(
+                zip(sim_log["subtasks"].tolist(), sim_log["subtask_done"][j].tolist())
+            )
+            frame_data["success"] = bool(sim_log["success"][j])
         if joints is not None:
             frame_data["joints"] = joints[i]
         if action is not None:
@@ -862,13 +1115,14 @@ def _build_sequence_metadata(
     else:
         resolution = None
 
+    has_depth = any(any((seq_dir / "depth" / cam).glob("*.npz")) for cam in cameras)
     meta = {
         "info": {
             "name": rec_meta.get("task_name", ""),
             "raw_id": rec_meta.get("timestamp", ""),
             "tags": ["robotics"],
         },
-        "labels": ["rgb", "depth", "action", "language"],
+        "labels": ["rgb", *(["depth"] if has_depth else []), "action", "language"],
         "cameras": cameras,
         "resolution": resolution,
         "framerate": rec_meta.get("camera_fps", 30),
@@ -878,7 +1132,11 @@ def _build_sequence_metadata(
         },
         "num_frames": max(frame_counts.values()) if frame_counts else 0,
         "rgb": {"extension": "png"},
-        "depth": {"extension": "npz", "sparse": False, "metric": True},
+        **(
+            {"depth": {"extension": "npz", "sparse": False, "metric": True}}
+            if has_depth
+            else {}
+        ),
         "intrinsics": {"model": "pinhole"},
         "extrinsics": {"transform": "cam2world", "metric": True},
         "action": {"format": "joint_cmd", "dims": 14},
@@ -979,9 +1237,10 @@ def convert_recording(
 
     svo2_files = sorted(cameras_path.glob("*.svo2"))
     bag_files = sorted(cameras_path.glob("*.bag"))
+    simrec_dirs = sorted(p for p in cameras_path.glob("*.simrec") if p.is_dir())
 
-    if not svo2_files and not bag_files:
-        print("No .svo2 or .bag files found in cameras/")
+    if not svo2_files and not bag_files and not simrec_dirs:
+        print("No .svo2 / .bag files or .simrec directories found in cameras/")
         sys.exit(1)
 
     seq_dir = Path(episode_dir) if episode_dir else rec_path / _SEQUENCE_NAME
@@ -989,15 +1248,16 @@ def convert_recording(
         print(f"Already converted: {seq_dir}")
         return {}
     elif (seq_dir / "rgb").exists() and reconvert:
-        import shutil as _shutil
-
-        _shutil.rmtree(seq_dir)
+        shutil.rmtree(seq_dir)
         print(f"Removed existing output: {seq_dir}")
 
     seq_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\nConverting to UnifiedDataset: {rec_path.name}")
-    print(f"  Found {len(svo2_files)} SVO2 file(s), {len(bag_files)} bag file(s)\n")
+    print(
+        f"  Found {len(svo2_files)} SVO2 file(s), {len(bag_files)} bag file(s), "
+        f"{len(simrec_dirs)} sim recording(s)\n"
+    )
 
     # ── load supporting data ──────────────────────────────────────────────
     rec_meta: dict = {}
@@ -1113,9 +1373,8 @@ def convert_recording(
             ts_path = rgb_dir / "timestamps.npy"
             if ts_path.exists():
                 ts_arr = np.load(str(ts_path))
-                clock_offset = rs_offsets.get(name)
-                cam_timestamps[name] = (
-                    ts_arr + int(clock_offset) if clock_offset is not None else ts_arr
+                cam_timestamps[name] = _apply_rs_clock_offset(
+                    ts_arr, rs_offsets.get(name)
                 )
             else:
                 cam_timestamps[name] = None
@@ -1130,29 +1389,62 @@ def convert_recording(
         camera_infos[name] = info
 
         # With global_time_enabled, RealSense timestamps are wall-clock (same as
-        # ZED).  Old recordings may carry a clock offset in metadata; apply it
-        # for backward compatibility.
-        clock_offset = rs_offsets.get(name)
+        # ZED).  Old recordings without it carry a clock offset in metadata;
+        # _apply_rs_clock_offset applies it only when the timestamps need it.
         if len(ts_arr) > 0:
-            cam_timestamps[name] = (
-                ts_arr + int(clock_offset) if clock_offset is not None else ts_arr
-            )
+            cam_timestamps[name] = _apply_rs_clock_offset(ts_arr, rs_offsets.get(name))
         else:
             cam_timestamps[name] = None
         print(f"  ✓ {name}: {len(ts_arr)} frames\n")
 
-    # Align all cameras to their overlapping recording window, correcting for
-    # sequential startup offsets between ZED and RealSense cameras.
+    # Simulated cameras store the state of each frame, not its pixels; render them.
+    sim_base = _sim_base_frame(simrec_dirs, rec_path / "sim_model.xml", calib)
+    for sim_dir in simrec_dirs:
+        name = sim_dir.stem
+        rgb_dir = seq_dir / "rgb" / name
+        if rgb_dir.exists():
+            n = len(list(rgb_dir.glob("*.png")))
+            print(f"  Skipping {name} (already extracted, {n} frames)")
+            frame_counts[name] = n
+            camera_infos[name] = None
+            ts_path = rgb_dir / "timestamps.npy"
+            cam_timestamps[name] = np.load(str(ts_path)) if ts_path.exists() else None
+            continue
+        print(f"  Extracting {sim_dir.name} (sim)")
+        ts_arr, info = _extract_simrec(
+            sim_dir, rgb_dir, rec_path / "sim_model.xml", sim_base
+        )
+        frame_counts[name] = len(ts_arr)
+        camera_infos[name] = info
+        cam_timestamps[name] = ts_arr if len(ts_arr) > 0 else None
+        print(f"  ✓ {name}: {len(ts_arr)} frames\n")
+
+    # Resample every camera onto one grid bounded by the camera overlap and
+    # robot telemetry, then verify the residual cross-camera timestamp error.
     cam_timestamps, frame_counts = _align_cameras_by_timestamp(
         seq_dir,
         cam_timestamps,
         frame_counts,
         camera_start_times_ns=rec_meta.get("camera_start_times_ns"),
+        camera_fps=float(rec_meta.get("camera_fps", 30)),
+        robot_timestamps=(
+            robot_data.get("timestamps") if robot_data is not None else None
+        ),
     )
 
-    # Trim all cameras to the same (minimum) frame count.
+    # Trim all cameras to the same (minimum) frame count.  Frames are indexed
+    # by position after alignment, so a camera that dropped most of its frames
+    # (e.g. RealSense on a USB 2 link) would silently pair frame i of one
+    # camera with a different moment in time on the other — refuse instead.
     if frame_counts:
+        n_max = max(frame_counts.values())
         n_min = min(frame_counts.values())
+        if n_max > 0 and n_min < 0.9 * n_max:
+            counts = ", ".join(f"{k}={v}" for k, v in frame_counts.items())
+            raise ConversionError(
+                f"camera frame counts differ by more than 10% ({counts}); "
+                "a camera dropped frames — check the USB link and re-record"
+            )
         frame_counts = {k: n_min for k in frame_counts}
         cam_timestamps = {
             k: (ts[:n_min] if ts is not None else None)
@@ -1170,6 +1462,9 @@ def convert_recording(
                         f.unlink()
                     else:
                         break
+            poses_path = rgb_dir / _POSES_FILE
+            if poses_path.exists():
+                np.save(str(poses_path), np.load(str(poses_path))[:n_min])
             if ts is not None:
                 np.save(str(rgb_dir / "timestamps.npy"), ts)
 
@@ -1197,8 +1492,12 @@ def convert_recording(
         right_base_to_left_base=T_left_base_from_right_base,
         cam_timestamps=cam_timestamps,
         wrist_camera_joint_keys=wrist_camera_joint_keys,
+        sim_log=_load_sim_log(simrec_dirs),
     )
     print(f"  ✓ lowdim/ ({n_min} frames)")
+    if (rec_path / "sim_model.xml").exists():
+        shutil.copy(rec_path / "sim_model.xml", seq_dir / "sim_model.xml")
+        print("  ✓ sim_model.xml")
 
     # ── sequence metadata ─────────────────────────────────────────────────
     _build_sequence_metadata(seq_dir, cameras, frame_counts, rec_meta, camera_infos)
@@ -1323,19 +1622,26 @@ def convert_task(
 
     print(f"Converting {len(success_dirs)} successful recording(s)\n")
 
+    failed: List[str] = []
     for i, rec_dir in enumerate(success_dirs):
-        episode_name = f"{i:04d}"
+        episode_name = f"{len(episode_frame_counts):04d}"
         ep_dir = out_base / episode_name
         print(f"[{i + 1}/{len(success_dirs)}] {rec_dir.name} → {episode_name}/")
-        counts = convert_recording(
-            str(rec_dir),
-            episode_dir=str(ep_dir),
-            stereo_method=stereo_method,
-            ffs_scale=ffs_scale,
-            ffs_iters=ffs_iters,
-            tri_stereo_variant=tri_stereo_variant,
-            reconvert=reconvert,
-        )
+        try:
+            counts = convert_recording(
+                str(rec_dir),
+                episode_dir=str(ep_dir),
+                stereo_method=stereo_method,
+                ffs_scale=ffs_scale,
+                ffs_iters=ffs_iters,
+                tri_stereo_variant=tri_stereo_variant,
+                reconvert=reconvert,
+            )
+        except ConversionError as e:
+            print(f"\n  ✗ Skipping {rec_dir.name}: {e}\n")
+            shutil.rmtree(ep_dir, ignore_errors=True)
+            failed.append(rec_dir.name)
+            continue
 
         if counts:
             episode_frame_counts[episode_name] = max(counts.values())
@@ -1361,6 +1667,14 @@ def convert_task(
                     )
             except Exception:
                 pass
+
+    if failed:
+        print(
+            f"\n✗ {len(failed)} recording(s) could not be converted: {', '.join(failed)}"
+        )
+        print("  Mark them as failures in `rd console` so they are not retried.")
+    if not episode_frame_counts:
+        return
 
     # ── combined split_all.json ────────────────────────────────────────────
     total_frames = sum(episode_frame_counts.values())

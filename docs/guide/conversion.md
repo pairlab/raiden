@@ -144,13 +144,35 @@ so every camera directory contains exactly the same number of frames.
 | Key | Shape | Description |
 |---|---|---|
 | `intrinsics` | `dict[str → (3, 3) float32]` | `{camera_name: K}` — pinhole camera matrix `[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]`. Principal point adjusted for upside-down cameras. |
-| `extrinsics` | `dict[str → (4, 4) float32]` | `{camera_name: T_cam2world}` in the **left\_arm\_base** frame for this frame. Scene cameras: static calibrated extrinsics. Wrist cameras: computed from forward kinematics + hand-eye calibration. |
+| `extrinsics` | `dict[str → (4, 4) float32]` | `{camera_name: T_cam2world}` in the **left\_arm\_base** frame for this frame. Sim cameras: read from the model and state that rendered the frame. Scene cameras: static calibrated extrinsics. Wrist cameras: computed from forward kinematics + hand-eye calibration. |
 | `joints` | `(14,)` float32 | Follower **actual** joint positions at this frame: `[left_arm(6), left_gripper(1), right_arm(6), right_gripper(1)]`. |
 | `action` | `(26,)` float32 | FK EE poses computed from **commanded** joint positions (`follower_*_joint_cmd`): `[l_pos(3), l_rot9(9), l_gripper(1), r_pos(3), r_rot9(9), r_gripper(1)]`. Left arm pose is in the **left\_arm\_base** frame; right arm pose is in the **right\_arm\_base** frame. Rotation is the 3×3 matrix flattened row-major. |
 | `actual_poses` | `(26,)` float32 | FK EE poses computed from **actual** joint positions (`follower_*_joint_pos_7d`): same layout as `action`. Represents where the arm physically was, not where it was commanded to go. |
 | `action_joints` | `(14,)` float32 | Commanded joint positions: `[left_arm(6), left_gripper(1), right_arm(6), right_gripper(1)]`. Same source as `action` but in joint space. |
 | `language_task` | str | Task name. |
 | `language_prompt` | str | Task instruction. |
+| `table_pose` | `(4, 4)` float32 | Table frame (origin at the centre of the table top, axes along the base axes) in the **left\_arm\_base** frame, from `table.T_base_table` in `calibration_results.json`; identity when absent. |
+| `sim_state` | `(1 + nq + nv,)` float64 | Sim only. MuJoCo `[time, qpos, qvel]` the frame was rendered from; replay it in the episode's `sim_model.xml` to re-render from any camera. |
+| `object_poses` | `dict[str → (4, 4) float32]` | Sim only. Task object poses in the **left\_arm\_base** frame. |
+| `subtasks` | `dict[str → bool]` | Sim only. BDDL subtask predicates, in task order. |
+| `success` | bool | Sim only. Task goal satisfied. |
+
+The sim keys come from `cameras/<camera>.simrec/sim_state.npz`, which holds the
+state each sim frame was rendered from; every frame takes the snapshot nearest
+its timestamp, which for the reference camera is its own. Sim episodes also
+get `sim_model.xml` next to `lowdim/`.
+
+Sim recordings store no pixels. The converter renders each camera's frames
+from its `sim_state.npz` in the episode's `sim_model.xml` (the model's asset
+paths must still exist). Without a display, raiden selects `MUJOCO_GL=egl`.
+
+While rendering, each frame's camera pose is read from the state that drew its
+pixels and written to `rgb/<camera>/camera_poses.npy`, which then follows the
+frames through timestamp selection and trimming. These poses become the sim
+`extrinsics`, so a sim frame and its pose label cannot disagree — including for
+the wrist camera, whose FK-based label carried the difference between raiden's
+i2rt arm model and MESA's (about 4.4 mm at the camera) plus the error from
+interpolating telemetry onto the camera grid.
 
 ## Coordinate system
 
@@ -160,6 +182,9 @@ bimanual or single-arm setup - in single-arm mode the sole arm is always
 treated as the left arm.
 
 ## Wrist camera extrinsics
+
+Sim recordings label their cameras from the model instead (see above); this
+section is the path a real recording takes.
 
 Extrinsics for `left_wrist_camera` and `right_wrist_camera` are computed
 **per frame** using forward kinematics (FK):
