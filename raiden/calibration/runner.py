@@ -1,8 +1,10 @@
 """Orchestrates the full camera calibration workflow"""
 
+import json
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -231,6 +233,7 @@ class CalibrationRunner:
         self.robot_controller: Optional[RobotController] = None
         self.cameras: Dict[str, Camera] = {}
         self._move_stop_event = threading.Event()
+        self._captures: List[Dict] = []
 
     def load_configuration(self):
         """Load camera config and calibration poses"""
@@ -499,6 +502,55 @@ class CalibrationRunner:
             "right_board": valid_right_board,
         }
 
+    def _save_captures(self) -> Path:
+        """Write each pose's images, measured joints and the camera intrinsics to disk.
+
+        The calibration keeps nothing else from the capture, so these files are what let a bad
+        solve be diagnosed and redone offline. They go next to the output file, under
+        ``calibration_captures/<timestamp>/``.
+        """
+        out_dir = (
+            Path(self.output_file).parent
+            / "calibration_captures"
+            / datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        intrinsics = {}
+        for name, camera in self.cameras.items():
+            try:
+                cam_matrix, dist_coeffs, image_size = camera.get_intrinsics()
+                intrinsics[name] = {
+                    "camera_matrix": np.asarray(cam_matrix).tolist(),
+                    "distortion_coeffs": np.asarray(dist_coeffs).ravel().tolist(),
+                    "image_size": list(image_size),
+                }
+            except Exception as e:
+                print(f"  Warning: no intrinsics for {name}: {e}")
+
+        poses = []
+        for i, capture in enumerate(self._captures):
+            files = {}
+            for name, image in capture["images"].items():
+                files[name] = f"{i:02d}_{name}.png"
+                cv2.imwrite(str(out_dir / files[name]), image)
+            poses.append(
+                {
+                    "pose": capture["pose"],
+                    "joints_l": capture["joints_l"],
+                    "images": files,
+                }
+            )
+
+        meta = {
+            "charuco_config": self.board_config.__dict__,
+            "intrinsics": intrinsics,
+            "poses": poses,
+        }
+        (out_dir / "captures.json").write_text(json.dumps(meta, indent=2))
+        print(f"\n✓ Capture images and joints saved to: {out_dir}")
+        return out_dir
+
     def collect_calibration_data(
         self,
     ) -> Dict[str, Dict[str, List]]:
@@ -532,6 +584,7 @@ class CalibrationRunner:
         }
 
         poses = self.poses_data["poses"]
+        self._captures = []
 
         for i, pose in enumerate(poses):
             print(f"\nPose {i + 1}/{len(poses)}: {pose['name']}")
@@ -578,6 +631,7 @@ class CalibrationRunner:
 
             # Capture images and detect board
             print("  Capturing images...")
+            pose_images: Dict[str, np.ndarray] = {}
             for camera_name, camera in self.cameras.items():
                 try:
                     # Capture frame
@@ -589,6 +643,7 @@ class CalibrationRunner:
                     image = np.ascontiguousarray(image, dtype=np.uint8)
 
                     camera_data[camera_name]["images"].append(image)
+                    pose_images[camera_name] = image
 
                     # Detect ChArUco board
                     corners, ids = self.calibrator.detector.detect(image)
@@ -653,6 +708,20 @@ class CalibrationRunner:
 
                 except Exception as e:
                     print(f"    ✗ {camera_name}: Error - {e}")
+
+            joints_l = None
+            if self.robot_controller and self.robot_controller.follower_l:
+                try:
+                    joints_l = np.asarray(
+                        self.robot_controller.follower_l.get_joint_pos(), dtype=float
+                    ).tolist()
+                except Exception as e:
+                    print(
+                        f"    Warning: could not read left joints for the capture log: {e}"
+                    )
+            self._captures.append(
+                {"pose": pose["name"], "joints_l": joints_l, "images": pose_images}
+            )
 
         print("\n" + "=" * 70)
         print("Data collection complete!")
@@ -720,6 +789,7 @@ class CalibrationRunner:
 
             # Collect data
             camera_data = self.collect_calibration_data()
+            self._save_captures()
 
             # Compute bimanual transform if both arms are calibrated
             bimanual_transform_computed = False
