@@ -1,4 +1,4 @@
-"""Policy server for the YAM bimanual robot — serves live observations via chiral.
+"""Policy server for the YAM robot — serves live observations via chiral.
 
 Bridges the raiden robot stack (ZED/RealSense cameras + YAM follower arms) to
 any remote policy client that speaks the chiral WebSocket protocol.
@@ -9,12 +9,13 @@ Usage::
 
 Or with custom options::
 
-    rd serve --port 8765 --stereo-method ffs
+    rd serve --port 8765 --no-depth
 
 Thread layout::
 
     camera-<name>       : grabs frames from ZED or RealSense at ~30 Hz (per camera)
     proprio-<name>      : reads joint state from follower arms at ~100 Hz (per stream)
+    command             : sends the interpolated joint command to the followers at 100 Hz
     asyncio event loop  : handles WebSocket connections (chiral protocol)
 
 Extrinsics convention
@@ -38,7 +39,6 @@ point in the intrinsics and the ``T_cam→ee`` rotation are corrected accordingl
 """
 
 import asyncio
-import concurrent.futures
 import json
 import threading
 import time
@@ -52,7 +52,10 @@ import numpy as np
 from chiral.types import CameraInfo, Observation
 
 from raiden.camera_config import CameraConfig as RaidenCameraConfig
-from raiden.robot.controller import RobotController
+from raiden.robot.controller import (
+    _GRIPPER_MIN_OPENING,
+    RobotController,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -83,12 +86,11 @@ _R_FLIP_180 = np.array(
 )
 
 DOF = 7  # joints per arm (6 revolute + 1 gripper)
-BIMANUAL_DOF = DOF * 2  # right arm then left arm
 
 # EE pose action layout — matches vla_foundry action_fields concatenation order:
 #   [l_xyz(3), r_xyz(3), l_rot6d(6), r_rot6d(6), l_grip(1), r_grip(1)]  (20-D)
+#   [l_xyz(3), l_rot6d(6), l_grip(1)]                         (10-D, single arm)
 EE_POSE_ARM_DOF = 10  # per arm: xyz(3) + rot_6d(6) + grip(1)
-BIMANUAL_EE_POSE_DOF = EE_POSE_ARM_DOF * 2
 
 # Robot name used in proprioception key names — must match the shardify convention.
 _ROBOT = "yam"
@@ -101,7 +103,12 @@ _PROPRIO_HISTORY_SIZE = 64
 # abrupt policy jumps while allowing normal motion.
 _DEFAULT_MAX_JOINT_DELTA = 0.2  # radians
 
-_CONTROL_HZ = 10.0
+# Rate the client sends actions at; each action is reached one period after it arrives.
+_DEFAULT_CONTROL_HZ = 10.0
+
+# Rate the interpolated command is sent to the followers — the rate of the teleop
+# loops that recorded the training commands.
+_COMMAND_HZ = 100.0
 
 # Per-arm Kinematics instances, each protected by its own lock.
 #
@@ -202,7 +209,7 @@ def _pose_from_xyz_rot6d(xyz: np.ndarray, rot6d: np.ndarray) -> np.ndarray:
 
 
 class RaidenPolicyServer(chiral.PolicyServer):
-    """Policy server for the YAM bimanual robot system.
+    """Policy server for the YAM robot system (left arm only or bimanual).
 
     Streams live camera images, depth maps, and joint-state observations to a
     remote policy over WebSocket using the chiral protocol.
@@ -214,6 +221,9 @@ class RaidenPolicyServer(chiral.PolicyServer):
             the calibration file supplies extrinsics and ``T_cam→ee``.
         host: WebSocket host to bind to.
         port: WebSocket port to listen on.
+        arms: ``"single"`` drives the left follower only; ``"bimanual"`` both.
+        control_hz: Rate the client sends actions at.  Each action is
+            interpolated from the current command over one period.
     """
 
     def __init__(
@@ -222,15 +232,13 @@ class RaidenPolicyServer(chiral.PolicyServer):
         calibration_file: str = "./config/calibration_results.json",
         host: str = "0.0.0.0",
         port: int = 8765,
-        stereo_method: str = "zed",
-        ffs_scale: float = 1.0,
-        ffs_iters: int = 8,
-        tri_stereo_variant: str = "c64",
         max_joint_delta: float = _DEFAULT_MAX_JOINT_DELTA,
         action_type: str = "ee_pose",
         no_depth: bool = False,
         resize_images_size: Optional[Tuple[int, int]] = None,
         visualize: bool = False,
+        arms: str = "bimanual",
+        control_hz: float = _DEFAULT_CONTROL_HZ,
     ):
         self._no_depth = no_depth
         self._resize = resize_images_size  # (H, W) or None
@@ -238,69 +246,14 @@ class RaidenPolicyServer(chiral.PolicyServer):
             raise ValueError(
                 f"action_type must be 'joint' or 'ee_pose', got {action_type!r}"
             )
+        if arms not in ("single", "bimanual"):
+            raise ValueError(f"arms must be 'single' or 'bimanual', got {arms!r}")
         self._action_type = action_type
+        # Action order: left arm first, then right arm.
+        self._arms = ("left",) if arms == "single" else ("left", "right")
+        self._control_hz = control_hz
         self._raiden_cam_cfg = RaidenCameraConfig(camera_config_file)
         self._calibration = self._load_calibration(calibration_file)
-        self._stereo_method = stereo_method
-
-        # Lazily-loaded learned-stereo predictor (shared across all ZED cameras).
-        # Both FFS and TRI Stereo share the same predict(left, right, fx, baseline) API.
-        self._ffs_predictor = None
-        if stereo_method == "ffs":
-            from raiden.depth.ffs import (
-                FFSDepthPredictor,
-                FFSOnnxDepthPredictor,
-                FFSTrtDepthPredictor,
-            )
-
-            if FFSTrtDepthPredictor.engines_available():
-                self._ffs_predictor = FFSTrtDepthPredictor()
-            elif FFSOnnxDepthPredictor.models_available():
-                self._ffs_predictor = FFSOnnxDepthPredictor()
-            else:
-                self._ffs_predictor = FFSDepthPredictor(
-                    scale=ffs_scale, iters=ffs_iters
-                )
-                print(
-                    "[FFS] Using Fast Foundation Stereo (PyTorch)"
-                    + (f" scale={ffs_scale}" if ffs_scale != 1.0 else "")
-                )
-        elif stereo_method == "tri_stereo":
-            from raiden.depth.tri_stereo import (
-                TRIStereoOnnxDepthPredictor,
-                TRIStereoTrtDepthPredictor,
-            )
-
-            pred = None
-            if TRIStereoTrtDepthPredictor.engine_available(variant=tri_stereo_variant):
-                try:
-                    trt = TRIStereoTrtDepthPredictor(variant=tri_stereo_variant)
-                    trt._ensure_loaded()
-                    pred = trt
-                except RuntimeError as e:
-                    print(
-                        f"[TRIStereo] TRT engine unusable ({e}), falling back to ONNX"
-                    )
-            else:
-                print(
-                    f"[TRIStereo] No TRT engine found for variant '{tri_stereo_variant}', "
-                    "using ONNX. Compile an engine with trtexec for faster inference."
-                )
-            if pred is None:
-                if TRIStereoOnnxDepthPredictor.model_available(
-                    variant=tri_stereo_variant
-                ):
-                    pred = TRIStereoOnnxDepthPredictor(variant=tri_stereo_variant)
-                    pred._ensure_loaded()
-                else:
-                    raise RuntimeError(
-                        f"No TRI Stereo model found for variant '{tri_stereo_variant}'. "
-                        "Run: git lfs pull"
-                    )
-            self._ffs_predictor = pred
-
-        # Per-camera stereo calibration (fx, baseline) populated by _open_zed.
-        self._stereo_calib: dict[str, tuple[float, float]] = {}
 
         # Per-camera data populated across _open_cameras() and
         # _prepare_camera_transforms():
@@ -342,10 +295,14 @@ class RaidenPolicyServer(chiral.PolicyServer):
         self._robot = RobotController(
             use_right_leader=False,
             use_left_leader=False,
-            use_right_follower=True,
+            use_right_follower="right" in self._arms,
             use_left_follower=True,
         )
         self._robot.initialize_robots()
+        self._followers = {
+            "left": self._robot.follower_l,
+            "right": self._robot.follower_r,
+        }
 
         # super().__init__() calls camera_configs() and proprio_configs() to
         # pre-allocate self.images, self.depths, and self.proprios.
@@ -365,16 +322,17 @@ class RaidenPolicyServer(chiral.PolicyServer):
         self._step_count = 0
         self._t_sum = 0.0
         self._running = True
-        # Executor for async smooth commands so policy inference overlaps motion.
-        self._smooth_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="smooth"
-        )
-        self._pending_smooth: Optional[concurrent.futures.Future] = None
-        # Last commanded joint positions — used as IK seed for the next step.
-        self._last_joint_cmd: Optional[np.ndarray] = None
-        # Set when an emergency stop fires; causes step() to reject new actions
-        # immediately and smooth_move_joints threads to abort mid-interpolation.
+        # The command thread sends start + alpha * (target - start), with alpha
+        # rising from 0 to 1 over one control period after _cmd_t0.  None until
+        # the first action after startup or reset.  The target is also the IK seed.
+        self._cmd_lock = threading.Lock()
+        self._cmd_start: Optional[np.ndarray] = None
+        self._cmd_target: Optional[np.ndarray] = None
+        self._cmd_t0 = 0.0
+        # Set when an emergency stop fires; causes apply_action() to reject new
+        # actions and the command thread to stop commanding immediately.
         self._estop_active = threading.Event()
+        threading.Thread(target=self._command_loop, daemon=True).start()
 
         if visualize:
             threading.Thread(target=self._rerun_loop, daemon=True).start()
@@ -385,14 +343,6 @@ class RaidenPolicyServer(chiral.PolicyServer):
             ).start()
 
         threading.Thread(target=self._proprio_loop, daemon=True).start()
-
-        # Single dedicated thread for learned stereo depth inference.
-        # Processes all cameras sequentially so the GPU is never contested.
-        if (
-            self._stereo_method in ("ffs", "tri_stereo")
-            and self._ffs_predictor is not None
-        ):
-            threading.Thread(target=self._depth_inference_loop, daemon=True).start()
 
         # Wait for the first frame from every camera, then compute phase offsets.
         print("\nComputing camera phase offsets...")
@@ -496,6 +446,14 @@ class RaidenPolicyServer(chiral.PolicyServer):
                 # Scene camera: static extrinsics.
                 ext: dict = cam_data.get("extrinsics", {})
                 if ext.get("success") and "rotation_matrix" in ext:
+                    frame = ext.get("reference_frame", "left_arm_base")
+                    if frame != "left_arm_base":
+                        raise RuntimeError(
+                            f"{name}: calibrated extrinsics are in the {frame!r} "
+                            "frame; the policy needs the left arm base frame. "
+                            "Refit with scripts/write_calib.py or "
+                            "scripts/write_scene_calib.py."
+                        )
                     T = np.eye(4, dtype=np.float64)
                     T[:3, :3] = np.array(ext["rotation_matrix"])
                     T[:3, 3] = np.array(ext["translation_vector"]).flatten()
@@ -516,15 +474,13 @@ class RaidenPolicyServer(chiral.PolicyServer):
             else:
                 h = handle.get("h", 0)
                 w = handle.get("w", 0)
-            is_zed = handle.get("type") == "zed"
-            has_depth = not (self._no_depth and is_zed)
             configs.append(
                 chiral.CameraConfig(
                     name=name,
                     height=h,
                     width=w,
                     channels=3,
-                    has_depth=has_depth,
+                    has_depth=handle.get("depth", False),
                     intrinsics=self._cam_intrinsics[name],
                     extrinsics=self._cam_extrinsics[name],
                 )
@@ -590,32 +546,32 @@ class RaidenPolicyServer(chiral.PolicyServer):
             self._estop_active.set()
             self._robot.emergency_stop()
 
+    def _action_dim(self) -> int:
+        per_arm = EE_POSE_ARM_DOF if self._action_type == "ee_pose" else DOF
+        return per_arm * len(self._arms)
+
     async def get_metadata(self) -> dict:
-        action_shape = (
-            [BIMANUAL_EE_POSE_DOF] if self._action_type == "ee_pose" else [BIMANUAL_DOF]
-        )
+        if self._action_type == "ee_pose":
+            layout = "+".join(
+                [f"{arm}_xyz(3)" for arm in self._arms]
+                + [f"{arm}_rot6d(6)" for arm in self._arms]
+                + [f"{arm}_grip(1)" for arm in self._arms]
+            )
+        else:
+            layout = "+".join(f"{arm}_joints(7)" for arm in self._arms)
         return {
             "cameras": self._raiden_cam_cfg.list_camera_names(),
             "action_type": self._action_type,
-            "action_shape": action_shape,
-            "action_layout": (
-                "left_xyz(3)+right_xyz(3)+left_rot6d(6)+right_rot6d(6)+left_grip(1)+right_grip(1)"
-                if self._action_type == "ee_pose"
-                else "right_joints(7)+left_joints(7)"
-            ),
+            "action_shape": [self._action_dim()],
+            "action_layout": layout,
             "proprio_names": list(self.proprios.keys()),
         }
 
     async def reset(self) -> tuple[Observation, dict]:
-        # Wait for any in-flight smooth command before homing.
-        if self._pending_smooth is not None:
-            loop = asyncio.get_running_loop()
-            try:
-                await loop.run_in_executor(None, self._pending_smooth.result)
-            except Exception:
-                pass
-            self._pending_smooth = None
-        self._last_joint_cmd = None
+        # Stop the command thread before homing so it cannot fight the move.
+        with self._cmd_lock:
+            self._cmd_start = None
+            self._cmd_target = None
         self._step_count = 0
         self._t_sum = 0.0
         self._robot.move_to_home_positions(simultaneous=True)
@@ -626,8 +582,8 @@ class RaidenPolicyServer(chiral.PolicyServer):
     async def apply_action(self, action: np.ndarray) -> None:
         """Fire-and-forget action application (chiral non-blocking API).
 
-        Called by the network thread at the client's inference rate.  Returns
-        immediately after queuing the smooth command — the client never waits
+        Called by the network thread at the client's action rate.  Retargets
+        the command thread and returns immediately — the client never waits
         for execution to finish, and ``get_obs()`` is polled independently.
         """
         if self._estop_active.is_set():
@@ -637,30 +593,37 @@ class RaidenPolicyServer(chiral.PolicyServer):
         loop = asyncio.get_running_loop()
 
         action = np.asarray(action).reshape(-1)  # (D,)
+        if action.size != self._action_dim():
+            raise ValueError(
+                f"expected a {self._action_dim()}-D {self._action_type} action "
+                f"for arms={'+'.join(self._arms)}, got {action.size}-D"
+            )
 
         # Run IK in the executor so it doesn't block the event loop.
         # Seeded from the last commanded target for stable convergence.
-        init_cmd = self._last_joint_cmd
         if self._action_type == "ee_pose":
             joint_cmd = await loop.run_in_executor(
-                None, self._ee_pose_to_joint_cmd, action, init_cmd
+                None, self._ee_pose_to_joint_cmd, action, self._cmd_target
             )
         else:
-            joint_cmd = action
+            joint_cmd = action.astype(np.float64)
 
         # Safety check: abort if any joint delta exceeds the threshold.
         self._check_joint_delta(joint_cmd)
 
-        self._last_joint_cmd = joint_cmd
-
-        # Submit to the smooth executor.  max_workers=1 serialises commands:
-        # smooth_N completes before smooth_N+1 starts, so the robot always
-        # moves cleanly from one target to the next without abrupt stops.
-        # init_cmd (captured before the IK await) is used as the smooth start
-        # to avoid a stale re-read of _last_joint_cmd after the await.
-        self._pending_smooth = self._smooth_executor.submit(
-            self._smooth_command, init_cmd, joint_cmd
-        )
+        # Start from the command currently being sent, so an action that arrives
+        # before the previous one is reached replaces it instead of queueing.
+        now = time.monotonic()
+        with self._cmd_lock:
+            if self._cmd_target is None:
+                start = np.concatenate(
+                    [self._followers[arm].get_joint_pos() for arm in self._arms]
+                )
+            else:
+                start = self._interpolated_cmd(now)
+            self._cmd_start = start.astype(np.float64)
+            self._cmd_target = np.asarray(joint_cmd, dtype=np.float64)
+            self._cmd_t0 = now
 
         step_ms = (time.perf_counter() - t0) * 1e3
         self._step_count += 1
@@ -793,174 +756,123 @@ class RaidenPolicyServer(chiral.PolicyServer):
     def _ee_pose_to_joint_cmd(
         self, action: np.ndarray, init_cmd: Optional[np.ndarray] = None
     ) -> np.ndarray:
-        """Convert a 20-D EE pose action to a 14-D joint command via IK.
+        """Convert an EE pose action to a joint command via IK.
 
         Action layout (matching vla_foundry action_fields concatenation order)::
 
             [l_xyz(3), r_xyz(3), l_rot6d(6), r_rot6d(6), l_grip(1), r_grip(1)]
+            [l_xyz(3), l_rot6d(6), l_grip(1)]                  (single arm)
 
         Poses are in each arm's own base frame (left arm in left-base frame,
         right arm in right-base frame) — same convention as the stored action
         in ``lowdim.npz``.
 
         Returns:
-            (14,) float32 joint command — left arm first, then right arm,
-            matching the joint action convention expected by ``step()``.
+            (7 per arm,) float32 joint command — left arm first, then right arm,
+            matching the joint action convention expected by ``apply_action()``.
         """
-        # action layout: [l_xyz(3), r_xyz(3), l_rot6d(6), r_rot6d(6), l_grip(1), r_grip(1)]
-        T_l = _pose_from_xyz_rot6d(action[0:3], action[6:12])
-        l_grip = float(action[18])
-        T_r = (
-            _pose_from_xyz_rot6d(action[3:6], action[12:18])
-            if len(action) >= 20
-            else None
-        )
-        r_grip = float(action[19]) if len(action) >= 20 else 0.0
-
-        # Seed IK from the last *commanded* joint positions so the solver starts
-        # from the target the robot is moving toward rather than the mid-motion
-        # measured position, which is less stable and may slow convergence.
-        # On the very first step (init_cmd is None), seed with zeros so IK starts
-        # from the neutral configuration rather than whatever configuration was
-        # left by the most recent FK call.
-        if init_cmd is not None:
-            q_l_seed: Optional[np.ndarray] = init_cmd[:DOF]
-            q_r_seed: Optional[np.ndarray] = init_cmd[DOF : DOF * 2]
-        else:
-            q_l_seed = None
-            q_r_seed = None
-
-        with _kin_l_lock:
-            kin_l = _get_kin_l()
-            nq = kin_l._configuration.model.nq
-
-            def _pad_init(q7: Optional[np.ndarray]) -> np.ndarray:
-                q = np.zeros(nq, dtype=np.float64)
-                if q7 is not None:
-                    q[:6] = q7[:6]
-                return q
-
-            ok_l, q_l_full = kin_l.ik(T_l, "grasp_site", init_q=_pad_init(q_l_seed))
-            T_l_fk = kin_l.fk(q_l_full)
-            cmd_l = np.append(q_l_full[:6], l_grip).astype(np.float32)
-
-        if T_r is not None:
-            with _kin_r_lock:
-                kin_r = _get_kin_r()
-                nq_r = kin_r._configuration.model.nq
-
-                def _pad_init_r(q7: Optional[np.ndarray]) -> np.ndarray:
-                    q = np.zeros(nq_r, dtype=np.float64)
-                    if q7 is not None:
-                        q[:6] = q7[:6]
-                    return q
-
-                ok_r, q_r_full = kin_r.ik(
-                    T_r, "grasp_site", init_q=_pad_init_r(q_r_seed)
-                )
-                T_r_fk = kin_r.fk(q_r_full)
-                cmd_r = np.append(q_r_full[:6], r_grip).astype(np.float32)
-        else:
-            ok_r, T_r_fk = True, None
-            cmd_r = np.zeros(DOF, dtype=np.float32)
-
-        # Diagnostic: log IK convergence and round-trip FK error.
-        pos_err_l = float(np.linalg.norm(T_l_fk[:3, 3] - T_l[:3, 3]))
-        print(
-            f"[IK-L] ok={ok_l}  target_xyz={T_l[:3, 3].round(4)}  "
-            f"fk_xyz={T_l_fk[:3, 3].round(4)}  pos_err={pos_err_l * 1000:.2f}mm"
-        )
-        if T_r is not None and T_r_fk is not None:
-            pos_err_r = float(np.linalg.norm(T_r_fk[:3, 3] - T_r[:3, 3]))
-            print(
-                f"[IK-R] ok={ok_r}  target_xyz={T_r[:3, 3].round(4)}  "
-                f"fk_xyz={T_r_fk[:3, 3].round(4)}  pos_err={pos_err_r * 1000:.2f}mm"
+        n = len(self._arms)
+        cmds = []
+        for i, arm in enumerate(self._arms):
+            T = _pose_from_xyz_rot6d(
+                action[3 * i : 3 * i + 3], action[3 * n + 6 * i : 3 * n + 6 * i + 6]
             )
+            grip = float(action[9 * n + i])
+            kin_lock, get_kin = (
+                (_kin_l_lock, _get_kin_l)
+                if arm == "left"
+                else (_kin_r_lock, _get_kin_r)
+            )
+            with kin_lock:
+                kin = get_kin()
+                # Seed IK from the last *commanded* joint positions so the solver
+                # starts from the target the robot is moving toward rather than the
+                # mid-motion measured position, which is less stable and may slow
+                # convergence.  On the very first step (init_cmd is None), seed with
+                # zeros so IK starts from the neutral configuration rather than
+                # whatever configuration was left by the most recent FK call.
+                q_init = np.zeros(kin._configuration.model.nq, dtype=np.float64)
+                if init_cmd is not None:
+                    q_init[:6] = init_cmd[DOF * i : DOF * i + 6]
+                ok, q_full = kin.ik(T, "grasp_site", init_q=q_init)
+                T_fk = kin.fk(q_full)
 
-        # IK returns full nq — take arm joints only, then append gripper.
-        # Output layout: left arm first, then right arm (matches joint action convention).
-        return np.concatenate([cmd_l, cmd_r])
+            # Diagnostic: log IK convergence and round-trip FK error.
+            pos_err = float(np.linalg.norm(T_fk[:3, 3] - T[:3, 3]))
+            print(
+                f"[IK-{arm[0].upper()}] ok={ok}  target_xyz={T[:3, 3].round(4)}  "
+                f"fk_xyz={T_fk[:3, 3].round(4)}  pos_err={pos_err * 1000:.2f}mm"
+            )
+            # IK returns full nq — take arm joints only, then append gripper.
+            cmds.append(np.append(q_full[:6], grip).astype(np.float32))
+        return np.concatenate(cmds)
 
     # -------------------------------------------------------------------------
-    # Smooth joint command
+    # Joint command stream
     # -------------------------------------------------------------------------
 
-    def _smooth_command(
-        self, prev_cmd: Optional[np.ndarray], joint_cmd: np.ndarray
-    ) -> None:
-        """Interpolate from prev_cmd to joint_cmd over one control period.
+    def _interpolated_cmd(self, now: float) -> np.ndarray:
+        """Return the command due at *now* (caller must hold _cmd_lock)."""
+        alpha = min((now - self._cmd_t0) * self._control_hz, 1.0)
+        return (1 - alpha) * self._cmd_start + alpha * self._cmd_target
 
-        Both arms are commanded together in each interpolation step so they
-        stay in sync.  Interpolates between the previous and current
+    def _command_loop(self) -> None:
+        """Send the interpolated joint command to the followers at _COMMAND_HZ.
+
+        Each action is reached one control period after it arrives and then held
+        until the next one, in 100 Hz sub-steps like the teleop loops that
+        recorded the training data.  The command is interpolated between
         *commanded* targets (not actual positions) to reproduce the same
         trajectory shape as the training data.
-
-        Args:
-            prev_cmd: Previous commanded joint positions (14,).  ``None`` on the
-                first step — falls back to reading the actual robot position.
-            joint_cmd: (14,) float32 — left arm (7) then right arm (7).
         """
-        steps = 10
-        dt = (1.0 / _CONTROL_HZ) / steps
+        dt = 1.0 / _COMMAND_HZ
+        while self._running and not self._estop_active.is_set():
+            loop_start = time.monotonic()
+            try:
+                with self._cmd_lock:
+                    if self._cmd_target is not None:
+                        cmd = self._interpolated_cmd(loop_start)
+                        for i, arm in enumerate(self._arms):
+                            self._command_arm(
+                                self._followers[arm], cmd[DOF * i : DOF * (i + 1)]
+                            )
+            except Exception as e:
+                print(f"Command error: {e}")
+            remaining = dt - (time.monotonic() - loop_start)
+            if remaining > 0:
+                time.sleep(remaining)
 
-        # Read start positions once before the loop.
-        if prev_cmd is not None:
-            start_l = prev_cmd[:DOF].astype(np.float64)
-            start_r = prev_cmd[DOF : DOF * 2].astype(np.float64)
-        else:
-            start_l = (
-                self._robot.follower_l.get_joint_pos().astype(np.float64)
-                if self._robot.follower_l
-                else None
-            )
-            start_r = (
-                self._robot.follower_r.get_joint_pos().astype(np.float64)
-                if self._robot.follower_r
-                else None
-            )
+    @staticmethod
+    def _command_arm(follower: Any, cmd: np.ndarray) -> None:
+        """Command one follower with the gripper limits the teleop loops apply.
 
-        target_l = joint_cmd[:DOF].astype(np.float64)
-        target_r = joint_cmd[DOF : DOF * 2].astype(np.float64)
-
-        for i in range(steps + 1):
-            if self._estop_active.is_set():
-                return
-            alpha = i / steps
-            if self._robot.follower_l and start_l is not None:
-                self._robot.follower_l.command_joint_pos(
-                    (1 - alpha) * start_l + alpha * target_l
-                )
-            if self._robot.follower_r and start_r is not None:
-                self._robot.follower_r.command_joint_pos(
-                    (1 - alpha) * start_r + alpha * target_r
-                )
-            if i < steps:
-                time.sleep(dt)
+        The gripper never closes past the minimum opening; squeeze force on a
+        blocked grasp is bounded by i2rt's force limiter, motor-side.
+        """
+        cmd = cmd.copy()
+        cmd[6] = np.clip(cmd[6], _GRIPPER_MIN_OPENING, 1.0)
+        follower.command_joint_pos(cmd)
 
     # -------------------------------------------------------------------------
     # Joint-delta safety check
     # -------------------------------------------------------------------------
 
     def _check_joint_delta(self, action: np.ndarray) -> None:
-        """Abort the server if the commanded action jumps too far from current positions.
+        """Emergency-stop if the commanded action jumps too far from current positions.
 
         Compares each arm's commanded joint positions against the latest buffered
         proprioception values.  If any joint delta exceeds ``_max_joint_delta``
-        (radians), prints an error and calls ``os._exit(1)`` — the command is
-        never sent to the robot.
+        (radians), prints an error and triggers the emergency stop — the command
+        is never sent to the robot.
 
         Args:
-            action: Flat array of length ≥ ``BIMANUAL_DOF`` (left arm then right arm).
+            action: Flat array of 7 per arm (left arm then right arm).
         """
         pairs = []
-        if self._robot.follower_l:
-            q_l = self._read_proprio("follower_l_joint_pos")
-            if q_l is not None:
-                pairs.append(("left", q_l, action[:DOF]))
-        if self._robot.follower_r:
-            q_r = self._read_proprio("follower_r_joint_pos")
-            if q_r is not None:
-                pairs.append(("right", q_r, action[DOF : DOF * 2]))
+        for i, arm in enumerate(self._arms):
+            current = self._read_proprio(f"follower_{arm[0]}_joint_pos")
+            if current is not None:
+                pairs.append((arm, current, action[DOF * i : DOF * (i + 1)]))
 
         for arm, current, commanded in pairs:
             # Only check the 6 arm joints — gripper (index 6) uses linear position
@@ -1133,10 +1045,8 @@ class RaidenPolicyServer(chiral.PolicyServer):
                 if cam_type == "zed":
                     handle = self._open_zed(int(serial))
                 else:
-                    handle = self._open_realsense(str(serial))
+                    handle = self._open_realsense(name)
                 self._cam_handles[name] = handle
-                if cam_type == "zed" and self._stereo_method in ("ffs", "tri_stereo"):
-                    self._stereo_calib[name] = (handle["fx"], handle["baseline"])
                 print(
                     f"  ✓ Opened {cam_type} camera '{name}' "
                     f"(serial={serial}, {handle['w']}×{handle['h']})"
@@ -1153,9 +1063,7 @@ class RaidenPolicyServer(chiral.PolicyServer):
         params.camera_resolution = sl.RESOLUTION.HD720
         params.camera_fps = 30
         params.depth_mode = (
-            sl.DEPTH_MODE.NONE
-            if self._no_depth or self._stereo_method in ("ffs", "tri_stereo")
-            else sl.DEPTH_MODE.NEURAL_LIGHT
+            sl.DEPTH_MODE.NONE if self._no_depth else sl.DEPTH_MODE.NEURAL_LIGHT
         )
         params.coordinate_units = sl.UNIT.METER
         params.depth_minimum_distance = 0.1
@@ -1174,9 +1082,9 @@ class RaidenPolicyServer(chiral.PolicyServer):
         handle = {
             "type": "zed",
             "camera": cam,
+            "depth": not self._no_depth,
             "image_mat": sl.Mat(),
             "depth_mat": sl.Mat(),
-            "right_mat": sl.Mat(),
             "h": res.height,
             "w": res.width,
             "intrinsics": K,
@@ -1187,43 +1095,40 @@ class RaidenPolicyServer(chiral.PolicyServer):
             "get_current_ts_ns": lambda: cam.get_timestamp(
                 sl.TIME_REFERENCE.CURRENT
             ).get_nanoseconds(),
-            # Stereo inference fields (used when stereo_method is ffs or tri_stereo).
-            "stereo_lock": threading.Lock(),
-            "latest_left": None,
-            "latest_right": None,
-            "stereo_seq": 0,
-            "last_depth_seq": -1,
         }
-        if self._stereo_method in ("ffs", "tri_stereo"):
-            handle["fx"] = float(cal.fx)
-            handle["baseline"] = float(abs(cal_params.get_camera_baseline()))
         return handle
 
-    def _open_realsense(self, serial: str) -> dict:
+    def _open_realsense(self, name: str) -> dict:
+        """Open a RealSense camera with the stream settings ``rd record`` uses.
+
+        Resolution, fps, crop and depth come from ``camera.json``, so served
+        frames and intrinsics match the converted recordings.
+        """
         import pyrealsense2 as rs
 
-        pipeline = rs.pipeline()
-        cfg = rs.config()
-        cfg.enable_device(serial)
-        cfg.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
-        cfg.enable_stream(rs.stream.depth, 848, 480, rs.format.z16, 30)
-        profile = pipeline.start(cfg)
+        from raiden.cameras.realsense import RealSenseCamera
 
-        color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
-        intr = color_stream.get_intrinsics()
-        depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
-        K = np.array(
-            [[intr.fx, 0.0, intr.ppx], [0.0, intr.fy, intr.ppy], [0.0, 0.0, 1.0]],
-            dtype=np.float64,
+        entry = self._raiden_cam_cfg.cameras[name]
+        depth = entry.get("depth", True) and not self._no_depth
+        camera = RealSenseCamera(
+            name,
+            str(entry["serial"]),
+            fps=entry.get("fps", 30),
+            resolution=self._raiden_cam_cfg.get_resolution(name),
+            crop=self._raiden_cam_cfg.get_crop(name),
+            depth=depth,
         )
-        align = rs.align(rs.stream.color)
+        camera.open()
+        if depth:
+            # Align depth to color, as conversion does on bag playback.
+            camera._align = rs.align(rs.stream.color)
+        K, _, (w, h) = camera.get_intrinsics()
         return {
             "type": "realsense",
-            "pipeline": pipeline,
-            "align": align,
-            "depth_scale": depth_scale,
-            "h": intr.height,
-            "w": intr.width,
+            "camera": camera,
+            "depth": depth,
+            "h": h,
+            "w": w,
             "intrinsics": K,
         }
 
@@ -1243,11 +1148,6 @@ class RaidenPolicyServer(chiral.PolicyServer):
         cam = handle["camera"]
         image_mat = handle["image_mat"]
         depth_mat = handle["depth_mat"]
-        right_mat = handle["right_mat"]
-        use_learned_stereo = (
-            self._stereo_method in ("ffs", "tri_stereo")
-            and self._ffs_predictor is not None
-        )
         runtime = sl.RuntimeParameters(
             confidence_threshold=99, texture_confidence_threshold=100
         )
@@ -1260,18 +1160,7 @@ class RaidenPolicyServer(chiral.PolicyServer):
                 # ZED returns BGRA; drop alpha channel → BGR.
                 color_bgr = image_mat.get_data()[:, :, :3].copy()
 
-                if use_learned_stereo:
-                    cam.retrieve_image(right_mat, sl.VIEW.RIGHT)
-                    right_bgr = right_mat.get_data()[:, :, :3].copy()
-                    if flip:
-                        color_bgr = cv2.rotate(color_bgr, cv2.ROTATE_180)
-                        right_bgr = cv2.rotate(right_bgr, cv2.ROTATE_180)
-                    # Stereo depth models use BGR (OpenCV convention).
-                    with handle["stereo_lock"]:
-                        handle["latest_left"] = color_bgr
-                        handle["latest_right"] = right_bgr
-                        handle["stereo_seq"] += 1
-                elif not self._no_depth:
+                if not self._no_depth:
                     cam.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
                     raw = depth_mat.get_data().copy()
                     depth = np.where(np.isfinite(raw), raw, 0.0).astype(np.float32)
@@ -1300,88 +1189,45 @@ class RaidenPolicyServer(chiral.PolicyServer):
                     self._cam_capture_ts_ns[name] = frame_ts_ns
 
     def _realsense_capture_loop(self, name: str, handle: dict, flip: bool) -> None:
-        pipeline = handle["pipeline"]
-        align = handle["align"]
-        depth_scale = handle["depth_scale"]
+        camera = handle["camera"]
         while self._running:
             try:
-                frames = pipeline.wait_for_frames(timeout_ms=500)
-                # Record Unix-ns timestamp immediately after wait_for_frames so it
-                # is on the same clock domain as the ZED hardware timestamps used
-                # for proprio interpolation.  Processing latency (resize etc.) is
-                # excluded from the timestamp.
-                frame_ts_ns = time.time_ns()
-                aligned = align.process(frames)
-                color_frame = aligned.get_color_frame()
-                depth_frame = aligned.get_depth_frame()
-                if not color_frame or not depth_frame:
+                if not camera.grab():
                     continue
-                color_bgr = np.asanyarray(color_frame.get_data())  # BGR uint8
-                depth = (np.asanyarray(depth_frame.get_data()) * depth_scale).astype(
-                    np.float32
-                )
+                frame = camera.get_frame()  # BGR uint8, cropped
+                # Stamp with the RealSense global-time device timestamp, the
+                # same field the recorder stores (realsense.py get_frame).
+                # Host time after grab() runs ~33 ms (one frame period of
+                # USB transport) later than this, which would pair each image
+                # with joint state one control period newer than in training.
+                # Global time is host-epoch, so it is comparable to the
+                # time.time_ns() proprio clock used when no ZED is present.
+                frame_ts_ns = frame.timestamp_ns
+                if frame_ts_ns <= 0:
+                    frame_ts_ns = time.time_ns()
+                color_bgr = frame.color
+                depth = frame.depth
                 if flip:
                     color_bgr = cv2.rotate(color_bgr, cv2.ROTATE_180)
-                    depth = cv2.rotate(depth, cv2.ROTATE_180)
+                    if depth is not None:
+                        depth = cv2.rotate(depth, cv2.ROTATE_180)
                 if self._resize is not None:
                     h_out, w_out = self._resize
                     color_bgr = cv2.resize(
                         color_bgr, (w_out, h_out), interpolation=cv2.INTER_LANCZOS4
                     )
-                    depth = cv2.resize(
-                        depth, (w_out, h_out), interpolation=cv2.INTER_LANCZOS4
-                    )
+                    if depth is not None:
+                        depth = cv2.resize(
+                            depth, (w_out, h_out), interpolation=cv2.INTER_LANCZOS4
+                        )
                 # Serve RGB to the policy.
-                self.update_image(name, color_bgr[..., ::-1].copy())
-                if name in self.depths:
+                self.update_image(name, color_bgr[..., ::-1])
+                if depth is not None and name in self.depths:
                     self.update_depth(name, depth)
                 with self._cam_ts_locks[name]:
                     self._cam_capture_ts_ns[name] = frame_ts_ns
             except RuntimeError:
                 time.sleep(0.01)
-
-    # -------------------------------------------------------------------------
-    # Learned stereo depth inference (single GPU thread for all cameras)
-    # -------------------------------------------------------------------------
-
-    def _depth_inference_loop(self) -> None:
-        """Run learned stereo depth inference for all ZED cameras in one thread.
-
-        Camera loops store the latest left/right frame pair in the handle dict.
-        This thread picks up new pairs (detected via stereo_seq), runs inference
-        sequentially across cameras, and updates the depth buffers.  Running in
-        a single thread avoids GPU contention and ensures the model is loaded
-        exactly once.
-        """
-        while self._running:
-            any_new = False
-            for name, handle in self._cam_handles.items():
-                if handle.get("type") != "zed":
-                    continue
-                with handle["stereo_lock"]:
-                    left = handle["latest_left"]
-                    right = handle["latest_right"]
-                    seq = handle["stereo_seq"]
-                    last_seq = handle["last_depth_seq"]
-                if left is None or seq == last_seq:
-                    continue
-                any_new = True
-                fx, baseline = self._stereo_calib.get(name, (0.0, 0.0))
-                try:
-                    depth = self._ffs_predictor.predict(left, right, fx, baseline)
-                    if self._resize is not None:
-                        h_out, w_out = self._resize
-                        depth = cv2.resize(
-                            depth, (w_out, h_out), interpolation=cv2.INTER_LANCZOS4
-                        )
-                    if name in self.depths:
-                        self.update_depth(name, depth)
-                    with handle["stereo_lock"]:
-                        handle["last_depth_seq"] = seq
-                except Exception as e:
-                    print(f"Depth inference error ({name}): {e}")
-            if not any_new:
-                time.sleep(0.005)
 
     # -------------------------------------------------------------------------
     # Proprioception
@@ -1477,15 +1323,11 @@ class RaidenPolicyServer(chiral.PolicyServer):
     def close(self) -> None:
         """Stop capture threads and release cameras and robot connections."""
         self._running = False
-        self._smooth_executor.shutdown(wait=False)
         time.sleep(0.1)
         self._robot.shutdown()
         for handle in self._cam_handles.values():
             try:
-                if handle["type"] == "zed":
-                    handle["camera"].close()
-                else:
-                    handle["pipeline"].stop()
+                handle["camera"].close()
             except Exception:
                 pass
 
@@ -1500,15 +1342,13 @@ def run_server(
     calibration_file: str = "",
     host: str = "0.0.0.0",
     port: int = 8765,
-    stereo_method: str = "zed",
-    ffs_scale: float = 1.0,
-    ffs_iters: int = 8,
-    tri_stereo_variant: str = "c64",
     max_joint_delta: float = _DEFAULT_MAX_JOINT_DELTA,
     action_type: str = "ee_pose",
     no_depth: bool = False,
-    resize_images_size: Optional[Tuple[int, int]] = (384, 384),
+    resize_images_size: Optional[Tuple[int, int]] = None,
     visualize: bool = False,
+    arms: str = "bimanual",
+    control_hz: float = _DEFAULT_CONTROL_HZ,
 ) -> None:
     """Start the Raiden chiral policy server."""
     from raiden._config import CALIBRATION_FILE, CAMERA_CONFIG
@@ -1518,15 +1358,13 @@ def run_server(
         calibration_file=calibration_file or CALIBRATION_FILE,
         host=host,
         port=port,
-        stereo_method=stereo_method,
-        ffs_scale=ffs_scale,
-        ffs_iters=ffs_iters,
-        tri_stereo_variant=tri_stereo_variant,
         max_joint_delta=max_joint_delta,
         action_type=action_type,
         no_depth=no_depth,
         resize_images_size=resize_images_size,
         visualize=visualize,
+        arms=arms,
+        control_hz=control_hz,
     )
     try:
         server.run()

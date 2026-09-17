@@ -436,29 +436,23 @@ class ServeCommand:
     port: int = 8765
     """WebSocket port to listen on"""
 
-    stereo_method: Literal["zed", "ffs", "tri_stereo"] = "zed"
-    """Depth backend: 'zed' (SDK NEURAL_LIGHT), 'ffs' (Fast Foundation Stereo), or 'tri_stereo' (TRI Stereo)"""
-
-    ffs_scale: float = 1.0
-    """Input resize scale for FFS inference (e.g. 0.5 halves resolution for speed)"""
-
-    ffs_iters: int = 8
-    """FFS update iterations (range 4–32)"""
-
-    tri_stereo_variant: Literal["c32", "c64"] = "c64"
-    """TRI Stereo model variant: 'c64' (higher quality) or 'c32' (faster)"""
-
     max_joint_delta: float = 0.8
     """Maximum allowed joint delta per policy step in radians before server aborts"""
 
+    arms: Literal["bimanual", "single"] = "bimanual"
+    """Which arms to drive: both followers (bimanual) or the left follower only (single)"""
+
     action_type: Literal["joint", "ee_pose"] = "ee_pose"
-    """Action space: 'joint' (14-D joint positions, left then right) or 'ee_pose' (20-D EE poses, IK solved on-the-fly)"""
+    """Action space: 'joint' (7-D joint positions per arm, left then right) or 'ee_pose' (10-D EE pose per arm, IK solved on-the-fly)"""
+
+    control_hz: float = 10.0
+    """Rate the policy client sends actions at; each action is reached within one period"""
 
     no_depth: bool = False
-    """Disable depth sensing on ZED cameras (faster, no NEURAL_LIGHT inference)"""
+    """Disable depth on all cameras (ZED NEURAL_LIGHT inference, RealSense depth stream and alignment)"""
 
-    resize_images: Optional[str] = "384x384"
-    """Resize images to HxW before sending to the policy (default: '384x384'). Pass empty string to disable."""
+    resize_images: Optional[str] = None
+    """Resize images to HxW (e.g. '384x384') before sending to the policy; unset serves the native, recorded resolution"""
 
     visualize: bool = False
     """Stream camera images to a Rerun web viewer at 30 FPS (accessible via browser or SSH tunnel)"""
@@ -847,15 +841,13 @@ def main():
                 calibration_file=command.calibration_file,
                 host=command.host,
                 port=command.port,
-                stereo_method=command.stereo_method,
-                ffs_scale=command.ffs_scale,
-                ffs_iters=command.ffs_iters,
-                tri_stereo_variant=command.tri_stereo_variant,
                 max_joint_delta=command.max_joint_delta,
                 action_type=command.action_type,
                 no_depth=command.no_depth,
                 resize_images_size=resize,
                 visualize=command.visualize,
+                arms=command.arms,
+                control_hz=command.control_hz,
             )
 
         elif subcommand == "make_ffs_onnx":
