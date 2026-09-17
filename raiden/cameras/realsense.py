@@ -64,11 +64,34 @@ def _enable_global_time(device: rs.device) -> None:
             sensor.set_option(rs.option.global_time_enabled, 1)
 
 
+def _wait_for_device(serial: str, timeout_s: float = 20.0) -> bool:
+    """Block until *serial* is enumerated again (after a hardware reset)."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        for dev in rs.context().query_devices():
+            if dev.get_info(rs.camera_info.serial_number) == str(serial):
+                return True
+        time.sleep(0.5)
+    return False
+
+
 class RealSenseCamera(Camera):
     """Intel RealSense D4xx camera – records to .bag"""
 
     _COLOR_W, _COLOR_H = 640, 480
     _DEPTH_W, _DEPTH_H = 640, 480
+
+    # A camera whose firmware is older than the build librealsense expects (the
+    # wrist D435 runs 5.11.1.100 against a recommended 5.17.0.10) sometimes
+    # starts its color stream while the depth stream delivers nothing at all.
+    # It is silent and it costs the whole episode: the bag then holds color
+    # only, and playback of a bag whose depth stream is empty returns no
+    # framesets, so conversion extracts zero frames.  Every pipeline start
+    # therefore waits for a real depth frame, restarts if none arrives, and
+    # power-cycles the camera if restarting is not enough.
+    _DEPTH_START_BUDGET_S = 3.0
+    _DEPTH_START_ATTEMPTS = 6
+    _DEPTH_RESET_EVERY = 2  # hardware-reset after this many failed attempts
 
     def __init__(
         self,
@@ -154,16 +177,66 @@ class RealSenseCamera(Camera):
             )
         return cfg
 
+    def _depth_streams(self, budget_s: float) -> bool:
+        """True once a frameset carrying depth arrives within *budget_s*."""
+        deadline = time.time() + budget_s
+        while time.time() < deadline:
+            try:
+                ok, frames = self._pipeline.try_wait_for_frames(timeout_ms=200)
+            except RuntimeError:
+                return False
+            if ok and frames.get_depth_frame():
+                return True
+        return False
+
+    def _start_verified(self, make_config) -> None:
+        """Start the pipeline and do not return until depth really streams.
+
+        *make_config* is called once per attempt rather than reused, because a
+        config that records to a bag must drop the partial file it wrote on the
+        failed attempt.  Raises RuntimeError once the attempts are spent, which
+        is the point: a color-only bag recorded under ``"depth": true`` is worse
+        than a session that refuses to start.
+        """
+        for attempt in range(1, self._DEPTH_START_ATTEMPTS + 1):
+            self._start_pipeline(make_config())
+            _enable_global_time(self._profile.get_device())
+            if not self._depth or self._depth_streams(self._DEPTH_START_BUDGET_S):
+                if self._depth and attempt > 1:
+                    print(f"  [{self._name}] depth streaming after {attempt} attempts")
+                return
+
+            device = self._profile.get_device()
+            self._pipeline.stop()
+            print(
+                f"  [{self._name}] no depth frames "
+                f"(attempt {attempt}/{self._DEPTH_START_ATTEMPTS})"
+            )
+            if attempt % self._DEPTH_RESET_EVERY == 0:
+                print(f"  [{self._name}] power-cycling the camera ...")
+                device.hardware_reset()
+                if not _wait_for_device(self._serial):
+                    raise RuntimeError(
+                        f"[{self._name}] camera {self._serial} did not come back "
+                        "after a hardware reset — replug it"
+                    )
+                self._pipeline = rs.pipeline()
+
+        raise RuntimeError(
+            f"[{self._name}] depth was requested but the camera streams none. "
+            f"Check the firmware (see {self._serial} in `rd calibrate`/rs-fw-update) "
+            'or set "depth": false for this camera to record color only.'
+        )
+
     def open(self) -> None:
         self._pipeline = rs.pipeline()
-        self._start_pipeline(self._stream_config(self._COLOR_W, self._COLOR_H))
+        self._start_verified(lambda: self._stream_config(self._COLOR_W, self._COLOR_H))
         print(
             f"  [{self._name}] opened: "
             f"BGR8 {self._color_w}×{self._color_h} @ {self._fps}fps"
+            + ("" if self._depth else " (no depth)")
         )
-        device = self._profile.get_device()
-        _enable_global_time(device)
-        depth_sensor = device.first_depth_sensor()
+        depth_sensor = self._profile.get_device().first_depth_sensor()
         self._depth_scale = depth_sensor.get_depth_scale()
 
     def close(self) -> None:
@@ -177,10 +250,13 @@ class RealSenseCamera(Camera):
         if self._pipeline:
             self._pipeline.stop()
 
-        cfg = self._stream_config(self._COLOR_W, self._COLOR_H)
-        cfg.enable_record_to_file(str(path))
-        self._start_pipeline(cfg)
-        _enable_global_time(self._profile.get_device())
+        def bag_config() -> "rs.config":
+            path.unlink(missing_ok=True)  # a retry must not append to a partial bag
+            cfg = self._stream_config(self._COLOR_W, self._COLOR_H)
+            cfg.enable_record_to_file(str(path))
+            return cfg
+
+        self._start_verified(bag_config)
         print(
             f"  [{self._name}] recording: "
             f"BGR8 {self._color_w}×{self._color_h} @ {self._fps}fps"
