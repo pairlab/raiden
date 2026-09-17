@@ -106,7 +106,9 @@ class LiveMonitor:
             panel = cv2.resize(
                 img,
                 (int(img.shape[1] * scale), TILE_HEIGHT),
-                interpolation=cv2.INTER_AREA,
+                # INTER_AREA degenerates to nearest-neighbour when it enlarges, and the
+                # rig's 480-line frames are enlarged to fill a 900-line tile.
+                interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR,
             )
             k = TILE_HEIGHT / 360
             cv2.putText(
