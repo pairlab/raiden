@@ -11,6 +11,7 @@ Output: a LeRobotDataset (codebase v3) at ``<output_dir>/<task>``::
     camera.<camera>.intrinsics    float32 (4,), fx, fy, cx, cy of that camera's image
     camera.<camera>.extrinsics    float32 (12,), camera-to-base pose of that camera
     table.pose                    float32 (12,), table-to-base pose (static per episode)
+    depth.<camera>                uint16 (H, W), millimetres, 0 = no return (only when recorded)
     task                          language instruction from the recording
 
 Both the joint-space and the end-effector-space versions are stored so the
@@ -39,6 +40,14 @@ The camera features sit outside ``observation.*`` on purpose: LeRobot turns
 every ``observation.*`` float feature into a policy state input, and camera
 poses should reach a policy only when it asks for them by key.
 
+Depth is exported when the converted episodes have it (``depth/<camera>/*.npz``),
+for point-cloud policies such as Adapt3R. It is a plain uint16 array, not an
+image or video feature: LeRobot images are 3-channel uint8 and its videos are
+lossy, and either would destroy the metric values. It sits outside
+``observation.*`` for the same reason as the camera poses. LeRobot's per-feature
+stats are skipped for it: they would be computed per pixel, which is slow and
+bloats ``stats.json``, and depth is not normalised with them.
+
 Requires the ``lerobot`` optional extra (``uv sync --extra lerobot``).
 """
 
@@ -51,6 +60,8 @@ from typing import Dict, List, Optional
 import cv2
 import numpy as np
 from tqdm import tqdm
+
+_DEPTH_PREFIX = "depth."
 
 _ARM_JOINT_NAMES = [f"joint_{i}" for i in range(6)] + ["gripper"]
 _ARM_EE_NAMES = (
@@ -137,6 +148,25 @@ def _rotation_skew(extrinsics: np.ndarray) -> float:
     return float(np.abs(R.transpose(0, 2, 1) @ R - np.eye(3)).max())
 
 
+def _skip_depth_stats():
+    """Make LeRobot compute episode stats without the depth features.
+
+    Returns a callable that restores the original function.
+    """
+    import lerobot.datasets.lerobot_dataset as lerobot_dataset
+
+    original = lerobot_dataset.compute_episode_stats
+
+    def without_depth(episode_data, features):
+        return original(
+            {k: v for k, v in episode_data.items() if not k.startswith(_DEPTH_PREFIX)},
+            {k: v for k, v in features.items() if not k.startswith(_DEPTH_PREFIX)},
+        )
+
+    lerobot_dataset.compute_episode_stats = without_depth
+    return lambda: setattr(lerobot_dataset, "compute_episode_stats", original)
+
+
 def export_task_to_lerobot(
     task_dir: Path,
     episode_dirs: List[Path],
@@ -208,6 +238,18 @@ def export_task_to_lerobot(
         "shape": (len(_POSE_NAMES),),
         "names": _POSE_NAMES,
     }
+    depth_cameras = [
+        cam
+        for cam in cameras
+        if (episode_dirs[0] / "depth" / cam / "0000000000.npz").exists()
+    ]
+    for cam in depth_cameras:
+        depth0 = np.load(episode_dirs[0] / "depth" / cam / "0000000000.npz")["depth"]
+        features[f"{_DEPTH_PREFIX}{cam}"] = {
+            "dtype": "uint16",
+            "shape": depth0.shape,
+            "names": ["height", "width"],
+        }
     pose_keys = [f"camera.{cam}.extrinsics" for cam in cameras] + ["table.pose"]
 
     print(f"Exporting {len(episode_dirs)} episode(s) of '{task_name}' → {root}")
@@ -215,7 +257,8 @@ def export_task_to_lerobot(
     dims = ", ".join(
         f"{k}={v['shape'][0]}" for k, v in features.items() if v["dtype"] == "float32"
     )
-    print(f"  {dims}  vcodec={vcodec}\n")
+    print(f"  {dims}  vcodec={vcodec}")
+    print(f"  depth: {depth_cameras or 'none'}\n")
 
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
@@ -227,6 +270,7 @@ def export_task_to_lerobot(
         image_writer_threads=image_writer_threads,
         vcodec=vcodec,
     )
+    restore_stats = _skip_depth_stats() if depth_cameras else None
 
     placeholders: List[str] = []
     skewed: List[str] = []
@@ -256,12 +300,26 @@ def export_task_to_lerobot(
                 frame[f"observation.images.{cam}"] = cv2.cvtColor(
                     img_bgr, cv2.COLOR_BGR2RGB
                 )
+            for cam in depth_cameras:
+                depth_path = ep_dir / "depth" / cam / f"{i:010d}.npz"
+                if not depth_path.exists():
+                    raise FileNotFoundError(
+                        f"{depth_path} (the first episode has depth for {cam}; "
+                        "every exported episode must)"
+                    )
+                depth = np.load(depth_path)["depth"]
+                # 65535 is the camera's saturated value, not a measurement (the
+                # wrist D435 sends a whole frame of it when recording starts).
+                depth[depth == 65535] = 0
+                frame[f"{_DEPTH_PREFIX}{cam}"] = depth
             dataset.add_frame(frame)
 
         dataset.save_episode()
         print(f"  ✓ {ep_dir.name}: {n_frames} frames")
 
     dataset.finalize()
+    if restore_stats is not None:
+        restore_stats()
     print(f"\n✓ LeRobot dataset ready: {root}")
     print(
         f"  {dataset.meta.total_episodes} episodes, {dataset.meta.total_frames} frames"
