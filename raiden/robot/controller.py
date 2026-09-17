@@ -78,15 +78,19 @@ _SIM_SETTLE_S = 0.2
 # The model's two 47.5 mm finger strokes give a total opening range of 95 mm.
 _GRIPPER_MIN_OPENING = 20.0 / 95.0
 
-# Gripper closing safety threshold in normalized [0,1] gripper space.
-# Gripper is stopped from closing further when commanded position is more than
-# this amount below the actual position (indicating the fingers are blocked).
-# LINEAR_4310 stroke = 95 mm, so this allows 2 mm of lag; squeeze force is kp x lag.
-_GRIPPER_SAFETY_THRESHOLD = 2.0 / 95.0
 
-# Gripper command speed for SpaceMouse teleop (normalized [0,1] units per second).
-# Full stroke (71 mm) closes/opens in 1/_GRIPPER_SPEED seconds.
-_GRIPPER_SPEED = 1.0
+# Recorded gripper actions are the operator's intent -- open or closed, nothing
+# between.  What reaches the motor is clamped separately (_GRIPPER_MIN_OPENING,
+# plus i2rt's own force limiter); those limits are motor-side only and must not
+# reach the dataset, or a policy learns to imitate the limiter instead of the task.
+def _binary_gripper(gripper: float) -> float:
+    """The gripper half of a recorded action: 1.0 open, 0.0 closed.
+
+    Quest and SpaceMouse gripper signals are already binary; the leader arm's
+    analog encoder is thresholded at half its travel.
+    """
+    return 1.0 if gripper >= 0.5 else 0.0
+
 
 # ---------------------------------------------------------------------------
 # Pyroki / J-PARSE IK helpers
@@ -966,7 +970,10 @@ class RobotController:
                 follower_cmd = np.append(leader_pos[:6], follower_gripper_cmd)
 
                 follower.command_joint_pos(follower_cmd)
-                self._last_commanded_pos[side] = follower_cmd
+                # Record the operator's intent; the clamp above stays motor-side.
+                self._last_commanded_pos[side] = np.append(
+                    leader_pos[:6], _binary_gripper(leader_pos[6])
+                )
                 time.sleep(0.01)  # 100 Hz — matches inference command rate
 
             except Exception as e:
@@ -1114,7 +1121,9 @@ class RobotController:
     def _cartesian_control_loop(self, side: str, target_fn, dt: float) -> None:
         follower = self.follower_r if side == "right" else self.follower_l
         fk, ik_step = self._build_ik_mink(dt)
-        q_arm = follower.get_joint_pos()[:6].copy()
+        q_full = follower.get_joint_pos()
+        q_arm = q_full[:6].copy()
+        gripper_intent = _binary_gripper(q_full[6])
         hold_pos: Optional[np.ndarray] = None
         was_paused = False
 
@@ -1144,17 +1153,14 @@ class RobotController:
                 else:
                     T_target, gripper = result
                     q_arm = ik_step(q_arm, T_target)
-                    gripper = np.clip(
-                        gripper,
-                        gripper_actual - 0.9 * _GRIPPER_SAFETY_THRESHOLD,
-                        gripper_actual + 0.9 * _GRIPPER_SAFETY_THRESHOLD,
-                    )
+                    gripper_intent = _binary_gripper(gripper)
                     cmd = np.append(
                         q_arm,
                         float(np.clip(gripper, _GRIPPER_MIN_OPENING, 1.0)),
                     )
                 follower.command_joint_pos(cmd)
-                self._last_commanded_pos[side] = cmd.copy()
+                # Record the operator's intent; the clamp above stays motor-side.
+                self._last_commanded_pos[side] = np.append(cmd[:6], gripper_intent)
 
                 remaining = dt - (time.monotonic() - loop_start)
                 if remaining > 0:
@@ -1375,7 +1381,7 @@ class RobotController:
         # at the two boundaries: reading from robot and commanding the robot.
         q_full_init = follower.get_joint_pos()
         q_arm = q_full_init[:6][::-1].copy()  # MuJoCo→pyroki
-        gripper = q_full_init[6]
+        gripper_intent = _binary_gripper(q_full_init[6])
 
         while not self._spacemouse_shutdown.is_set():
             try:
@@ -1398,7 +1404,7 @@ class RobotController:
                     # Re-sync virtual state to actual robot position after pause.
                     q_full_resync = follower.get_joint_pos()
                     q_arm = q_full_resync[:6][::-1].copy()  # MuJoCo→pyroki
-                    gripper = q_full_resync[6]
+                    gripper_intent = _binary_gripper(q_full_resync[6])
                 was_paused = False
 
                 # --- read SpaceMouse ---
@@ -1412,9 +1418,6 @@ class RobotController:
                     time.sleep(dt)
                     continue
 
-                # --- gripper (read from robot; not part of IK-tracked state) ---
-                gripper_actual = follower.get_joint_pos()[6]
-
                 T_current = _fk_tcp(q_arm)
                 T_target = spacemouse_to_target_pose(
                     state, T_current, vel_scale, rot_scale, invert_rotation
@@ -1423,22 +1426,20 @@ class RobotController:
                 # --- J-PARSE velocity IK ---
                 q_arm = _ik_step(q_arm, T_target)
 
-                # --- gripper buttons ---
-                gripper = gripper_actual
+                # --- gripper buttons (latched open/closed, not a rate) ---
                 buttons = getattr(state, "buttons", [])
                 if len(buttons) > 0 and buttons[0]:
-                    gripper = max(
-                        _GRIPPER_MIN_OPENING,
-                        gripper_actual - 0.9 * _GRIPPER_SAFETY_THRESHOLD,
-                    )  # close
+                    gripper_intent = 0.0  # close
                 elif len(buttons) > 1 and buttons[1]:
-                    gripper = min(
-                        1.0, gripper_actual + 0.9 * _GRIPPER_SAFETY_THRESHOLD
-                    )  # open
+                    gripper_intent = 1.0  # open
 
-                cmd = np.append(q_arm[::-1], gripper)  # pyroki→MuJoCo
+                cmd = np.append(
+                    q_arm[::-1],  # pyroki→MuJoCo
+                    max(_GRIPPER_MIN_OPENING, gripper_intent),
+                )
                 follower.command_joint_pos(cmd)
-                self._last_commanded_pos[side] = cmd.copy()
+                # Record the operator's intent; the clamp above stays motor-side.
+                self._last_commanded_pos[side] = np.append(cmd[:6], gripper_intent)
 
                 # --- pace to dt ---
                 elapsed = time.monotonic() - loop_start

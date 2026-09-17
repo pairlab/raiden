@@ -741,6 +741,17 @@ def _build_lowdim(
             axis=1,
         ).astype(np.float32)
 
+    def cmd_to_cam(key: str) -> Optional[np.ndarray]:
+        """A commanded 7-DOF array on the camera grid, gripper still binary.
+
+        ``interp_to_cam`` interpolates every column linearly, which on the gripper
+        would invent intermediate openings the operator never commanded.
+        """
+        arr = interp_to_cam(key)
+        if arr is not None:
+            arr[:, 6] = (arr[:, 6] >= 0.5).astype(np.float32)
+        return arr
+
     def _fk(kin: Any, q: np.ndarray) -> np.ndarray:
         """Call FK, padding q with zeros to the model's nq if needed."""
         nq = kin._configuration.model.nq
@@ -885,7 +896,7 @@ def _build_lowdim(
                     "cannot be converted. Re-record the episode."
                 )
 
-        l_cmd = interp_to_cam("follower_l_joint_cmd")
+        l_cmd = cmd_to_cam("follower_l_joint_cmd")
         if l_cmd is not None:
             l_poses = np.stack(
                 [
@@ -896,7 +907,7 @@ def _build_lowdim(
             action_parts.append(l_poses)
             action_parts.append(l_cmd[:, 6:7])  # gripper
 
-        r_cmd = interp_to_cam("follower_r_joint_cmd")
+        r_cmd = cmd_to_cam("follower_r_joint_cmd")
         if r_cmd is not None:
             r_poses = np.stack(
                 [
@@ -948,8 +959,8 @@ def _build_lowdim(
     action_joints_parts = [
         p
         for p in (
-            interp_to_cam("follower_l_joint_cmd"),
-            interp_to_cam("follower_r_joint_cmd"),
+            cmd_to_cam("follower_l_joint_cmd"),
+            cmd_to_cam("follower_r_joint_cmd"),
         )
         if p is not None
     ]
