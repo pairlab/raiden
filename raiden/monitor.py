@@ -6,9 +6,9 @@ the recorder actually captured, tiled, with the BDDL task state drawn on top, so
 sees the data being collected rather than a separate free camera.
 
 Frames arrive through :meth:`log`, which only parks the newest one; a background thread does
-the tiling and drawing.  Recording threads are never blocked, and against the sim the rig
-cameras cost the server nothing extra.  ``view=`` adds an operator camera: one extra render
-on the server per monitor frame (~0.3 ms on the GPU).
+the tiling and drawing.  Recording threads are never blocked.  Against the sim the monitor
+renders its own panels -- ``view=``, comma-separated, plus the rig cameras -- in one ``hires``
+request per frame at the server's ``--viewer-scale``; what gets recorded is unchanged.
 
 ``web=True`` swaps the window for a Rerun stream, for when the display is not local.
 """
@@ -21,8 +21,8 @@ from typing import Dict, List, Optional
 import cv2
 import numpy as np
 
-TILE_HEIGHT = 360
-MAX_WIDTH = 1920
+TILE_HEIGHT = 900
+MAX_WIDTH = 2560
 WINDOW = "raiden monitor"
 
 
@@ -43,10 +43,12 @@ class LiveMonitor:
     ):
         self.fps = fps
         self.guides = guides
-        self.view = view
-        self.names = ([view] if view else []) + list(camera_names)
+        self.views = [v for v in view.split(",") if v]
+        self.names = self.views + list(camera_names)
         self._sim = sim
         self._web = web
+        self._rendered = set(self.names) if sim else set()
+        self._window = False
         self._latest: Dict[str, np.ndarray] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -78,6 +80,8 @@ class LiveMonitor:
 
     def log(self, name: str, image_bgr: np.ndarray) -> None:
         """Hand over the newest frame.  Called from grab threads, so it must stay cheap."""
+        if name in self._rendered:
+            return
         with self._lock:
             self._latest[name] = image_bgr
 
@@ -99,9 +103,20 @@ class LiveMonitor:
                 continue
             img = self._with_guides(name, img)
             scale = TILE_HEIGHT / img.shape[0]
-            panel = cv2.resize(img, (int(img.shape[1] * scale), TILE_HEIGHT))
+            panel = cv2.resize(
+                img,
+                (int(img.shape[1] * scale), TILE_HEIGHT),
+                interpolation=cv2.INTER_AREA,
+            )
+            k = TILE_HEIGHT / 360
             cv2.putText(
-                panel, name, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2
+                panel,
+                name,
+                (int(8 * k), int(22 * k)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6 * k,
+                (0, 255, 255),
+                max(2, int(2 * k)),
             )
             panels.append(panel)
         if not panels:
@@ -129,13 +144,24 @@ class LiveMonitor:
         ]
         if task.status["success"]:
             lines.append("SUCCESS")
-        y = img.shape[0] - 14 * len(lines) - 10
-        cv2.rectangle(img, (0, y - 16), (420, img.shape[0]), (0, 0, 0), -1)
+        # Sub-linear in the panel height so the overlay stays clear of the workspace.
+        k = max(1.0, img.shape[0] / 600)
+        step = int(14 * k)
+        y = img.shape[0] - step * len(lines) - int(10 * k)
+        cv2.rectangle(
+            img, (0, y - int(16 * k)), (int(420 * k), img.shape[0]), (0, 0, 0), -1
+        )
         for i, line in enumerate(lines):
             done = line.startswith("[x]") or line == "SUCCESS"
             colour = (0, 255, 0) if done else (255, 255, 255)
             cv2.putText(
-                img, line, (8, y + 14 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour, 1
+                img,
+                line,
+                (int(8 * k), y + step * i),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45 * k,
+                colour,
+                max(1, int(k)),
             )
 
     def _loop(self) -> None:
@@ -144,14 +170,17 @@ class LiveMonitor:
             from raiden.sim import SimConnection, TaskMonitor
 
             task = TaskMonitor(self._sim)
-            if self.view:
-                conn = SimConnection(self._sim)
+            conn = SimConnection(self._sim)
         try:
             while not self._stop.is_set():
                 if conn is not None:
                     try:
-                        rgb = conn.call("render", cameras=[self.view], depth=False)
-                        self.log(self.view, rgb[self.view]["rgb"][:, :, ::-1])
+                        rgb = conn.call(
+                            "render", cameras=list(self.names), depth=False, hires=True
+                        )
+                        with self._lock:
+                            for name, frame in rgb.items():
+                                self._latest[name] = frame["rgb"][:, :, ::-1]
                     except (RuntimeError, EOFError, OSError):
                         pass
                 if task is not None and task.poll():
@@ -164,7 +193,7 @@ class LiveMonitor:
                 conn.close()
             if task is not None:
                 task.close()
-            if not self._web:
+            if not self._web and self._window:
                 cv2.destroyWindow(WINDOW)
                 cv2.waitKey(1)
 
@@ -184,6 +213,10 @@ class LiveMonitor:
             return
         tiled = self._tile(frames, task)
         if tiled is not None:
+            if not self._window:
+                cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(WINDOW, tiled.shape[1], tiled.shape[0])
+                self._window = True
             cv2.imshow(WINDOW, tiled)
             cv2.waitKey(1)
 

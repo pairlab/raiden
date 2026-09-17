@@ -58,15 +58,18 @@ class GraspGuides:
         *,
         T_base_cam: Optional[np.ndarray] = None,
         T_tool_cam: Optional[np.ndarray] = None,
+        size: Optional[Tuple[int, int]] = None,
     ) -> None:
         """Register a camera. Give ``T_base_cam`` for a fixed camera, ``T_tool_cam`` for a
-        wrist camera (both camera-to-frame, OpenCV optical convention)."""
+        wrist camera (both camera-to-frame, OpenCV optical convention).  ``size`` is the
+        (width, height) ``K`` belongs to; frames of another size get ``K`` rescaled."""
         if (T_base_cam is None) == (T_tool_cam is None):
             raise ValueError(
                 f"camera {name!r}: give exactly one of T_base_cam, T_tool_cam"
             )
         self._cams[name] = {
             "K": np.asarray(K, dtype=np.float64).reshape(3, 3),
+            "size": None if size is None else (int(size[0]), int(size[1])),
             "T_base_cam": None
             if T_base_cam is None
             else np.asarray(T_base_cam, dtype=np.float64),
@@ -104,6 +107,12 @@ class GraspGuides:
         cam = self._cams.get(name)
         if cam is None or not self._joints:
             return image_bgr
+        K = cam["K"]
+        if cam["size"] is not None:
+            # The monitor may show a sim frame larger than the rig resolution.
+            sx = image_bgr.shape[1] / cam["size"][0]
+            sy = image_bgr.shape[0] / cam["size"][1]
+            K = np.diag([sx, sy, 1.0]) @ K
         for q in list(self._joints.values()):
             try:
                 T_base_tool = self._fk(q)
@@ -117,7 +126,7 @@ class GraspGuides:
             approach = T_base_tool[:3, 2]  # grasp_site local +z: out through the jaws
             self._draw_one(
                 image_bgr,
-                cam["K"],
+                K,
                 T_cam_base,
                 grasp - AXIS_BEHIND * approach,
                 grasp + AXIS_AHEAD * approach,
@@ -171,18 +180,24 @@ def make_guides(cameras, *, sim: str = "") -> GraspGuides:
     for camera in cameras:
         name = camera.name
         try:
-            K, _dist, _size = camera.get_intrinsics()
+            K, _dist, size = camera.get_intrinsics()
         except Exception:
             continue
         entry = (rig.get("cameras") or {}).get(name, {})
         if "T_base_cam" in entry:
             guides.add_camera(
-                name, K, T_base_cam=np.array(entry["T_base_cam"], dtype=np.float64)
+                name,
+                K,
+                T_base_cam=np.array(entry["T_base_cam"], dtype=np.float64),
+                size=size,
             )
             continue
         if "T_tool_cam" in entry:
             guides.add_camera(
-                name, K, T_tool_cam=_grasp_from_tcp(np.array(entry["T_tool_cam"]))
+                name,
+                K,
+                T_tool_cam=_grasp_from_tcp(np.array(entry["T_tool_cam"])),
+                size=size,
             )
             continue
         cam_calib = (calib.get("cameras") or {}).get(name, {})
@@ -197,7 +212,7 @@ def make_guides(cameras, *, sim: str = "") -> GraspGuides:
                 T[:3, 3] = np.array(
                     block["translation_vector"], dtype=np.float64
                 ).reshape(3)
-                guides.add_camera(name, K, **{kwarg: T})
+                guides.add_camera(name, K, size=size, **{kwarg: T})
                 break
     return guides
 

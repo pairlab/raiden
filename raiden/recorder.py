@@ -981,9 +981,9 @@ def run_recording(
         except Exception as exc:
             print(f"  grasp guides unavailable ({type(exc).__name__}: {exc})")
             guides = None
-        # Sim: an operator view (default MESA's leftshoulder) takes the scene camera's panel;
-        # the wrist camera stays.  Display only -- what is recorded does not change.
-        view = {"": "leftshoulder" if sim else "", "none": ""}.get(
+        # Sim: operator views (default ``operator`` and ``topdown``) take the scene camera's
+        # panel; the wrist camera stays.  Display only -- what is recorded does not change.
+        view = {"": "operator,topdown" if sim else "", "none": ""}.get(
             monitor_view, monitor_view
         )
         shown = [c.name for c in cameras if not view or "wrist" in c.name]

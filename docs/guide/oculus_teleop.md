@@ -67,9 +67,11 @@ is saved.
 A reset snaps the arm home and re-samples the objects. Only saved episodes keep a
 directory, so episode numbers stay contiguous.
 
-With `--monitor`, the window shows MESA's `leftshoulder` view (partitions hidden)
-and the wrist camera. The view is for the operator only and is never recorded;
-`--monitor-view` picks another operator view, and `--monitor-view none` shows the
+With `--monitor`, the window shows the `operator` view (behind the arm), the
+`topdown` view (above the table, angled down) and the wrist camera, with the
+partitions hidden. The views are for the operator only and are never recorded;
+`--monitor-view` picks other operator views (comma-separated, e.g.
+`--monitor-view leftshoulder,topdown`), and `--monitor-view none` shows the
 recorded scene camera. The terminal prints each subtask as the sim completes it,
 and a note if you save an episode the sim does not score a success.
 

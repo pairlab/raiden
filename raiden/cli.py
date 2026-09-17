@@ -42,8 +42,8 @@ class TeleopCommand:
     """Show the frames being recorded live in Rerun (plus the task panel when --sim)"""
 
     monitor_view: str = ""
-    """Sim only: also stream an operator view (agentview, behindview, frontview, birdview,
-    sideview). Costs extra renders on the sim server; implies --monitor"""
+    """Sim only: also stream an operator view (operator, agentview, behindview, frontview,
+    birdview, sideview). Costs extra renders on the sim server; implies --monitor"""
 
     monitor_web: bool = False
     """Serve the monitor in a browser (Rerun) instead of the local OpenCV window"""
@@ -140,8 +140,9 @@ class RecordCommand:
     """Show the frames being recorded live in Rerun (plus the task panel when --sim)"""
 
     monitor_view: str = ""
-    """Sim only: operator view shown in place of the scene camera, never recorded. Default
-    leftshoulder (MESA's); also rightshoulder, midshoulder, egocentric, agentview, behindview,
+    """Sim only: operator views (comma-separated) shown in place of the scene camera, never
+    recorded. Default operator,topdown (behind the arm base, and above the table); also
+    leftshoulder (MESA's), rightshoulder, midshoulder, egocentric, agentview, behindview,
     frontview, birdview, sideview; 'none' shows the scene camera. Implies --monitor"""
 
     monitor_web: bool = False
