@@ -209,14 +209,20 @@ class DemonstrationRecorder:
         self._stop_event.set()
         duration = time.monotonic() - self._start_time
 
-        # Finalize the camera files before shutdown moves the robot home.  Otherwise
-        # the video contains homing motion after robot telemetry has already stopped.
-        self._stop_streams()
+        # Stop the grab and robot-sampling threads first, so nothing reads the robot
+        # while it shuts down.
+        self._join_threads()
 
         if shutdown_robots:
             # Motors must be closed between episodes — keeping them alive idle
             # causes DM4310 CAN watchdog errors due to lack of regular commands.
+            # Home and close the arm *before* finalising the camera files: with depth
+            # on, finalising stalls the process past the motors' 400 ms watchdog and
+            # the arm drops onto the table.  The bags keep recording through homing;
+            # conversion drops that tail because it clips cameras to robot telemetry.
             self.robot_controller.shutdown()
+
+        self._finalize_cameras()
 
         print("\n" + "!" * 60)
         print("  RECORDING STOPPED")
@@ -240,10 +246,15 @@ class DemonstrationRecorder:
         print("\n  Episode discarded\n")
 
     def _stop_streams(self) -> None:
+        self._join_threads()
+        self._finalize_cameras()
+
+    def _join_threads(self) -> None:
         # Wait for threads (camera grab threads will exit within one frame period)
         for t in self._threads:
             t.join(timeout=3.0)
 
+    def _finalize_cameras(self) -> None:
         # Finalise SVO2 / bag files but keep cameras open — run in parallel so
         # all cameras stop at the same time (avoids trailing frames on one camera).
         stop_threads = [
