@@ -54,6 +54,10 @@ lerobot = ["lerobot>=0.4"]
 [project.scripts]
 rd = "raiden.cli:main"
 
+[tool.uv]
+# ruckig 0.15.3 uses cmake.targets, rejected by scikit-build-core >= 0.10
+build-constraint-dependencies = ["scikit-build-core<0.10"]
+
 [tool.uv.sources]
 i2rt = { path = "third_party/i2rt" }
 pyzed = { path = "packages/pyzed-5.2-cp311-cp311-linux_x86_64.whl" }

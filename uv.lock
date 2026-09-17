@@ -8,6 +8,9 @@ resolution-markers = [
     "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
 ]
 
+[manifest]
+build-constraints = [{ name = "scikit-build-core", specifier = "<0.10" }]
+
 [[package]]
 name = "absl-py"
 version = "2.4.0"
