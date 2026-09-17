@@ -38,15 +38,11 @@ for most distributions; `pyrealsense2` is installed via the `realsense` extra.
 
 ## Install `rd`
 
-Install `rd` as a shell command, picking the extras that match your hardware and
-depth backend:
+Install `rd` as a shell command, picking the extras that match your hardware:
 
 ```bash
 uv tool install -e .                                                    # base install
 uv tool install -e ".[zed]"                                             # + ZED cameras
-uv tool install -e ".[zed,tri-stereo]"                                  # + TRI Stereo depth (ONNX)
-uv tool install -e ".[zed,tri-stereo,tri-stereo-trt-cu12]"              # + TensorRT (CUDA 12)
-uv tool install -e ".[zed,tri-stereo,tri-stereo-trt-cu13]"              # + TensorRT (CUDA 13)
 uv tool install -e ".[realsense]"                                       # + RealSense cameras (not recommended)
 rd --help
 ```
@@ -54,8 +50,3 @@ rd --help
 !!! note
     Re-run `uv tool install --reinstall -e ".[<extras>]"` whenever you add
     or change extras, or after pulling updates from the repository.
-
-## Optional depth backends
-
-- **[TRI Stereo Depth](tri_stereo.md)** — TRI's learned stereo depth model tailored for robot manipulation scenes. Supports `c32` and `c64` variants with ONNX and TensorRT backends.
-- **[Fast Foundation Stereo](tensorrt.md)** — foundation model stereo depth; higher quality at object boundaries and thin structures.

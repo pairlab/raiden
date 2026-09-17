@@ -9,8 +9,8 @@ Raiden is designed for the **YAM bimanual robot system**. Exact quantities depen
 | PC | A GPU is required when using ZED cameras; RealSense cameras produce depth on-device |
 
 !!! note "PC specifications"
-    An NVIDIA GPU is required when using ZED cameras (ZED SDK or Fast Foundation Stereo
-    depth). RealSense cameras produce depth on-device so a GPU is not needed for
+    An NVIDIA GPU is required when using ZED cameras (ZED SDK depth).
+    RealSense cameras produce depth on-device so a GPU is not needed for
     RealSense-only setups. Required GPU memory and CPU performance depend on your
     specific configuration; check the requirements before purchasing.
 

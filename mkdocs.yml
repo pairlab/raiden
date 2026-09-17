@@ -50,10 +50,7 @@ nav:
     - guide/index.md
     - Bill of Materials: guide/bom.md
     - "1. Hardware Setup": guide/hardware.md
-    - "2. Installation":
-      - Setup: guide/installation.md
-      - TRI Stereo Depth: guide/tri_stereo.md
-      - Fast Foundation Stereo: guide/tensorrt.md
+    - "2. Installation": guide/installation.md
     - "3. Quick Start": guide/quickstart.md
     - "4. Calibration": guide/calibration.md
     - "5. Console": guide/console.md

@@ -37,46 +37,6 @@ rd convert --reconvert
 If a recording has no database entry (e.g. recorded before the DB was set up)
 its status is treated as unknown and it is included.
 
-## Depth backends for ZED cameras
-
-ZED stereo cameras support three depth estimation backends, selected with
-`--stereo-method`:
-
-| Backend | Flag | Description |
-|---|---|---|
-| ZED SDK (default) | `--stereo-method zed` | On-device NEURAL_LIGHT depth from the ZED SDK. Fast, no extra GPU setup required. |
-| Fast Foundation Stereo | `--stereo-method ffs` | [Fast Foundation Stereo](https://github.com/NVlabs/Fast-FoundationStereo) — a foundation model for stereo depth. Requires a CUDA GPU; see [Installation](installation.md#fast-foundation-stereo-optional) for setup. |
-| TRI Stereo | `--stereo-method tri_stereo` | TRI's learned stereo depth model, tailored for robot manipulation scenes. Available in `c32` (faster) and `c64` (higher quality) variants. Requires a CUDA GPU; see [TRI Stereo Depth](tri_stereo.md) for setup. |
-
-```bash
-# Use Fast Foundation Stereo
-rd convert --stereo-method ffs
-
-# Reduce FFS input resolution for speed (default scale 1.0)
-rd convert --stereo-method ffs --ffs-scale 0.5
-
-# Increase FFS update iterations for quality (default 8)
-rd convert --stereo-method ffs --ffs-iters 16
-
-# Use TRI Stereo (c64 variant, default)
-rd convert --stereo-method tri_stereo
-
-# Use the lighter c32 variant
-rd convert --stereo-method tri_stereo --tri-stereo-variant c32
-```
-
-When `--stereo-method tri_stereo` is used, Raiden automatically selects the fastest
-available backend for the chosen variant:
-
-1. **TensorRT** — if `stereo_c64.engine` (or `stereo_c32.engine`) exists in `~/.config/raiden/weights/tri_stereo/`
-2. **ONNX Runtime** — if `stereo_c64.onnx` (or `stereo_c32.onnx`) exists
-3. **PyTorch** — falls back to the `.pth` checkpoint
-
-!!! warning "Learned stereo backends are GPU-heavy"
-    Both Fast Foundation Stereo and TRI Stereo depth are GPU-intensive models and
-    may be slow depending on your hardware. For real-time throughput, compile
-    TensorRT engines.
-
 ## Multi-camera synchronization
 
 All ZED SVO2 cameras are extracted **simultaneously** in a single pass. On

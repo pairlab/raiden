@@ -60,9 +60,8 @@ Offline post-processing step (`rd convert`). Reads raw SVO2/bag recordings,
 synchronizes multi-camera streams by timestamp, extracts JPEG frames and depth
 maps, interpolates joint poses onto the camera timeline, and writes the
 per-frame `lowdim.npz` files that bundle intrinsics, per-frame extrinsics,
-the action vector, and the language instruction. Supports three depth backends:
-RealSense IR, ZED SDK NEURAL_LIGHT, and Fast Foundation Stereo (with optional
-TensorRT acceleration).
+the action vector, and the language instruction. Supports two depth backends:
+RealSense IR and ZED SDK NEURAL_LIGHT.
 
 ### [`Visualizer`](visualizer.md)
 Loads a converted recording and streams it into a [Rerun](https://rerun.io)
@@ -74,13 +73,6 @@ Hand-eye calibration (`rd calibrate`) for wrist cameras and static extrinsic
 estimation for scene cameras. Writes `~/.config/raiden/calibration_results.json` with
 `T_cam2ee` per wrist camera and `T_base2cam` for scene cameras, plus a
 `bimanual_transform` mapping the right-arm base into the left-arm base frame.
-
-### `FFSDepthPredictor` / `FFSTrtDepthPredictor`
-Depth estimation backends wrapping
-[Fast Foundation Stereo](https://github.com/NVlabs/Fast-FoundationStereo).
-`FFSDepthPredictor` runs inference in PyTorch; `FFSTrtDepthPredictor` uses
-compiled TensorRT FP16 engines for faster throughput. Both are used
-transparently by the Converter — TRT engines are preferred when present.
 
 ---
 

@@ -125,35 +125,3 @@ sudo bash scripts/install_spacemouse_udev.sh
 Then unplug, replug, and log out/in (or reboot) for the group change to take
 effect. See [SpaceMouse setup](quickstart.md#spacemouse).
 
----
-
-### `scripts/install_ffs.py`
-
-Clones [Fast Foundation Stereo](https://github.com/NVlabs/Fast-FoundationStereo)
-into `third_party/`:
-
-```bash
-uv run python scripts/install_ffs.py
-```
-
-Then download the pretrained weights from the
-[Fast Foundation Stereo repository](https://github.com/NVlabs/Fast-FoundationStereo)
-and place the `*.pth` file in `~/.config/raiden/weights/`.
-
-See [Installation - Fast Foundation Stereo](installation.md#fast-foundation-stereo-optional).
-
----
-
-### `sudo apt-get install tensorrt` fails with Python version conflict
-
-The `tensorrt` apt meta-package depends on `python3-libnvinfer` which requires
-Python < 3.11. Install the C++ tools directly instead, then add the Python
-bindings via pip:
-
-```bash
-sudo apt-get install --no-install-recommends libnvinfer-bin libnvinfer-dev libnvinfer-headers-dev
-uv add tensorrt
-```
-
-`libnvinfer-bin` provides `trtexec` and `uv add tensorrt` installs the Python
-bindings into the project environment.

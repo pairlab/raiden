@@ -11,7 +11,7 @@ visualization.
 
 - **Flexible control** — leader-follower teleoperation or SpaceMouse end-effector control, in bimanual or single-arm configurations.
 - **Manipulability-aware IK** — uses [PyRoki](https://github.com/chungmin99/pyroki) and [J-Parse](https://jparse-manip.github.io/) for smooth and singularity-aware control.
-- **Multiple depth backends** — IR structured light (RealSense), ZED SDK stereo, TRI Stereo, and [Fast Foundation Stereo](https://github.com/NVlabs/Fast-FoundationStereo) for high-quality depth tailored to manipulation scenes.
+- **Multiple depth backends** — IR structured light (RealSense) and ZED SDK stereo.
 - **Heterogeneous cameras** — mix ZED and Intel RealSense cameras freely in a single session, across scene and wrist roles.
 - **Automated extrinsic calibration** — hand-eye calibration for wrist cameras and static extrinsic estimation for scene cameras via ChArUco boards.
 - **Metadata console** — a terminal UI (`rd console`) for reviewing demonstrations, correcting success/failure labels, and managing tasks and teachers.
@@ -38,8 +38,6 @@ See the **[Installation guide](https://tri-ml.github.io/raiden/guide/installatio
 | `rd lerobot` | Export converted episodes to a LeRobot dataset |
 | `rd visualize` | Visualize a converted recording with Rerun |
 | `rd serve` | Start the policy server for live inference |
-| `rd make_ffs_onnx` | Export Fast Foundation Stereo model to ONNX / TensorRT engines |
-| `rd make_tri_stereo_engine` | Compile TRI Stereo TensorRT engine from ONNX model |
 
 Run `rd <command> --help` for all options.
 

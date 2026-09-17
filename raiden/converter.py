@@ -136,7 +136,7 @@ def _count_svo2_frames(svo_path: Path) -> int:
     from raiden.cameras.zed import ZedCamera
 
     # Depth is never needed for counting; always use DEPTH_MODE.NONE to avoid
-    # wasting GPU memory (especially important when FFS will run afterwards).
+    # wasting GPU memory.
     camera = ZedCamera.from_svo(svo_path.stem, svo_path, compute_sdk_depth=False)
     n = camera.get_total_frames()
     camera.close()
@@ -151,10 +151,6 @@ def _extract_svo2_synchronized(
     flips: List[bool],
     max_frames: Optional[int] = None,
     sync_threshold_ns: int = 16_666_667,  # half a frame at 30 fps
-    stereo_method: str = "zed",
-    ffs_scale: float = 1.0,
-    ffs_iters: int = 8,
-    tri_stereo_variant: str = "c64",
 ) -> Dict[str, Tuple[np.ndarray, Optional[dict]]]:
     """Extract frames from multiple SVO2 files with cross-camera temporal alignment.
 
@@ -176,62 +172,12 @@ def _extract_svo2_synchronized(
     for d in rgb_dirs + depth_dirs:
         d.mkdir(parents=True, exist_ok=True)
 
-    use_ffs = stereo_method == "ffs"
-    use_tri_stereo = stereo_method == "tri_stereo"
-    use_learned_stereo = use_ffs or use_tri_stereo
-
-    # Lazily create a shared depth predictor (one instance, GPU-loaded once).
-    depth_predictor = None
-    if use_ffs:
-        from raiden.depth.ffs import (
-            FFSDepthPredictor,
-            FFSOnnxDepthPredictor,
-            FFSTrtDepthPredictor,
-        )
-
-        if FFSTrtDepthPredictor.engines_available():
-            depth_predictor = FFSTrtDepthPredictor()
-        elif FFSOnnxDepthPredictor.models_available():
-            depth_predictor = FFSOnnxDepthPredictor()
-        else:
-            depth_predictor = FFSDepthPredictor(scale=ffs_scale, iters=ffs_iters)
-    elif use_tri_stereo:
-        from raiden.depth.tri_stereo import (  # noqa: PLC0415
-            TRIStereoOnnxDepthPredictor,
-            TRIStereoTrtDepthPredictor,
-        )
-
-        if TRIStereoTrtDepthPredictor.engine_available(variant=tri_stereo_variant):
-            pred = TRIStereoTrtDepthPredictor(variant=tri_stereo_variant)
-            try:
-                pred._ensure_loaded()
-                depth_predictor = pred
-            except RuntimeError as e:
-                print(f"[TRIStereo] TRT engine unusable ({e}), falling back to ONNX")
-        if depth_predictor is None:
-            if TRIStereoOnnxDepthPredictor.model_available(variant=tri_stereo_variant):
-                depth_predictor = TRIStereoOnnxDepthPredictor(
-                    variant=tri_stereo_variant
-                )
-            else:
-                raise RuntimeError(
-                    f"No TRI Stereo model found for variant '{tri_stereo_variant}'. "
-                    f"Run: git lfs pull"
-                )
-
     # Open all cameras.
     cams: Dict[str, ZedCamera] = {
-        name: ZedCamera.from_svo(
-            name, svo_path, compute_sdk_depth=not use_learned_stereo
-        )
+        name: ZedCamera.from_svo(name, svo_path)
         for name, svo_path in zip(names, svo_paths)
     }
 
-    # Cache per-camera stereo calibration for learned stereo backends.
-    stereo_calib: Dict[str, Tuple[float, float]] = {}
-    if use_learned_stereo:
-        for name, cam in cams.items():
-            stereo_calib[name] = cam.get_stereo_calib()
     total_frames = {name: cam.get_total_frames() for name, cam in cams.items()}
     print(f"  Frames per camera: { {n: total_frames[n] for n in names} }")
 
@@ -295,20 +241,9 @@ def _extract_svo2_synchronized(
             color = cv2.rotate(frame.color, cv2.ROTATE_180) if flip else frame.color
             cv2.imwrite(str(rgb_dir_map[name] / f"{frame_idx:010d}{_IMG_EXT}"), color)
 
-            if use_learned_stereo:
-                fx, baseline = stereo_calib[name]
-                # Run inference on raw (pre-rotation) images — the ZED rectifies
-                # them in the sensor frame; rotating before inference only adds noise.
-                depth_m = depth_predictor.predict(
-                    frame.color, cam.get_right_color(), fx, baseline
-                )
-                if flip:
-                    depth_m = cv2.rotate(depth_m, cv2.ROTATE_180)
-                depth_mm = (depth_m * 1000.0).clip(0, 65535).astype(np.uint16)
-            else:
-                depth_mm = (frame.depth * 1000.0).clip(0, 65535).astype(np.uint16)
-                if flip:
-                    depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_180)
+            depth_mm = (frame.depth * 1000.0).clip(0, 65535).astype(np.uint16)
+            if flip:
+                depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_180)
             np.savez_compressed(
                 str(depth_dir_map[name] / f"{frame_idx:010d}.npz"), depth=depth_mm
             )
@@ -318,18 +253,11 @@ def _extract_svo2_synchronized(
         frame_idx += 1
         pbar.update(1)
 
-        if use_learned_stereo and frame_idx % 10 == 0 and depth_predictor._n_calls > 0:
-            avg_inf = depth_predictor._t_inference / depth_predictor._n_calls * 1000
-            pbar.set_postfix(inf_ms=f"{avg_inf:.0f}", refresh=False)
-
         # Advance all cameras for the next slot.
         active = {name: cam.grab() for name, cam in cams.items()}
 
     pbar.close()
     print(f"    {frame_idx} synchronized frames extracted")
-    if use_learned_stereo and depth_predictor._n_calls > 0:
-        label = "FFS" if use_ffs else f"TRIStereo-{tri_stereo_variant.upper()}"
-        print(f"  {label} timing: {depth_predictor.timing_summary()}")
 
     # Collect camera info and persist per-camera timestamps.
     results: Dict[str, Tuple[np.ndarray, Optional[dict]]] = {}
@@ -1210,10 +1138,6 @@ def select_tasks(data_dir: str = "data") -> List[str]:
 def convert_recording(
     recording_dir: str,
     episode_dir: Optional[str] = None,
-    stereo_method: str = "zed",
-    ffs_scale: float = 1.0,
-    ffs_iters: int = 8,
-    tri_stereo_variant: str = "c64",
     reconvert: bool = False,
 ) -> Dict[str, int]:
     """Convert a recording directory to UnifiedDataset format.
@@ -1332,13 +1256,6 @@ def convert_recording(
             )
 
         print(f"  Extracting {len(svo2_files)} SVO2 file(s) in sync ...")
-        if stereo_method != "zed":
-            extra = ""
-            if stereo_method == "ffs" and ffs_scale != 1.0:
-                extra = f" (scale={ffs_scale})"
-            elif stereo_method == "tri_stereo":
-                extra = f" (variant={tri_stereo_variant})"
-            print(f"  Stereo method: {stereo_method}{extra}")
         sync_results = _extract_svo2_synchronized(
             svo_paths=svo2_files,
             names=svo2_names,
@@ -1346,10 +1263,6 @@ def convert_recording(
             depth_dirs=[seq_dir / "depth" / n for n in svo2_names],
             flips=[n in _FLIP_CAMERAS for n in svo2_names],
             max_frames=max_frames_svo2,
-            stereo_method=stereo_method,
-            ffs_scale=ffs_scale,
-            ffs_iters=ffs_iters,
-            tri_stereo_variant=tri_stereo_variant,
         )
         for name, (ts_arr, info) in sync_results.items():
             frame_counts[name] = len(ts_arr)
@@ -1532,12 +1445,8 @@ def convert_recording(
 def convert_task(
     task_dir: str,
     output_dir: Optional[str] = None,
-    stereo_method: str = "zed",
-    ffs_scale: float = 1.0,
-    ffs_iters: int = 8,
     reconvert: bool = False,
     processed_base: Optional[str] = None,
-    tri_stereo_variant: str = "c64",
 ) -> None:
     """Convert all recordings in a task directory into a single UnifiedDataset.
 
@@ -1631,10 +1540,6 @@ def convert_task(
             counts = convert_recording(
                 str(rec_dir),
                 episode_dir=str(ep_dir),
-                stereo_method=stereo_method,
-                ffs_scale=ffs_scale,
-                ffs_iters=ffs_iters,
-                tri_stereo_variant=tri_stereo_variant,
                 reconvert=reconvert,
             )
         except ConversionError as e:

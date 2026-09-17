@@ -29,7 +29,6 @@ dependencies = [
   "textual>=8.1.1",
   "iterfzf>=1.4.0",
   "pysondb>=1.6.1",
-  "onnxscript>=0.6.2",
   "chiral",
   "pyyaml>=6.0.3",
   "pure-python-adb>=0.3.0.dev0",
@@ -38,12 +37,6 @@ dependencies = [
 [project.optional-dependencies]
 zed = ["pyzed"]
 realsense = ["pyrealsense2>=2.54"]
-ffs = ["onnxscript>=0.6.2", "omegaconf", "timm"]
-ffs-trt-cu12 = ["onnxscript>=0.6.2", "omegaconf", "timm", "tensorrt-cu12"]
-ffs-trt-cu13 = ["onnxscript>=0.6.2", "omegaconf", "timm", "tensorrt-cu13"]
-tri-stereo = ["onnxruntime-gpu>=1.18", "kornia>=0.7"]
-tri-stereo-trt-cu12 = ["kornia>=0.7", "tensorrt-cu12"]
-tri-stereo-trt-cu13 = ["kornia>=0.7", "tensorrt-cu13"]
 docs = [
   "mkdocs>=1.5,<2.0",
   "mkdocs-material>=9.0",

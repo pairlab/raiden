@@ -20,10 +20,8 @@ Key features:
   control, in bimanual or single-arm configurations.
 - **Manipulability-aware IK** - uses [PyRoki](https://github.com/chungmin99/pyroki)
   and [J-Parse](https://jparse-manip.github.io/) for smooth and singularity-aware control.
-- **Multiple depth backends** - IR structured light (RealSense), ZED SDK stereo,
-  TRI Stereo,
-  and [Fast Foundation Stereo](https://github.com/NVlabs/Fast-FoundationStereo)
-  for high-quality depth tailored to manipulation scenes.
+- **Multiple depth backends** - IR structured light (RealSense) and ZED SDK
+  stereo.
 - **Heterogeneous cameras** - mix ZED and Intel RealSense cameras freely in a
   single session, across scene and wrist roles.
 - **Automated extrinsic calibration** - hand-eye calibration for wrist cameras
@@ -75,8 +73,6 @@ be mixed freely within the same session.
 |---|---|---|
 | IR structured light | Intel RealSense D400 series | On-device active IR depth |
 | ZED SDK stereo | ZED cameras | NEURAL_LIGHT stereo depth from the ZED SDK (requires GPU) |
-| [TRI Stereo](https://sites.google.com/view/stereoformobilemanipulation) | ZED cameras | TRI's learned stereo depth model tailored for robot manipulation scenes; `c32` and `c64` variants with ONNX and TensorRT backends (optional, requires CUDA GPU) |
-| [Fast Foundation Stereo](https://github.com/NVlabs/Fast-FoundationStereo) | ZED cameras | Foundation model stereo depth; higher quality at object boundaries and thin structures (optional, requires CUDA GPU) |
 
 <video controls loop autoplay muted style="width:100%">
   <source src="https://s3.us-east-1.amazonaws.com/tri-ml-public.s3.amazonaws.com/github/raiden/compare.mp4" type="video/mp4">
@@ -99,10 +95,6 @@ The following features are coming soon:
 - **[J-Parse](https://jparse-manip.github.io/)** - enables manipulability-aware
   IK by efficiently computing task-space Jacobians for articulated robots.
   Thanks to the J-Parse authors for making this available.
-
-- **[TRI Stereo Depth](https://sites.google.com/view/stereoformobilemanipulation)** - optional depth backend for ZED cameras. A learned stereo depth model developed at Toyota Research Institute, tailored for robot manipulation scenes.
-
-- **[Fast Foundation Stereo](https://github.com/NVlabs/Fast-FoundationStereo)** - optional depth backend for ZED cameras. A foundation model for stereo depth estimation that produces higher-quality depth maps than the ZED SDK, particularly at object boundaries and on thin structures.
 
 ## Disclaimer
 

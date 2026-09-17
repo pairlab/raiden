@@ -27,7 +27,6 @@ class ZedCamera(Camera):
         self._is_open = False
         self._image = sl.Mat()
         self._depth = sl.Mat()
-        self._right_image = sl.Mat()
         self._has_depth = False  # True only in playback mode
 
     # ------------------------------------------------------------------
@@ -127,8 +126,8 @@ class ZedCamera(Camera):
         ----------
         compute_sdk_depth : bool
             If True (default) depth is computed by the ZED SDK (NEURAL_LIGHT).
-            Set to False when you will compute depth externally (e.g. with FFS);
-            this skips the SDK depth pass for lower CPU/GPU load.
+            Set to False when depth is not needed; this skips the SDK depth
+            pass for lower CPU/GPU load.
         """
         cam = cls.__new__(cls)
         cam._name = camera_name
@@ -138,7 +137,6 @@ class ZedCamera(Camera):
         cam._is_open = False
         cam._image = sl.Mat()
         cam._depth = sl.Mat()
-        cam._right_image = sl.Mat()
         cam._has_depth = compute_sdk_depth
 
         init_params = sl.InitParameters()
@@ -174,27 +172,6 @@ class ZedCamera(Camera):
         )
         image_size = (res.width, res.height)
         return camera_matrix, dist_coeffs, image_size
-
-    def get_right_color(self) -> np.ndarray:
-        """Return the right-camera BGR image for the most recently grabbed frame.
-
-        Only valid after a successful grab(). Used by external stereo depth
-        predictors (e.g. Fast Foundation Stereo) that need both views.
-        """
-        self._camera.retrieve_image(self._right_image, sl.VIEW.RIGHT)
-        return self._right_image.get_data()[:, :, :3].copy()
-
-    def get_stereo_calib(self) -> "tuple[float, float]":
-        """Return ``(fx, baseline_m)`` for the left camera at the current resolution.
-
-        ``fx`` is the left-camera focal length in pixels and ``baseline_m`` is
-        the stereo baseline in metres. Used to convert FFS disparity to depth.
-        """
-        info = self._camera.get_camera_information()
-        cal = info.camera_configuration.calibration_parameters
-        fx = float(cal.left_cam.fx)
-        baseline = float(abs(cal.get_camera_baseline()))
-        return fx, baseline
 
     def get_total_frames(self) -> int:
         """Total frame count (valid for SVO2 playback only)."""
