@@ -36,6 +36,7 @@ import termios
 import threading
 import time
 import tty
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1057,6 +1058,7 @@ def run_recording(
     last_saved_dir: Optional[Path] = None
     recorder: Optional[DemonstrationRecorder] = None
     robot_controller: Optional[RobotController] = None
+    tally: "Counter[str]" = Counter()
 
     use_right = arms == "bimanual" and not sim
     use_left = True
@@ -1096,6 +1098,11 @@ def run_recording(
             print("\n" + "=" * 60)
             print("  READY")
             print("=" * 60)
+            # The tally belongs here rather than next to the saved-recording line:
+            # robot shutdown and re-init print between the two, so a total printed at
+            # the end of an episode has scrolled away by the time the operator looks.
+            if sum(tally.values()):
+                print(_tally_line(tally))
             print(f"\n  Data dir   : {task_dir}")
             if interface.waits_for_button_start:
                 print("\n  Press button on any leader arm or left pedal to START.")
@@ -1203,7 +1210,9 @@ def run_recording(
                         calibration_result_id=calibration_result_id,
                     )
                     db.update_demonstration(demo_id, status="failure", converted=False)
-                print("\nRecording aborted — marked as failure.\n")
+                tally["failure"] += 1
+                print("\nRecording aborted — marked as failure.")
+                print(_tally_line(tally) + "\n")
                 break
 
             last_saved_dir = saved_dir
@@ -1222,8 +1231,10 @@ def run_recording(
                 if verdict:
                     print(f"  Demonstration marked as: {verdict}")
 
+            tally[verdict or "pending"] += 1
             print(f"✓ Recording saved to: {saved_dir}\n")
             # Loop back — cameras stay open, robots reinited next iteration.
+            # The running tally prints under that iteration's READY banner.
 
     except KeyboardInterrupt:
         print("\nCancelled by user.")
@@ -1251,6 +1262,20 @@ def run_recording(
         _close_session()
 
     _report_session(last_saved_dir, s3_bucket, s3_prefix)
+
+
+def _tally_line(tally: "Counter[str]") -> str:
+    """Running session total, printed after every episode of a real recording.
+
+    Success and failure always show, zeros included, so the two numbers stay in the
+    same place after every episode and can be read without parsing the line.
+    Unlabelled is only listed when it happens, because it means a verdict was missed
+    rather than recorded.
+    """
+    parts = [f"{tally['success']} success", f"{tally['failure']} failure"]
+    if tally["pending"]:
+        parts.append(f"{tally['pending']} unlabelled")
+    return f"  Session so far: {sum(tally.values())} recorded — {', '.join(parts)}"
 
 
 def _report_session(
