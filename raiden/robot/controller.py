@@ -81,8 +81,8 @@ _GRIPPER_MIN_OPENING = 20.0 / 95.0
 # Gripper closing safety threshold in normalized [0,1] gripper space.
 # Gripper is stopped from closing further when commanded position is more than
 # this amount below the actual position (indicating the fingers are blocked).
-# CRANK_4310 stroke ≈ 71 mm → 0.5 mm ≈ 0.007 in normalized units.
-_GRIPPER_SAFETY_THRESHOLD = 6.0 / 71.0
+# LINEAR_4310 stroke = 95 mm, so this allows 2 mm of lag; squeeze force is kp x lag.
+_GRIPPER_SAFETY_THRESHOLD = 2.0 / 95.0
 
 # Gripper command speed for SpaceMouse teleop (normalized [0,1] units per second).
 # Full stroke (71 mm) closes/opens in 1/_GRIPPER_SPEED seconds.
