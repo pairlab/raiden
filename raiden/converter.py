@@ -76,6 +76,10 @@ _kinematics: Any = None
 # hardware-relative counter, not wall-clock.
 _WALL_CLOCK_MIN_NS = 1_577_836_800_000_000_000
 
+# Frames a camera may drop in a row, and the dropped fraction that gets a warning.
+_MAX_DROP_RUN = 4
+_DROP_WARN_FRACTION = 0.02
+
 
 class ConversionError(RuntimeError):
     """Raised when a recording cannot be converted into a consistent episode."""
@@ -474,9 +478,10 @@ def _align_cameras_by_timestamp(
     """Resample cameras onto one timestamp grid inside the telemetry window.
 
     The first camera is the reference clock. Every other camera is mapped to
-    its nearest frame rather than paired by array index. When robot timestamps
-    are available, the reference grid is intersected with their range so robot
-    values are never extrapolated into a trailing camera-only interval.
+    its nearest frame rather than paired by array index, and holds its previous
+    frame over a slot it dropped. When robot timestamps are available, the
+    reference grid is intersected with their range so robot values are never
+    extrapolated into a trailing camera-only interval.
     """
     if not frame_counts:
         return cam_timestamps, frame_counts
@@ -550,36 +555,44 @@ def _align_cameras_by_timestamp(
         raise ConversionError("no reference-camera frames overlap robot telemetry")
     grid = ref_ts[ref_indices]
 
+    period_ns = 1e9 / camera_fps
     selections: Dict[str, np.ndarray] = {}
-    max_allowed_ns = int(round(1e9 / camera_fps))
+    max_allowed_ns = int(round((_MAX_DROP_RUN + 1) * period_ns))
     for name, ts in aligned_ts.items():
         eligible = np.flatnonzero((ts >= t_start) & (ts <= t_end))
         if len(eligible) == 0:
             raise ConversionError(f"{name} has no frames inside robot telemetry")
+        drops = np.maximum(np.round(np.diff(ts[eligible]) / period_ns) - 1, 0)
+        if len(drops) and int(drops.max()) > _MAX_DROP_RUN:
+            raise ConversionError(
+                f"{name} dropped {int(drops.max())} frames in a row "
+                f"(at most {_MAX_DROP_RUN})"
+            )
+        n_dropped = int(drops.sum())
         if name == reference:
             indices = ref_indices
         else:
             candidate_ts = ts[eligible]
-            right = np.searchsorted(candidate_ts, grid, side="left")
-            right = np.clip(right, 0, len(candidate_ts) - 1)
-            left = np.maximum(right - 1, 0)
-            choose_left = np.abs(grid - candidate_ts[left]) <= np.abs(
-                candidate_ts[right] - grid
+            after = np.searchsorted(
+                candidate_ts, grid + int(period_ns / 2), side="right"
             )
-            indices = eligible[np.where(choose_left, left, right)]
+            indices = eligible[np.maximum(after - 1, 0)]
 
         residual_ns = np.abs(ts[indices] - grid)
         max_residual_ns = int(np.max(residual_ns))
         median_ms = float(np.median(residual_ns)) / 1e6
         max_ms = max_residual_ns / 1e6
         print(
-            f"  Timestamp sync {name}: median {median_ms:.2f} ms, max {max_ms:.2f} ms"
+            f"  Timestamp sync {name}: median {median_ms:.2f} ms, max {max_ms:.2f} ms, "
+            f"{n_dropped} dropped"
         )
         if max_residual_ns > max_allowed_ns:
             raise ConversionError(
                 f"{name} residual timestamp error {max_ms:.2f} ms exceeds "
-                f"one {1000.0 / camera_fps:.2f} ms frame"
+                f"{_MAX_DROP_RUN + 1} frames"
             )
+        if n_dropped > _DROP_WARN_FRACTION * len(grid):
+            print(f"  WARNING: {name} dropped {n_dropped} of {len(grid)} frames")
         selections[name] = indices
 
     selected: Dict[str, np.ndarray] = {}

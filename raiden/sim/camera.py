@@ -73,6 +73,7 @@ class SimCamera(Camera):
     def start_recording(self, path: Path) -> None:
         self._timestamps = []
         self._sim_log = []
+        self._next_t = None  # a recording starts its own frame grid, not the idle one's phase
         self._rec_dir = Path(path)
         self._rec_dir.mkdir(parents=True, exist_ok=True)
 
@@ -107,13 +108,16 @@ class SimCamera(Camera):
     def grab(self) -> bool:
         if self._c is None:
             return False
-        # Pace to the camera frame rate like a real SDK would.
+        # Pace to a fixed 1/fps grid like a real camera: a slot missed by more than half
+        # a period is dropped, not caught up with a burst of short frames.
+        period = 1.0 / self._fps
         now = time.monotonic()
-        if self._next_t is None or now > self._next_t + 1.0 / self._fps:
+        if self._next_t is None:
             self._next_t = now
-        else:
-            time.sleep(max(0.0, self._next_t - now))
-        self._next_t += 1.0 / self._fps
+        elif now > self._next_t:
+            self._next_t += round((now - self._next_t) / period) * period
+        time.sleep(max(0.0, self._next_t - now))
+        self._next_t += period
         recording = (
             self._rec_dir is not None
         )  # the recording this frame belongs to, if any
