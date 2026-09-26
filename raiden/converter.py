@@ -360,15 +360,16 @@ def _extract_bag(
 def _extract_simrec(
     sim_dir: Path,
     rgb_dir: Path,
+    depth_dir: Path,
     model_xml: Path,
     T_world_base: Optional[np.ndarray],
 ) -> Tuple[np.ndarray, Optional[dict]]:
     """Write a :class:`raiden.sim.SimCamera` recording into the sequence layout.
 
     ``sim_dir`` holds ``timestamps.npy`` (host ns), ``camera_info.json`` and ``sim_state.npz``,
-    the state each frame was rendered from.  The frames are rendered again from those states in
-    ``model_xml`` (the episode's ``sim_model.xml``), and each frame's camera pose is read from
-    the same state into ``rgb_dir/camera_poses.npy``.
+    the state each frame was rendered from.  The frames, color and depth, are rendered again
+    from those states in ``model_xml`` (the episode's ``sim_model.xml``), and each frame's
+    camera pose is read from the same state into ``rgb_dir/camera_poses.npy``.
     """
     ts_path = sim_dir / "timestamps.npy"
     ts_arr = (
@@ -397,6 +398,7 @@ def _extract_simrec(
             info["width"],
             info["height"],
             rgb_dir,
+            depth_dir,
         )
         if T_world_base is None:
             raise ConversionError(
@@ -1349,7 +1351,11 @@ def convert_recording(
             continue
         print(f"  Extracting {sim_dir.name} (sim)")
         ts_arr, info = _extract_simrec(
-            sim_dir, rgb_dir, rec_path / "sim_model.xml", sim_base
+            sim_dir,
+            rgb_dir,
+            seq_dir / "depth" / name,
+            rec_path / "sim_model.xml",
+            sim_base,
         )
         frame_counts[name] = len(ts_arr)
         camera_infos[name] = info

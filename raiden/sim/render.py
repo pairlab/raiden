@@ -8,6 +8,7 @@ state again reproduces the frame (mean difference 0.002 grey levels on the 2026-
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import mujoco
@@ -16,6 +17,17 @@ import numpy as np
 # MuJoCo cameras look down -z with +y up; dataset poses use the OpenCV convention
 # (+z into the scene, +y down).
 _MUJOCO_TO_OPENCV = np.diag([1.0, -1.0, -1.0, 1.0])
+
+# Depth is stored like a real D435 frame: uint16 mm, 0 where the sensor returns nothing. The
+# real wrist camera returns nothing nearer than 168 mm (the minimum range of its 848x480 depth
+# stream); a ray that hits nothing reads MuJoCo's far plane (~180 m), beyond the D435's range.
+_DEPTH_RANGE_M = (0.168, 10.0)
+
+
+def depth_mm(depth_m: np.ndarray) -> np.ndarray:
+    lo, hi = _DEPTH_RANGE_M
+    valid = (depth_m >= lo) & (depth_m <= hi)
+    return np.where(valid, depth_m * 1000.0, 0.0).astype(np.uint16)
 
 
 def camera_pose(data: mujoco.MjData, cam_id: int) -> np.ndarray:
@@ -44,8 +56,10 @@ def render_states(
     width: int,
     height: int,
     out_dir: Path,
+    depth_dir: Optional[Path] = None,
 ) -> np.ndarray:
-    """Write ``out_dir/<idx>.png`` (BGR, like RealSense) for each ``[time, qpos, qvel]`` row.
+    """Write ``out_dir/<idx>.png`` (BGR, like RealSense) for each ``[time, qpos, qvel]`` row,
+    and ``depth_dir/<idx>.npz`` (see :func:`depth_mm`) if ``depth_dir`` is given.
 
     ``camera`` is the MuJoCo camera name.  The scene options match the sim server's rig
     cameras: visual geoms (group 1) only, no sites.
@@ -68,6 +82,8 @@ def render_states(
     opt.geomgroup[1] = 1
     opt.sitegroup[:] = 0
     out_dir.mkdir(parents=True, exist_ok=True)
+    if depth_dir is not None:
+        depth_dir.mkdir(parents=True, exist_ok=True)
     poses = np.empty((len(states), 4, 4))
     renderer = mujoco.Renderer(model, height=height, width=width)
     try:
@@ -79,6 +95,11 @@ def render_states(
             poses[i] = camera_pose(data, cam_id)
             renderer.update_scene(data, camera=camera, scene_option=opt)
             cv2.imwrite(str(out_dir / f"{i:010d}.png"), renderer.render()[:, :, ::-1])
+            if depth_dir is not None:
+                renderer.enable_depth_rendering()
+                depth = depth_mm(renderer.render())
+                renderer.disable_depth_rendering()
+                np.savez_compressed(str(depth_dir / f"{i:010d}.npz"), depth=depth)
     finally:
         renderer.close()
     return poses
