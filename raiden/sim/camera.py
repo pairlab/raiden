@@ -97,6 +97,7 @@ class SimCamera(Camera):
             str(path),
             t_ns=np.array(self._timestamps, dtype=np.int64),
             state=np.stack([s["state"] for s in log]),
+            warmstart=np.stack([s["warmstart"] for s in log]),
             objects=np.array(objects),
             object_poses=np.array([[s["objects"][o] for o in objects] for s in log]),
             subtasks=np.array(self._c.call("get_task_status")["subtasks"]),

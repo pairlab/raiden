@@ -7,6 +7,7 @@ is the client side. :class:`SimFollower` duck-types the i2rt follower used by
 the LeRobot export run unchanged.
 """
 
+from raiden.sim.action_log import ActionLog
 from raiden.sim.calibration import table_pose, write_sim_calibration, write_sim_files
 from raiden.sim.camera import SimCamera, load_sim_cameras
 from raiden.sim.client import DEFAULT_ADDRESS, SimConnection, parse_address
@@ -14,6 +15,7 @@ from raiden.sim.follower import SimFollower
 from raiden.sim.task import TaskMonitor
 
 __all__ = [
+    "ActionLog",
     "DEFAULT_ADDRESS",
     "SimCamera",
     "SimConnection",

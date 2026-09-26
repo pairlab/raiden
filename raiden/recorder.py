@@ -785,7 +785,7 @@ def _run_sim_episodes(
     stays up for the whole session (the sim has no CAN watchdog), so a reset is a snap home
     and a new object layout, not a re-initialisation.  Returns the last saved episode.
     """
-    from raiden.sim import TaskMonitor
+    from raiden.sim import ActionLog, TaskMonitor
 
     robot_controller = RobotController(
         use_right_leader=False,
@@ -796,6 +796,7 @@ def _run_sim_episodes(
     )
     active_ctrl[0] = robot_controller
     task = TaskMonitor(sim)
+    action_log = ActionLog(sim)
     hint = "\n".join(
         line
         for line in (
@@ -831,6 +832,7 @@ def _run_sim_episodes(
             interface.start(robot_controller)
             interface.set_active_recording(robot_controller)
             robot_controller.enable_estop()
+            action_log.start()
             recorder.start_recording(hint=f"  Episode {recording_dir.name}\n{hint}")
 
             action = _wait_for_sim_action(robot_controller, interface, task, use_stdin)
@@ -838,6 +840,7 @@ def _run_sim_episodes(
                 saved_dir = recorder.stop_recording(
                     complete=True, shutdown_robots=False
                 )
+                action_log.save(saved_dir)
                 on_saved(saved_dir)
                 last_saved, n_saved = saved_dir, n_saved + 1
                 print(f"✓ Saved as success → {saved_dir}  ({n_saved} this session)")
@@ -846,6 +849,7 @@ def _run_sim_episodes(
                     print("  Note: the sim does not score this episode a success.")
             else:
                 recorder.discard()
+                action_log.discard()
             recorder = None
             if action == "quit":
                 print("\nEnding session.\n")
@@ -869,6 +873,7 @@ def _run_sim_episodes(
         if old_settings is not None:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
         interface.set_active_recording(None)
+        action_log.close()
         task.close()
         robot_controller.shutdown()
         active_ctrl[0] = None
