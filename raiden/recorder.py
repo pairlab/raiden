@@ -626,7 +626,7 @@ def _ui_ready_command(ui, interface: TeleopInterface) -> Optional[bool]:
     """The page's READY command: True to end the session, False to start, None for nothing."""
     if ui is None:
         return None
-    ui.update(calibrating=bool(getattr(interface, "calibrating", False)))
+    ui.poll_interface(interface)
     cmd = ui.take("start", "end")
     if cmd == "end":
         return True
@@ -720,6 +720,7 @@ def _wait_for_verdict(
             if interface.poll_failure(robot_controller):
                 return "failure"
             if ui is not None:
+                ui.poll_interface(interface)
                 cmd = ui.take("success", "failure", "skip")
                 if cmd is not None:
                     return None if cmd == "skip" else cmd
@@ -1282,6 +1283,7 @@ def run_recording(
                     ):
                         break
                     if record_ui is not None:
+                        record_ui.poll_interface(interface)
                         cmd = record_ui.take("stop", "success", "failure")
                         forced_success = cmd == "success"
                         forced_failure = cmd == "failure"

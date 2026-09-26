@@ -12,9 +12,11 @@ reads the open cameras itself, paused around every pipeline restart (``pause_pum
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import queue
 import shutil
+import sys
 import threading
 import time
 import traceback
@@ -42,6 +44,27 @@ PHASE_COMMANDS = {
 RENDER_HZ, CHECK_HZ = 10.0, 3.0
 WHITE, BLUE, ORANGE, GREEN, RED, YELLOW, CYAN = (
     (255, 255, 255), (255, 120, 30), (0, 140, 255), (0, 210, 0), (0, 0, 255), (0, 255, 255), (255, 255, 0))
+
+
+class _Tee:
+    """A stdout/stderr that also hands every write to the page's terminal panel."""
+
+    def __init__(self, stream, sink):
+        self._stream, self._sink = stream, sink
+
+    def write(self, text):
+        n = self._stream.write(text)
+        try:
+            self._sink(text)
+        except Exception:
+            pass
+        return n
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
 
 
 class _Monitor:
@@ -90,6 +113,12 @@ class RecordUI:
         self._settings = qc.QCSettings()
         self._threads: List[threading.Thread] = []
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._log_buf: collections.deque = collections.deque(maxlen=400)
+        self._log_partial = ""
+        self._log_seq = 0
+        self._log_lock = threading.Lock()
+        self._streams = None
+        self._last_poll = 0.0
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -110,6 +139,8 @@ class RecordUI:
             t = threading.Thread(target=target, name=f"record-ui{target.__name__}", daemon=True)
             t.start()
             self._threads.append(t)
+        self._streams = (sys.stdout, sys.stderr)
+        sys.stdout, sys.stderr = _Tee(sys.stdout, self._to_log), _Tee(sys.stderr, self._to_log)
         print(f"\n  Recording UI: {self.url}\n")
         if self._open_browser:
             threading.Timer(1.0, lambda: webbrowser.open(self.url)).start()
@@ -117,6 +148,9 @@ class RecordUI:
     def close(self) -> None:
         self.set_phase("ended")
         time.sleep(0.5)  # let the page see the end
+        if self._streams is not None:
+            sys.stdout, sys.stderr = self._streams
+            self._streams = None
         self._stop.set()
         self._pump_run.clear()
         if self._loop is not None:
@@ -177,6 +211,19 @@ class RecordUI:
         with self._lock:
             self._state.update(info)
 
+    def poll_interface(self, interface) -> None:
+        """Show the teleop device's state (Quest tracking and calibration); at most twice a second."""
+        now = time.monotonic()
+        if now - self._last_poll < 0.5:
+            return
+        self._last_poll = now
+        try:
+            status = interface.ready_hint or ""
+        except Exception:
+            status = ""
+        self.update(calibrating=bool(getattr(interface, "calibrating", False)), device_status=status,
+                    device_help=getattr(interface, "banner", "") or "")
+
     def set_tally(self, tally: Dict[str, int]) -> None:
         with self._lock:
             self._state["session_tally"] = dict(tally)
@@ -218,6 +265,17 @@ class RecordUI:
         with self._lock:
             self._seq += 1
             self._frames[name] = (self._seq, image_bgr)
+
+    def _to_log(self, text: str) -> None:
+        with self._log_lock:
+            buf = self._log_partial + text
+            parts = buf.split("\n")
+            self._log_partial = parts.pop()
+            for line in parts:
+                line = line.rsplit("\r", 1)[-1]  # progress lines overwrite themselves
+                self._log_buf.append(line)
+            if parts:
+                self._log_seq += 1
 
     def _pump_loop(self) -> None:
         while not self._stop.is_set():
@@ -288,6 +346,23 @@ class RecordUI:
                 c = dict(x=round(p[0], 3), y=round(p[1], 3), in_blue=in_blue, in_white=in_white,
                          cell=list(cell) if cell else None)
             live["croissant"] = c
+            o = qc.oven_position(raw, geo)
+            if o is None:
+                ov = None
+            else:
+                x_ok, y_ok, o_white = qc.oven_verdict(o[0], o[1], geo)
+                ov = dict(x=round(o[0], 3), y=round(o[1], 3), match=o[2], x_ok=x_ok, y_ok=y_ok, in_white=o_white,
+                          cell=qc.oven_cell(o[1], geo))
+            live["oven"] = ov
+        else:
+            ov = self._state.get("live", {}).get("oven")
+        if ov:
+            f = qc.OVEN_FOOTPRINT
+            box = (ov["x"] + f[0], ov["x"] + f[1], ov["y"] + f[2], ov["y"] + f[3])
+            colour = GREEN if ov["x_ok"] and ov["y_ok"] and ov["in_white"] else RED
+            uv = qc.box_outline(box, geo.table_z, geo).round().astype(np.int32)
+            cv2.polylines(v, [uv], True, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.polylines(v, [uv], True, colour, 2, cv2.LINE_AA)
         if c:
             uv = qc.project(np.array([[c["x"], c["y"], geo.table_z + qc.CRO_COM_Z]]), geo.T, geo.K)[0]
             colour = GREEN if c["in_blue"] and c["in_white"] else RED
@@ -336,7 +411,7 @@ class RecordUI:
             mf = e / "metadata.json"
             if mf.exists() and json.load(open(mf)).get("complete", False):
                 r = self._results.get(e.name)
-                if r is None or r.get("_stamp") != mf.stat().st_mtime:
+                if r is None or r.get("_stamp") != mf.stat().st_mtime or r.get("_qc_version") != qc.QC_VERSION:
                     self._qc_q.put(e)
         self._publish_results()
 
@@ -362,8 +437,13 @@ class RecordUI:
             qc.apply_duration_outliers(self._results)
             G, outside = qc.coverage(self._results, self._geo)
             eps = [dict(episode=k, duration_s=r.get("duration_s"), label=r.get("label"), reasons=r.get("reasons", []),
-                        croissant=r.get("croissant"), closes=r.get("closes"))
+                        croissant=r.get("croissant"), oven=r.get("oven"), closes=r.get("closes"))
                    for k, r in sorted(self._results.items(), reverse=True)]
+            O, o_out = qc.oven_coverage(self._results, self._geo)
+            oy0, oy1 = self._geo.oven_region[2], self._geo.oven_region[3]
+            self._state.update(oven_coverage=O.tolist(), oven_outside=o_out,
+                               oven_grid=np.linspace(oy1, oy0, qc.OVEN_GRID + 1).round(3).tolist(),
+                               oven_sim_x=round((self._geo.oven_region[0] + self._geo.oven_region[1]) / 2, 3))
             bx0, bx1, by0, by1 = self._geo.blue
             self._state.update(episodes=eps, coverage=G.tolist(), coverage_outside=outside,
                                grid=dict(x=np.linspace(bx0, bx1, qc.GRID_X + 1).round(3).tolist(),
@@ -467,10 +547,15 @@ class RecordUI:
         await ws.prepare(request)
 
         async def push():
+            sent_seq = -1
             while not ws.closed and not self._stop.is_set():
                 with self._lock:
-                    msg = json.dumps(dict(self._state, now=time.time()), default=str)
-                await ws.send_str(msg)
+                    st = dict(self._state, now=time.time())
+                with self._log_lock:
+                    if self._log_seq != sent_seq:
+                        sent_seq = self._log_seq
+                        st["log"] = list(self._log_buf)[-300:]
+                await ws.send_str(json.dumps(st, default=str))
                 await asyncio.sleep(0.25)
 
         pusher = asyncio.ensure_future(push())

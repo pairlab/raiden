@@ -150,7 +150,16 @@ the terminal prompts. Real recording only.
   PASS or the reasons. Pending episodes can be labelled there, and episodes
   deleted, files and DB row together, while nothing is recording.
 - **Coverage:** where the croissant started in the episodes so far, on a grid
-  over the blue box, with the current placement outlined.
+  over the blue box, and where the oven stood, over the sim's range of oven
+  positions; the current placements are outlined.
+- **Oven:** found from its three knob faces (a knob-face template, matched where
+  the oven model puts them), drawn on the table in green or red, and checked
+  against the sim: x within 1.5 cm of the sim's, y in the sim's range, the whole
+  oven in the white box.
+- **Terminal and Quest:** a panel shows everything `rd record` prints, with the
+  Quest calibration prompts highlighted, and a box shows each controller's
+  tracking and calibration state and the button help, for when the terminal is
+  out of sight.
 
 The limits and the camera pose come from the vla-benchmark twin
 (`~/robot/vla-benchmark`: rig.json, layout.json and the croissant task JSON).

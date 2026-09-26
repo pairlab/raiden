@@ -41,6 +41,14 @@
   .rec #phase { color:var(--rec); } .ready #phase { color:var(--ok); } .verdict #phase { color:var(--warn); }
   .hidden { display:none !important; }
   kbd { background:#333; border-radius:3px; padding:0 5px; font-size:12px; }
+  .term { margin-top:12px; background:#0b0c0e; border-radius:6px; overflow:hidden; }
+  .term .cap { padding:6px 10px; background:var(--panel); color:var(--dim); }
+  #term { height:260px; overflow:auto; margin:0; padding:8px 10px; font:12px/1.35 ui-monospace, Menlo, monospace; color:#cfd3d7; white-space:pre-wrap; }
+  #term .q { color:var(--warn); } #term .e { color:var(--bad); } #term .g { color:var(--ok); }
+  #q_status, #q_help { margin:4px 0 0; font:12px/1.4 ui-monospace, Menlo, monospace; white-space:pre-wrap; color:var(--text); }
+  #oven_grid td { text-align:center; padding:8px 0; border:1px solid #2c3036; font-weight:600; }
+  #oven_grid td.zero { color:#555; background:#1a1c1f; } #oven_grid td.live { outline:3px solid var(--ok); outline-offset:-3px; }
+  #oven_grid th { font-weight:400; color:var(--dim); font-size:11px; }
 </style>
 </head>
 <body>
@@ -78,16 +86,29 @@
   </div>
   <div id="notice"></div>
   <main>
-    <div class="views">
-      <div class="view"><img src="/stream/scene_camera" alt="scene camera"><div class="cap" id="scene_cap">scene camera</div></div>
-      <div class="view"><img src="/stream/left_wrist_camera" alt="wrist camera"><div class="cap" id="wrist_cap">wrist camera</div></div>
+    <div>
+      <div class="views">
+        <div class="view"><img src="/stream/scene_camera" alt="scene camera"><div class="cap" id="scene_cap">scene camera</div></div>
+        <div class="view"><img src="/stream/left_wrist_camera" alt="wrist camera"><div class="cap" id="wrist_cap">wrist camera</div></div>
+      </div>
+      <div class="term"><div class="cap">terminal: what rd record prints (Quest calibration prompts in yellow)</div><pre id="term"></pre></div>
     </div>
     <aside>
+      <section>
+        <h2>Quest / teleop</h2>
+        <div id="q_calib"></div>
+        <pre id="q_status">—</pre>
+        <details><summary class="dim">buttons</summary><pre id="q_help"></pre></details>
+      </section>
       <section>
         <h2>Live checks</h2>
         <div class="row"><span>croissant centre in blue box</span><span id="c_blue">—</span></div>
         <div class="row"><span>whole croissant in white box</span><span id="c_white">—</span></div>
         <div class="row"><span>croissant position (base)</span><span id="c_pos" class="dim">—</span></div>
+        <div class="row"><span>oven x at the sim's <span id="o_simx"></span> (±1.5 cm)</span><span id="o_x">—</span></div>
+        <div class="row"><span>oven y in the sim's range</span><span id="o_y">—</span></div>
+        <div class="row"><span>whole oven in white box</span><span id="o_white">—</span></div>
+        <div class="row"><span>oven position (base)</span><span id="o_pos" class="dim">—</span></div>
         <div class="row"><span>wrist fingertips (rows)</span><span id="w_tips">—</span></div>
         <div class="row"><span>wrist brightness</span><span id="w_mean">—</span></div>
         <div class="row"><span>scene brightness</span><span id="s_mean" class="dim">—</span></div>
@@ -96,6 +117,11 @@
         <h2>Croissant coverage of the blue box</h2>
         <div class="dim" style="font-size:12px;margin-bottom:6px">top = far from the robot · left = robot's left · outlined = croissant now · <span id="outside"></span></div>
         <table id="grid"></table>
+      </section>
+      <section>
+        <h2>Oven coverage of the sim's y range</h2>
+        <div class="dim" style="font-size:12px;margin-bottom:6px">left = robot's left · outlined = oven now · <span id="oven_outside"></span></div>
+        <table id="oven_grid" style="width:100%"></table>
       </section>
       <section>
         <h2>Episodes</h2>
@@ -165,7 +191,35 @@ function render() {
   $('w_mean').innerHTML = w ? `${w.mean.toFixed(0)} ${w.bright_ok ? '<span class="ok">ok</span>' : '<span class="bad">LOW</span>'}` : '—';
   $('s_mean').textContent = (S.live || {}).scene_mean ? S.live.scene_mean.toFixed(0) : '—';
   $('wrist_cap').innerHTML = w && !(w.ok && w.bright_ok) ? '<span class="bad">wrist camera: check the mount (fingertips off the cyan lines or dark view)</span>' : 'wrist camera · cyan = fingertip reference';
-  $('scene_cap').innerHTML = c ? (c.in_blue && c.in_white ? '<span class="ok">croissant placement OK</span>' : '<span class="bad">croissant outside the limits</span>') : 'scene camera · white: whole objects · blue: croissant centre · orange: oven';
+  const oo = (S.live || {}).oven, parts = [];
+  parts.push(c ? (c.in_blue && c.in_white ? '<span class="ok">croissant OK</span>' : '<span class="bad">croissant outside the limits</span>') : '<span class="warn">croissant not seen</span>');
+  parts.push(oo ? (oo.x_ok && oo.y_ok && oo.in_white ? '<span class="ok">oven OK</span>' : '<span class="bad">oven off the sim position</span>') : '<span class="warn">oven knobs not seen</span>');
+  $('scene_cap').innerHTML = parts.join(' · ') + ' <span class="dim">· white: whole objects · blue: croissant centre · orange: oven range · green/red: oven now</span>';
+  // Quest / teleop
+  $('q_calib').innerHTML = S.calibrating ? '<span class="warn">CALIBRATING: follow the yellow prompts in the terminal panel</span>' : '';
+  $('q_status').textContent = S.device_status || '—';
+  $('q_help').textContent = S.device_help || '';
+  // terminal
+  if (S.log) {
+    const t = $('term'), bottom = t.scrollTop + t.clientHeight >= t.scrollHeight - 30;
+    const esc = x => x.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    t.innerHTML = S.log.map(l => /Oculus|CALIBRAT|tracking/i.test(l) ? `<span class="q">${esc(l)}</span>`
+      : /error|fail|✗|abort/i.test(l) ? `<span class="e">${esc(l)}</span>` : /✓|saved/i.test(l) ? `<span class="g">${esc(l)}</span>` : esc(l)).join('\n');
+    if (bottom) t.scrollTop = t.scrollHeight;
+  }
+  // oven
+  const o = (S.live || {}).oven;
+  $('o_simx').textContent = S.oven_sim_x ? S.oven_sim_x.toFixed(3) : '';
+  $('o_x').innerHTML = o ? yes(o.x_ok) : '<span class="warn">knobs not seen</span>';
+  $('o_y').innerHTML = o ? yes(o.y_ok) : '—';
+  $('o_white').innerHTML = o ? yes(o.in_white) : '—';
+  $('o_pos').textContent = o ? `x ${o.x.toFixed(3)}  y ${o.y >= 0 ? '+' : ''}${o.y.toFixed(3)}` : '—';
+  if (S.oven_coverage && S.oven_grid) {
+    const g = S.oven_grid, live = o && o.cell !== null && o.cell !== undefined ? o.cell : null;
+    $('oven_grid').innerHTML = '<tr>' + g.slice(0, -1).map((y, j) => `<th>${((y + g[j + 1]) / 2 >= 0 ? '+' : '') + ((y + g[j + 1]) / 2).toFixed(3)}</th>`).join('') + '</tr><tr>' +
+      S.oven_coverage.map((n, j) => `<td class="${n ? '' : 'zero'} ${live === j ? 'live' : ''}">${n || '·'}</td>`).join('') + '</tr>';
+    $('oven_outside').textContent = S.oven_outside ? `${S.oven_outside} outside` : '';
+  }
   // coverage grid
   if (S.coverage && S.grid) {
     const live = c && c.cell ? c.cell : null;
