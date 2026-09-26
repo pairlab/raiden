@@ -120,10 +120,14 @@ def rot_angle(Ra: np.ndarray, Rb: np.ndarray) -> float:
     return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
 
 
-def load_calibration() -> dict:
+def load_calibration(board_spec: str | None = None) -> dict:
     d = json.loads(Path(CALIBRATION_FILE).read_text())
     cams = d["cameras"]
     cc = d["charuco_config"]
+    if board_spec:
+        sx, sy, sq, mk, dic = board_spec.split(",")
+        cc = {"squares_x": int(sx), "squares_y": int(sy), "square_length": float(sq),
+              "marker_length": float(mk), "dictionary": dic}
     board = cv2.aruco.CharucoBoard(
         (cc["squares_x"], cc["squares_y"]),
         cc["square_length"],
@@ -527,7 +531,7 @@ class Capture:
         self.args = args
         self.out = Path(args.out or f"data/teaser/real_mv/{datetime.now():%Y%m%d_%H%M%S}")
         self.out.mkdir(parents=True, exist_ok=True)
-        self.cal = load_calibration()
+        self.cal = load_calibration(args.board)
         self.cfg = CameraConfig(CAMERA_CONFIG)
         self.scene_serial = str(self.cfg.cameras[SCENE]["serial"])
         self.states = [chr(ord("A") + s) for s in range(args.states)]
@@ -757,6 +761,9 @@ def main() -> None:
     ap.add_argument("--hires-warmup", type=int, default=30, help="frames dropped after the 1080p switch")
     ap.add_argument("--max-drift", type=float, default=0.005,
                     help="refuse a shot if any arm joint is further than this from the locked pose (rad)")
+    ap.add_argument("--board", default=None, metavar="SX,SY,SQUARE_M,MARKER_M,DICT",
+                    help="ChArUco board if not the one in the calibration file, "
+                         "e.g. 10,7,0.025,0.018,DICT_4X4_50 (calib.io 7x10, 25/18 mm)")
     Capture(ap.parse_args()).run()
 
 
