@@ -252,7 +252,7 @@ def descend(robot, kin, chain, pose: dict, args, table_z: float) -> Optional[Con
         time.sleep(args.settle)
         obs = robot.get_observations()
         q_meas = np.asarray(obs["joint_pos"], dtype=np.float64)[:6]
-        tau = np.asarray(obs["joint_torque"], dtype=np.float64)[:6]
+        tau = np.asarray(obs["joint_eff"], dtype=np.float64)[:6]
         cmd_joints.append(q_cmd.copy())
         meas_joints.append(q_meas)
         torque.append(tau)
