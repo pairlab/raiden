@@ -30,7 +30,11 @@ import numpy as np
 from i2rt.robots.kinematics import Kinematics
 
 from raiden._xml_paths import get_yam_4310_linear_xml_path
-from raiden.robot.controller import RobotController, smooth_move_joints
+from raiden.robot.controller import (
+    _GRIPPER_MIN_OPENING,
+    RobotController,
+    smooth_move_joints,
+)
 
 
 def _load_raw_joints(
@@ -454,6 +458,13 @@ def _stream_trajectories(
     If *robot* is None a new ``RobotController`` is created and closed when
     done.  Pass an already-initialized controller to avoid reconnecting.
     """
+    # Recorded gripper actions are binary (closed = 0.0): floor them as teleop does.
+    traj_l = traj_l.copy()
+    traj_l[:, 6] = np.clip(traj_l[:, 6], _GRIPPER_MIN_OPENING, 1.0)
+    if traj_r is not None:
+        traj_r = traj_r.copy()
+        traj_r[:, 6] = np.clip(traj_r[:, 6], _GRIPPER_MIN_OPENING, 1.0)
+
     owns_robot = robot is None
     if owns_robot:
         robot = RobotController(
