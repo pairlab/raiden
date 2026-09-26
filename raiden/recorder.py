@@ -50,7 +50,7 @@ from raiden.camera_config import CameraConfig
 from raiden.cameras import Camera
 from raiden.control import TeleopInterface
 from raiden.db.database import get_db
-from raiden.robot.controller import RobotController
+from raiden.robot.controller import RobotController, _binary_gripper
 from raiden.utils import fzf_select
 
 # ---------------------------------------------------------------------------
@@ -356,9 +356,9 @@ class DemonstrationRecorder:
                     [data[jp_key].astype(np.float32), grip], axis=1
                 )
 
-            # Build cmd array, falling back to actual joint pos for frames
-            # where no command has been issued yet (e.g. the first few frames
-            # before the first teleop command is processed).
+            # Build cmd array, falling back to actual joint pos (gripper binarized)
+            # for frames where no command has been issued yet (e.g. the first few
+            # frames before the first teleop command is processed).
             pos7d_key = f"{arm_key}_joint_pos_7d"
             raw_cmds = [f["cmd"].get(arm_key) for f in self._robot_frames]
             if jp_key in data:
@@ -376,7 +376,9 @@ class DemonstrationRecorder:
                     if fallback is not None:
                         filled.append(fallback)
                     elif pos7d_key in data:
-                        filled.append(data[pos7d_key][i])
+                        pos = data[pos7d_key][i].copy()
+                        pos[6] = _binary_gripper(pos[6])
+                        filled.append(pos)
                 if len(filled) != n:
                     raise RuntimeError(
                         f"Could not build complete cmd array for {arm_key}: "
