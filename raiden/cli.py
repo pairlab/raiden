@@ -152,6 +152,16 @@ class RecordCommand:
     """Sim only: camera rate. 30 matches the real D435 so sim and real episodes have the
     same temporal density; raise it to collect faster if the server can render that fast"""
 
+    ui: bool = False
+    """Run the session from a browser page: task and teacher, live views with the placement
+    limits, start/stop/label buttons and per-episode QC (real recording only)"""
+
+    ui_port: int = 8765
+    """Port of the --ui page"""
+
+    ui_host: str = "127.0.0.1"
+    """Address the --ui page listens on; 0.0.0.0 to reach it from another machine"""
+
 
 _CAN_BITRATE = 1000000
 
@@ -519,6 +529,9 @@ def main():
                 monitor_view=command.monitor_view,
                 monitor_web=command.monitor_web,
                 sim_fps=command.sim_fps,
+                ui=command.ui,
+                ui_port=command.ui_port,
+                ui_host=command.ui_host,
             )
 
         elif subcommand == "replay":

@@ -558,6 +558,16 @@ def select_teacher() -> int:
 # ---------------------------------------------------------------------------
 
 
+def _peek_next_episode(task_dir: Path) -> str:
+    """The episode name ``_next_recording_dir`` will use, without creating it."""
+    existing = sorted(d for d in task_dir.iterdir() if d.is_dir() and d.name.isdigit())
+    if existing:
+        meta_file = existing[-1] / "metadata.json"
+        if not meta_file.exists() or not json.loads(meta_file.read_text()).get("complete", False):
+            return existing[-1].name
+    return f"{int(existing[-1].name) + 1 if existing else 0:04d}"
+
+
 def _next_recording_dir(task_dir: Path) -> Path:
     """Return the directory to record the next episode into.
 
@@ -612,9 +622,26 @@ def upload_to_s3(recording_dir: Path, bucket: str, prefix: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _ui_ready_command(ui, interface: TeleopInterface) -> Optional[bool]:
+    """The page's READY command: True to end the session, False to start, None for nothing."""
+    if ui is None:
+        return None
+    ui.update(calibrating=bool(getattr(interface, "calibrating", False)))
+    cmd = ui.take("start", "end")
+    if cmd == "end":
+        return True
+    if cmd == "start":
+        if getattr(interface, "calibrating", False):
+            ui.notice("finish or cancel the calibration first")
+            return None
+        return False
+    return None
+
+
 def _wait_for_enter_or_quit(
     robot_controller: RobotController,
     interface: TeleopInterface,
+    ui=None,
 ) -> bool:
     """Wait for Enter/Space (proceed) or 'q' (quit session).
 
@@ -641,6 +668,9 @@ def _wait_for_enter_or_quit(
                     if not interface.calibrating:
                         return False
                     print("  Finish or cancel the calibration first.")
+            ui_cmd = _ui_ready_command(ui, interface)
+            if ui_cmd is not None:
+                return ui_cmd
             time.sleep(0.05)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -649,6 +679,7 @@ def _wait_for_enter_or_quit(
 def _wait_for_verdict(
     robot_controller: RobotController,
     interface: TeleopInterface,
+    ui=None,
 ) -> Optional[str]:
     """After recording stops, wait for the user to mark success or failure.
 
@@ -681,11 +712,17 @@ def _wait_for_verdict(
     try:
         tty.setcbreak(fd)
         deadline = time.monotonic() + 30.0  # 30 s timeout
+        if ui is not None:
+            ui.set_phase("verdict", verdict_deadline=time.time() + 30.0)
         while time.monotonic() < deadline:
             if interface.poll_success(robot_controller):
                 return "success"
             if interface.poll_failure(robot_controller):
                 return "failure"
+            if ui is not None:
+                cmd = ui.take("success", "failure", "skip")
+                if cmd is not None:
+                    return None if cmd == "skip" else cmd
             if select.select([sys.stdin], [], [], 0)[0]:
                 ch = sys.stdin.read(1)
                 if ch in ("\r", "\n"):
@@ -707,6 +744,7 @@ def _wait_for_verdict(
 def _wait_for_start_or_quit(
     robot_controller: RobotController,
     interface: TeleopInterface,
+    ui=None,
 ) -> bool:
     """Wait for a leader button press (start) or the 'q' key (quit session).
 
@@ -727,6 +765,9 @@ def _wait_for_start_or_quit(
                 ch = sys.stdin.read(1)
                 if ch.lower() == "q":
                     return True
+            ui_cmd = _ui_ready_command(ui, interface)
+            if ui_cmd is not None:
+                return ui_cmd
             time.sleep(0.05)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -906,6 +947,9 @@ def run_recording(
     monitor_view: str = "",
     monitor_web: bool = False,
     sim_fps: int = 30,
+    ui: bool = False,
+    ui_port: int = 8765,
+    ui_host: str = "127.0.0.1",
 ) -> None:
     """Run teleoperation with continuous demonstration recording.
 
@@ -922,17 +966,39 @@ def run_recording(
       Press the leader button to start the next episode, or 'q' to end the session.
     - Incomplete recordings (estop / Ctrl-C) are detected via the ``complete``
       flag in metadata.json and overridden on the next run.
+
+    ``ui`` serves a browser page (:mod:`raiden.record_ui`) for the session: task and
+    teacher, live views with the placement limits, start/stop/label buttons and
+    per-episode QC. The buttons, pedal and keyboard keep working next to it.
     """
     print("\n" + "=" * 60)
     print("  DEMONSTRATION RECORDING")
     print("=" * 60 + "\n")
 
+    record_ui = None
+    if ui and sim:
+        print("  --ui supports real recording only; continuing in the terminal.")
+    elif ui:
+        from raiden.record_ui import RecordUI
+
+        record_ui = RecordUI(port=ui_port, host=ui_host, data_dir=data_dir)
+        try:
+            record_ui.start()
+        except RuntimeError as e:
+            print(f"  {e}; continuing in the terminal.")
+            record_ui = None
+
     # ── task and teacher selection (once per session) ────────────────────
-    task_name, task_instruction = select_task()
+    if record_ui is not None:
+        print("  Pick the task and teacher in the browser.")
+        task_name, task_instruction, teacher_id = record_ui.setup_session()
+    else:
+        task_name, task_instruction = select_task()
     task_dir = Path(data_dir) / "raw" / task_name
     task_dir.mkdir(parents=True, exist_ok=True)
 
-    teacher_id = select_teacher()
+    if record_ui is None:
+        teacher_id = select_teacher()
 
     print(f"\n  Task       : {task_name}")
     print(f"  Instruction: {task_instruction}\n")
@@ -993,6 +1059,9 @@ def run_recording(
     except Exception as e:
         print(f"Error initialising cameras: {e}")
         interface.close()
+        if record_ui is not None:
+            record_ui.notice(f"camera start failed: {e}")
+            record_ui.close()
         return
     print(f"✓ {len(cameras)} camera(s) ready\n")
 
@@ -1018,6 +1087,12 @@ def run_recording(
             shown, sim=sim, view=view, web=monitor_web, guides=guides
         )
 
+    # The page shows the recorded frames and, in between recordings, reads the open cameras.
+    recorder_monitor = live_monitor
+    if record_ui is not None:
+        recorder_monitor = record_ui.monitor(live_monitor)
+        record_ui.attach_cameras(cameras)
+
     # Signal handler updated each episode to point at the current controller.
     _active_ctrl: List[Optional[RobotController]] = [None]
 
@@ -1029,11 +1104,15 @@ def run_recording(
     signal.signal(signal.SIGINT, emergency_stop)
 
     def _close_session() -> None:
+        if record_ui is not None:
+            record_ui.pause_pump()
         for cam in cameras:
             cam.close()
         if live_monitor is not None:
             live_monitor.close()
         interface.close()
+        if record_ui is not None:
+            record_ui.close()
 
     if sim:
 
@@ -1081,6 +1160,9 @@ def run_recording(
     try:
         while True:
             recorder = None
+            if record_ui is not None:
+                record_ui.set_phase("init")
+                record_ui.set_tally(tally)
 
             # ── per-episode: init robots ──────────────────────────────────
             robot_controller = RobotController(
@@ -1128,10 +1210,14 @@ def run_recording(
             print("  Press 'q' to end session.\n")
             print("=" * 60 + "\n")
 
+            if record_ui is not None:
+                record_ui.set_phase(
+                    "ready", episode=_peek_next_episode(task_dir), hint=interface.ready_hint or ""
+                )
             if interface.waits_for_button_start:
-                quit_session = _wait_for_start_or_quit(robot_controller, interface)
+                quit_session = _wait_for_start_or_quit(robot_controller, interface, record_ui)
             else:
-                quit_session = _wait_for_enter_or_quit(robot_controller, interface)
+                quit_session = _wait_for_enter_or_quit(robot_controller, interface, record_ui)
             if quit_session:
                 print("\nEnding session.\n")
                 robot_controller.shutdown()
@@ -1155,10 +1241,14 @@ def run_recording(
                 task_instruction=task_instruction,
                 interface=interface,
                 extra_metadata=extra_meta,
-                monitor=live_monitor,
+                monitor=recorder_monitor,
             )
             if not started:
                 interface.start(robot_controller)
+            if record_ui is not None:
+                # The recording restarts every camera pipeline: the page's own reads stop first.
+                record_ui.pause_pump()
+                record_ui.set_phase("recording", episode=recording_dir.name, rec_started=time.time())
             recorder.start_recording()
             robot_controller.enable_estop()
             interface.set_active_recording(robot_controller)
@@ -1191,6 +1281,12 @@ def run_recording(
                         robot_controller
                     ):
                         break
+                    if record_ui is not None:
+                        cmd = record_ui.take("stop", "success", "failure")
+                        forced_success = cmd == "success"
+                        forced_failure = cmd == "failure"
+                        if cmd is not None:
+                            break
                     time.sleep(0.05)
             finally:
                 if old_settings is not None:
@@ -1205,13 +1301,17 @@ def run_recording(
             elif forced_success:
                 verdict = "success"
             else:
-                verdict = _wait_for_verdict(robot_controller, interface)
+                verdict = _wait_for_verdict(robot_controller, interface, record_ui)
 
             # ── stop episode (shuts down robots, keeps cameras open) ──────
+            if record_ui is not None:
+                record_ui.set_phase("saving")
             saved_dir = recorder.stop_recording(complete=not estop)
             recorder = None
             _active_ctrl[0] = None
             robot_controller = None  # shut down inside stop_recording
+            if record_ui is not None:
+                record_ui.resume_pump()
 
             _copy_calibration(saved_dir)
 
@@ -1228,6 +1328,10 @@ def run_recording(
                 tally["failure"] += 1
                 print("\nRecording aborted — marked as failure.")
                 print(_tally_line(tally) + "\n")
+                if record_ui is not None:
+                    record_ui.set_tally(tally)
+                    record_ui.episode_saved(saved_dir)
+                    record_ui.notice("recording aborted (e-stop): marked failure, session ended")
                 break
 
             last_saved_dir = saved_dir
@@ -1248,6 +1352,9 @@ def run_recording(
 
             tally[verdict or "pending"] += 1
             print(f"✓ Recording saved to: {saved_dir}\n")
+            if record_ui is not None:
+                record_ui.set_tally(tally)
+                record_ui.episode_saved(saved_dir)
             # Loop back — cameras stay open, robots reinited next iteration.
             # The running tally prints under that iteration's READY banner.
 

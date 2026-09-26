@@ -128,6 +128,34 @@ the [console](console.md).
 
 After recording, convert the raw camera files with [rd convert](conversion.md).
 
+## Recording from the browser
+
+`rd record --ui` runs the session from a page at `http://localhost:8765` (it
+opens by itself; `--ui-port` and `--ui-host` change the address) instead of
+the terminal prompts. Real recording only.
+
+- **Session:** pick the task and teacher, or add new ones.
+- **Live views:** the scene camera with the task's placement limits projected
+  on the table (white: the whole croissant and oven stay inside; blue: the
+  croissant's centre of mass; orange: the oven), and a marker that turns green
+  once the croissant is placed correctly. The wrist camera with
+  `camera_preview --grid`'s lines and the fingertip reference, flagged if the
+  mount has slipped or the view is dark.
+- **Controls:** Start, Stop, Success, Failure and Skip, with the keys
+  <kbd>Space</kbd>, <kbd>S</kbd>, <kbd>F</kbd> and <kbd>K</kbd>. The leader,
+  Quest and pedal buttons keep working. A countdown shows how long the verdict
+  prompt stays open.
+- **Episodes:** each saved episode is checked (`raiden/qc.py`: colour lock,
+  wrist aim, pauses, croissant start, gripper cycles, duration) and listed with
+  PASS or the reasons. Pending episodes can be labelled there, and episodes
+  deleted, files and DB row together, while nothing is recording.
+- **Coverage:** where the croissant started in the episodes so far, on a grid
+  over the blue box, with the current placement outlined.
+
+The limits and the camera pose come from the vla-benchmark twin
+(`~/robot/vla-benchmark`: rig.json, layout.json and the croissant task JSON).
+`scripts/qc_episodes.py <task> --watch` runs the same checks without the page.
+
 ## Uploading to S3
 
 Pass `--s3-bucket` to automatically upload each episode to S3 immediately
