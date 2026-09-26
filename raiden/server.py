@@ -1101,8 +1101,9 @@ class RaidenPolicyServer(chiral.PolicyServer):
     def _open_realsense(self, name: str) -> dict:
         """Open a RealSense camera with the stream settings ``rd record`` uses.
 
-        Resolution, fps, crop and depth come from ``camera.json``, so served
-        frames and intrinsics match the converted recordings.
+        Resolution, fps, crop, depth and color controls come from
+        ``camera.json``, so served frames and intrinsics match the converted
+        recordings.
         """
         import pyrealsense2 as rs
 
@@ -1117,6 +1118,7 @@ class RaidenPolicyServer(chiral.PolicyServer):
             resolution=self._raiden_cam_cfg.get_resolution(name),
             crop=self._raiden_cam_cfg.get_crop(name),
             depth=depth,
+            color_controls=self._raiden_cam_cfg.get_color_controls(name),
         )
         camera.open()
         if depth:

@@ -144,6 +144,25 @@ class CameraConfig:
         )
         return int(res[0]), int(res[1])
 
+    def get_color_controls(self, name: str) -> Optional[Dict[str, float]]:
+        """Return the white balance, exposure and gain a RealSense camera is locked to.
+
+        None (auto exposure and auto white balance) when ``color_controls`` is
+        absent or ``"auto"``.  ``scripts/lock_color.py`` writes the values.
+        """
+        entry = self.cameras.get(name)
+        controls = entry.get("color_controls") if isinstance(entry, dict) else None
+        if controls in (None, "auto"):
+            return None
+        from raiden.cameras.realsense import COLOR_CONTROLS
+
+        if not isinstance(controls, dict) or set(controls) != set(COLOR_CONTROLS):
+            raise ValueError(
+                f"Camera '{name}': color_controls must be \"auto\" or "
+                f"{{{', '.join(COLOR_CONTROLS)}}}, got {controls!r}"
+            )
+        return {key: float(controls[key]) for key in COLOR_CONTROLS}
+
     def get_camera_by_role(self, role: str) -> Optional[str]:
         """Return the name of the unique camera with the given role, or None.
 
@@ -244,6 +263,7 @@ class CameraConfig:
                 resolution=tuple(resolution) if resolution else None,
                 crop=self.get_crop(name),
                 depth=entry.get("depth", True) if isinstance(entry, dict) else True,
+                color_controls=self.get_color_controls(name),
             )
 
         raise ValueError(

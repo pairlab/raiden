@@ -73,7 +73,7 @@ rd serve --arms single --action-type joint --control-hz 30
 ## Cameras
 
 Images are served at the resolution they are recorded at, as RGB.  RealSense
-cameras use the `resolution`, `fps`, `crop` and `depth` settings from
+cameras use the `resolution`, `fps`, `crop`, `depth` and `color_controls` settings from
 `camera.json`, the same settings `rd record` and `rd convert` use, and the
 intrinsics are shifted by the crop.  Pass `--resize-images HxW` (e.g.
 `384x384`) to resize on the server instead; intrinsics are scaled to match.

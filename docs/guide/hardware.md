@@ -12,11 +12,12 @@ Run `rd list_devices` to detect all connected cameras and generate a starter `~/
 }
 ```
 
-RealSense entries accept three optional fields:
+RealSense entries accept four optional fields:
 
 - `"depth": false` — record color only. The `.bag` holds no depth stream, so bags are smaller and the USB link carries less; `rd convert` then writes no `depth/`. Default `true`.
 - `"resolution": [848, 480]` — stream size for color and depth (default `[640, 480]`, which is a centre crop of the D435 sensor; `848×480` keeps the full 69° horizontal field of view).
 - `"crop": [x, y, width, height]` — window cut from every frame (live, and when converting `.bag` files). Intrinsics are shifted to match. Use it to re-centre an off-axis mount, e.g. a wrist camera between the gripper fingers: `"resolution": [848, 480], "crop": [208, 0, 640, 480]`.
+- `"color_controls": {"white_balance": 2800, "exposure": 250, "gain": 22}` — lock the color sensor (white balance in K, exposure in 100 µs, gain 0–128) on every pipeline start in `rd record`, `rd serve` and `camera_preview.py`. On auto (the default, or `"auto"`) every start opens dark and green for about a second, and the colours drift between sessions. Measure the values under the rig lights, with the scene set up, with `uv run python scripts/lock_color.py`: it matches each camera's settled auto image and writes this field. Each episode's `metadata.json` records the values applied.
 
 Check the result live with `uv run python scripts/camera_preview.py --grid`.
 

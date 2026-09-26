@@ -64,6 +64,11 @@ def _enable_global_time(device: rs.device) -> None:
             sensor.set_option(rs.option.global_time_enabled, 1)
 
 
+# Color-sensor options a camera can be locked to, in the order they are set.  D435 RGB
+# units: white balance in K (2800-6500, steps of 10), exposure in 100 µs, gain 0-128.
+COLOR_CONTROLS = ("white_balance", "exposure", "gain")
+
+
 def _wait_for_device(serial: str, timeout_s: float = 20.0) -> bool:
     """Block until *serial* is enumerated again (after a hardware reset)."""
     deadline = time.time() + timeout_s
@@ -101,6 +106,7 @@ class RealSenseCamera(Camera):
         resolution: Optional[Tuple[int, int]] = None,
         crop: Optional[Tuple[int, int, int, int]] = None,
         depth: bool = True,
+        color_controls: Optional[dict] = None,
     ):
         """
         Args:
@@ -113,11 +119,23 @@ class RealSenseCamera(Camera):
                 every frame returned by ``get_frame()``; intrinsics are
                 shifted accordingly.  Use it to re-centre a camera whose
                 mount is off-axis (e.g. a wrist camera between the fingers).
+            color_controls: ``{"white_balance", "exposure", "gain"}`` to lock
+                the color sensor to on every pipeline start (measured by
+                ``scripts/lock_color.py``), or None for auto exposure and auto
+                white balance.
         """
         self._name = camera_name
         self._serial = serial_number
         self._fps = fps
         self._depth = depth
+        if color_controls is not None and color_controls["exposure"] > 10_000 / fps:
+            # An exposure longer than the frame period lowers the frame rate.
+            raise ValueError(
+                f"[{camera_name}] exposure {color_controls['exposure']} (100 µs) "
+                f"is longer than a frame at {fps} fps"
+            )
+        self._color_controls = dict(color_controls) if color_controls else None
+        self._color_applied: Optional[dict] = None
         if resolution is not None:
             self._COLOR_W, self._COLOR_H = int(resolution[0]), int(resolution[1])
             self._DEPTH_W, self._DEPTH_H = self._COLOR_W, self._COLOR_H
@@ -152,6 +170,11 @@ class RealSenseCamera(Camera):
     def recording_extension(self) -> str:
         return "bag"
 
+    @property
+    def color_controls(self) -> Optional[dict]:
+        """Color-sensor values read back at the last pipeline start; None on auto."""
+        return self._color_applied
+
     # ------------------------------------------------------------------
     # Live recording
     # ------------------------------------------------------------------
@@ -165,6 +188,33 @@ class RealSenseCamera(Camera):
         ).as_video_stream_profile()
         self._color_w = color_stream.width()
         self._color_h = color_stream.height()
+
+    def _apply_color_controls(self, device: rs.device) -> None:
+        """Lock white balance, exposure and gain, or hand both back to auto.
+
+        The options live on the device, not the pipeline: they outlast the
+        process, and ``hardware_reset()`` puts them back to auto.  So they are
+        set after every pipeline start, and a camera without controls is set
+        to auto explicitly rather than left as another tool set it.
+        """
+        sensor = device.first_color_sensor()
+        lock = self._color_controls is not None
+        sensor.set_option(rs.option.enable_auto_exposure, 0 if lock else 1)
+        sensor.set_option(rs.option.enable_auto_white_balance, 0 if lock else 1)
+        if not lock:
+            self._color_applied = None
+            return
+        for key in COLOR_CONTROLS:
+            sensor.set_option(getattr(rs.option, key), float(self._color_controls[key]))
+        applied = {
+            key: round(sensor.get_option(getattr(rs.option, key)))
+            for key in COLOR_CONTROLS
+        }
+        if any(abs(applied[k] - self._color_controls[k]) > 0.5 for k in COLOR_CONTROLS):
+            raise RuntimeError(
+                f"[{self._name}] color controls {self._color_controls} read back as {applied}"
+            )
+        self._color_applied = applied
 
     def _stream_config(self, color_w: int, color_h: int) -> "rs.config":
         """Color, plus depth unless it is turned off."""
@@ -201,6 +251,7 @@ class RealSenseCamera(Camera):
         for attempt in range(1, self._DEPTH_START_ATTEMPTS + 1):
             self._start_pipeline(make_config())
             _enable_global_time(self._profile.get_device())
+            self._apply_color_controls(self._profile.get_device())
             if not self._depth or self._depth_streams(self._DEPTH_START_BUDGET_S):
                 if self._depth and attempt > 1:
                     print(f"  [{self._name}] depth streaming after {attempt} attempts")
@@ -297,6 +348,7 @@ class RealSenseCamera(Camera):
         self._config = cfg
         self._profile = self._pipeline.start(cfg)
         _enable_global_time(self._profile.get_device())
+        self._apply_color_controls(self._profile.get_device())
 
     def grab(self) -> bool:
         try:
@@ -405,6 +457,8 @@ class RealSenseCamera(Camera):
         cam._crop = tuple(int(v) for v in crop) if crop is not None else None
         cam._depth_scale = 0.001
         cam._latest_frames = None
+        cam._color_controls = None
+        cam._color_applied = None
 
         cam._pipeline = rs.pipeline()
         cam._config = rs.config()

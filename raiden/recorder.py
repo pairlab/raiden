@@ -420,6 +420,14 @@ class DemonstrationRecorder:
         }
         if rs_offsets:
             meta_dict["realsense_clock_offsets"] = rs_offsets
+
+        color_controls = {
+            cam.name: cam.color_controls or "auto"
+            for cam in self.cameras
+            if hasattr(cam, "color_controls")
+        }
+        if color_controls:
+            meta_dict["color_controls"] = color_controls
         meta_dict.update(self.extra_metadata)
 
         with open(output_file, "w") as f:
