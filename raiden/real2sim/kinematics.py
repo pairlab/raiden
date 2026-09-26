@@ -4,9 +4,10 @@ Two MuJoCo models describe the same physical arm:
 
 * :func:`vendor_chain` — the i2rt model that ships with the driver. raiden uses it for the FK
   pose labels, teleop and replay IK, the reach guides and the hand-eye calibration.
-* :func:`mesa_chain` — the MuJoCo Menagerie model the MESA twin simulates and renders, placed
-  the way ``RaidenYam`` places it (its base body sits :data:`MENAGERIE_BASE_DZ` above the i2rt
-  base origin).
+* :func:`mesa_chain` — the MuJoCo Menagerie model the MESA twin used before ``RaidenYam`` took
+  the i2rt link offsets, placed as it was then (its base body sits :data:`MENAGERIE_BASE_DZ`
+  above the i2rt base origin). Only a ``sim_model.xml`` from before that change holds it; a
+  current one is the i2rt chain.
 
 They disagree. Joint 1 coincides, but joints 2-4 sit 4.6 mm apart perpendicular to their axes
 and links 5-6 add a few mm more, so the same joint angles put the fingertips a median 7 mm
@@ -28,7 +29,7 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 
 # The i2rt base origin sits this far below the Menagerie base body: joint 1 is at z = 0.067 in
-# the i2rt model and at 0.0631 in the Menagerie one. ``RaidenYam.base_xpos_offset`` adds it so
+# the i2rt model and at 0.0631 in the Menagerie one. ``RaidenYam.base_xpos_offset`` added it so
 # that joint 1 lands in the same place in both.
 MENAGERIE_BASE_DZ = 0.067 - 0.0631
 
@@ -200,7 +201,7 @@ def vendor_chain() -> ArmChain:
 
 
 def mesa_chain(xml_path: str | Path) -> ArmChain:
-    """The Menagerie model MESA renders, from any episode's ``sim_model.xml``."""
+    """The Menagerie model, from a ``sim_model.xml`` recorded before the i2rt link offsets."""
     return ArmChain(
         "MESA Menagerie",
         xml_path,
