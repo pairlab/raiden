@@ -33,7 +33,13 @@ COM_MARGIN = 0.004  # the task JSON's croissant region is this much inside the c
 CRO_RADIUS = 0.051  # croissant footprint radius about its centre, any yaw
 CRO_COM_Z = 0.0215  # centre-of-mass height above the table
 OVEN_FOOTPRINT = (-0.1518, 0.1100, -0.1937, 0.1930)  # x, y extents about the oven origin (sim model, handle incl.)
+# Knob-face centres about the oven origin at yaw 0 (base frame, z above the table). Each knob is a cylinder (radius
+# 14 mm) whose axis points out of the front panel toward the robot; the face is half its length (9 mm) out.
+OVEN_KNOB_FACES = np.array([[-0.129, -0.150, 0.165], [-0.129, -0.150, 0.115], [-0.129, -0.150, 0.065]])
+OVEN_X_TOL = 0.015  # real oven x may differ this much from the sim's fixed x
+OVEN_GRID = 5  # bins over the sim's oven y range
 STILL_RAD_S = 0.02
+QC_VERSION = 2  # results from an older version are checked again (2: oven position)
 GRID_X, GRID_Y = 3, 6
 VLA_DEFAULT = Path.home() / "robot/vla-benchmark"
 TASK_JSON = "mesa/task_suites/bddl_files/raiden_lab/croissant_oven_heating_region/source/000.json"
@@ -56,6 +62,7 @@ class Geometry:
     white: Tuple[float, float, float, float]  # x0, x1, y0, y1 in the base frame
     blue: Tuple[float, float, float, float]
     orange: Tuple[float, float, float, float]
+    oven_region: Tuple[float, float, float, float]  # the sim's range of the oven origin
     table_z: float
     T: np.ndarray = field(repr=False)  # scene camera, camera-to-base, OpenCV axes
     K: np.ndarray = field(repr=False)
@@ -75,6 +82,7 @@ def load_geometry(vla: Path = VLA_DEFAULT) -> Geometry:
         blue=(x0 + tc[0] - COM_MARGIN, x1 + tc[0] + COM_MARGIN, y0 + tc[1] - COM_MARGIN, y1 + tc[1] + COM_MARGIN),
         orange=(ox0 + tc[0] + OVEN_FOOTPRINT[0], ox1 + tc[0] + OVEN_FOOTPRINT[1],
                 oy0 + tc[1] + OVEN_FOOTPRINT[2], oy1 + tc[1] + OVEN_FOOTPRINT[3]),
+        oven_region=(ox0 + tc[0], ox1 + tc[0], oy0 + tc[1], oy1 + tc[1]),
         table_z=float(rig["table"]["z_in_base_at_origin"]), T=np.array(cam["T_base_cam"]), K=np.array(cam["K"]))
 
 
@@ -144,6 +152,81 @@ def croissant_position(img: np.ndarray, geo: Geometry) -> Optional[Tuple[float, 
     s = (geo.table_z + CRO_COM_Z - geo.T[2, 3]) / ray[2]
     p = geo.T[:3, 3] + s * ray
     return float(p[0]), float(p[1]), int(st[k, 4])
+
+
+_KNOB_TEMPLATE = Path(__file__).with_name("oven_knob_face.png")  # 25 x 25 px, the top knob face in the scene camera
+
+
+def _sample(m: np.ndarray, uv: np.ndarray, half: int) -> np.ndarray:
+    """Values of a matchTemplate map at template centres ``uv`` (outside the map: -1)."""
+    col, row = uv[:, 0].round().astype(int) - half, uv[:, 1].round().astype(int) - half
+    ok = (row >= 0) & (row < m.shape[0]) & (col >= 0) & (col < m.shape[1])
+    out = np.full(len(uv), -1.0)
+    out[ok] = m[row[ok], col[ok]]
+    return out
+
+
+def oven_position(img: np.ndarray, geo: Geometry, min_score: float = 0.55) -> Optional[Tuple[float, float, float]]:
+    """Oven origin (x, y) in the base frame at yaw 0, and the mean knob match, from the three knob faces.
+
+    A real knob-face template is correlated over the image (normalised cross-correlation). Every oven position on a
+    3 mm grid over the table is scored by the best match within 4 px of each of its three projected faces (the model
+    and the real knobs differ by ~3 px), the weakest face counting double so one bright spot cannot win. The pose is
+    then solved from the three matched face pixels by least squares. None if the mean match is below min_score (oven
+    not in view or occluded).
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    tpl = cv2.imread(str(_KNOB_TEMPLATE), cv2.IMREAD_GRAYSCALE)
+    half = tpl.shape[0] // 2
+    ncc = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
+    near = cv2.dilate(ncc, np.ones((9, 9), np.uint8))  # best match within 4 px
+
+    def faces(c):
+        return [project(np.c_[c[:, 0] + f[0], c[:, 1] + f[1], np.full(len(c), geo.table_z + f[2])], geo.T, geo.K)
+                for f in OVEN_KNOB_FACES]
+
+    X, Y = np.meshgrid(np.arange(0.68, 0.88, 0.003), np.arange(-0.17, 0.17, 0.003), indexing="ij")
+    c = np.stack([X.ravel(), Y.ravel()], 1)
+    per = np.stack([_sample(near, uv, half) for uv in faces(c)], 1)
+    k = int(np.argmax(per.mean(1) + per.min(1)))
+    score = float(per[k].mean())
+    if score < min_score:
+        return None
+    # the matched face pixels: the correlation peak within 4 px of each predicted face
+    peaks = []
+    for uv in faces(c[k:k + 1]):
+        u0, v0 = int(round(uv[0, 0])) - half, int(round(uv[0, 1])) - half
+        win = ncc[max(v0 - 4, 0):v0 + 5, max(u0 - 4, 0):u0 + 5]
+        dv, du = np.unravel_index(int(np.argmax(win)), win.shape)
+        peaks.append((max(u0 - 4, 0) + du + half, max(v0 - 4, 0) + dv + half))
+    peaks = np.array(peaks, float)
+    xy = c[k].copy()
+    for _ in range(10):  # Gauss-Newton on the face reprojection error, x and y
+        r = np.concatenate([uv[0] for uv in faces(xy[None])]) - peaks.ravel()
+        J = np.stack([(np.concatenate([uv[0] for uv in faces((xy + d)[None])]) - peaks.ravel() - r) / 1e-4
+                      for d in (np.array([1e-4, 0]), np.array([0, 1e-4]))], 1)
+        step = np.linalg.lstsq(J, -r, rcond=None)[0]
+        xy += step
+        if np.abs(step).max() < 1e-5:
+            break
+    return float(xy[0]), float(xy[1]), round(score, 3)
+
+
+def oven_verdict(x: float, y: float, geo: Geometry) -> Tuple[bool, bool, bool]:
+    """(x within OVEN_X_TOL of the sim's, y within the sim's range, whole oven inside the white box) at yaw 0."""
+    ox0, ox1, oy0, oy1 = geo.oven_region
+    wx0, wx1, wy0, wy1 = geo.white
+    x_ok = ox0 - OVEN_X_TOL <= x <= ox1 + OVEN_X_TOL
+    y_ok = oy0 <= y <= oy1
+    in_white = (wx0 <= x + OVEN_FOOTPRINT[0] and x + OVEN_FOOTPRINT[1] <= wx1
+                and wy0 <= y + OVEN_FOOTPRINT[2] and y + OVEN_FOOTPRINT[3] <= wy1)
+    return x_ok, y_ok, in_white
+
+
+def oven_cell(y: float, geo: Geometry) -> Optional[int]:
+    oy0, oy1 = geo.oven_region[2], geo.oven_region[3]
+    j = int(np.floor((oy1 - y) / (oy1 - oy0) * OVEN_GRID))  # 0 = the robot's left (+y)
+    return j if 0 <= j < OVEN_GRID else None
 
 
 def croissant_verdict(x: float, y: float, geo: Geometry) -> Tuple[bool, bool]:
@@ -218,6 +301,19 @@ def check(ep: Path, task: str, geo: Geometry, cfg: CameraConfig, st: QCSettings,
                 r["reasons"].append(f"croissant centre ({x:.3f}, {y:+.3f}) outside the blue box")
             if not in_white:
                 r["reasons"].append(f"croissant ({x:.3f}, {y:+.3f}) may cross the white box")
+        o = oven_position(s, geo)
+        if o is None:
+            r["reasons"].append("oven knobs not found in the first scene frame")
+        else:
+            ox, oy, _ = o
+            r["oven"] = [round(ox, 3), round(oy, 3)]
+            x_ok, y_ok, o_white = oven_verdict(ox, oy, geo)
+            if not x_ok:
+                r["reasons"].append(f"oven x {ox:.3f}, sim {sum(geo.oven_region[:2]) / 2:.3f} (> {OVEN_X_TOL * 1000:.0f} mm off)")
+            if not y_ok:
+                r["reasons"].append(f"oven y {oy:+.3f} outside the sim's ±{geo.oven_region[3]:.3f}")
+            if not o_white:
+                r["reasons"].append(f"oven ({ox:.3f}, {oy:+.3f}) crosses the white box")
     d = np.load(ep / "robot_data.npz")
     t = (d["timestamps"] - d["timestamps"][0]) / 1e9
     gcmd = d["follower_l_joint_cmd"][:, 6]
@@ -232,6 +328,7 @@ def check(ep: Path, task: str, geo: Geometry, cfg: CameraConfig, st: QCSettings,
         r["reasons"].append(f"duration {dur:.1f} s outside [{st.min_s}, {st.max_s}]")
     demo = db.get_demonstration_by_raw_path(f"data/raw/{task}/{ep.name}")
     r["label"] = demo["status"] if demo else "no DB row"
+    r["_qc_version"] = QC_VERSION
     return r
 
 
@@ -264,6 +361,21 @@ def coverage(results: Dict[str, Dict], geo: Geometry) -> Tuple[np.ndarray, int]:
     return G, outside
 
 
+def oven_coverage(results: Dict[str, Dict], geo: Geometry) -> Tuple[np.ndarray, int]:
+    """(OVEN_GRID counts of oven positions over the sim's y range, column 0 the robot's left; number outside)."""
+    G = np.zeros(OVEN_GRID, int)
+    outside = 0
+    for r in results.values():
+        if not r.get("oven"):
+            continue
+        j = oven_cell(r["oven"][1], geo)
+        if j is None:
+            outside += 1
+        else:
+            G[j] += 1
+    return G, outside
+
+
 def grid_cell(x: float, y: float, geo: Geometry) -> Optional[Tuple[int, int]]:
     bx0, bx1, by0, by1 = geo.blue
     i = int(np.floor((x - bx0) / (bx1 - bx0) * GRID_X))
@@ -275,6 +387,8 @@ def line(r: Dict) -> str:
     parts = [f"{r['duration_s']:.1f} s" if r.get("duration_s") else "? s", f"label {r.get('label')}"]
     if r.get("croissant"):
         parts.append(f"croissant ({r['croissant'][0]:.3f}, {r['croissant'][1]:+.3f})")
+    if r.get("oven"):
+        parts.append(f"oven ({r['oven'][0]:.3f}, {r['oven'][1]:+.3f})")
     parts.append(f"closes {r.get('closes')}")
     if r.get("wrist_tips"):
         parts.append(f"wrist tips {r['wrist_tips'][0]}/{r['wrist_tips'][1]} mean {r.get('wrist_mean', 0):.0f}")
@@ -301,4 +415,9 @@ def tally_text(results: Dict[str, Dict], geo: Geometry) -> str:
     for i in reversed(range(GRID_X)):
         cells = " ".join(f"{G[i, j]:>6d}" if G[i, j] else "     ." for j in range(GRID_Y))
         out.append(f"  x {xs[i]:.2f}-{xs[i + 1]:.2f} {cells}")
+    O, o_out = oven_coverage(results, geo)
+    oy = np.linspace(geo.oven_region[3], geo.oven_region[2], OVEN_GRID + 1)
+    out.append(f"oven positions over the sim's y range (left = robot's left); {o_out} outside:")
+    out.append("            " + " ".join(f"{(oy[j] + oy[j + 1]) / 2:+6.3f}" for j in range(OVEN_GRID)) + "   <- y (m)")
+    out.append("            " + " ".join(f"{O[j]:>6d}" if O[j] else "     ." for j in range(OVEN_GRID)))
     return "\n".join(out)

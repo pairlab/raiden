@@ -67,7 +67,8 @@ def main():
             if not mf.exists() or not json.load(open(mf)).get("complete", False):
                 continue
             stamp = mf.stat().st_mtime
-            if ep.name in results and results[ep.name].get("_stamp") == stamp:
+            if (ep.name in results and results[ep.name].get("_stamp") == stamp
+                    and results[ep.name].get("_qc_version") == qc.QC_VERSION):
                 continue
             try:
                 r = qc.check(ep, args.task, geo, cfg, st, get_db())
