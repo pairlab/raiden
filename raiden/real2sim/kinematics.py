@@ -47,7 +47,7 @@ class Contact:
 
 
 class ArmChain:
-    """A YAM model with its fingertips closed, posed by joint angles in the i2rt base frame.
+    """A YAM model posed by joint angles (gripper closed by default) in the i2rt base frame.
 
     The probe is the lowest point of the two fingertip meshes. Both models carry the same
     vendor fingertips, so the probe cancels out of a chain comparison; and because the twin
@@ -121,6 +121,7 @@ class ArmChain:
         if not self._tip_geoms:
             raise ValueError(f"{name}: no fingertip mesh geoms found in {tip_bodies}")
         self._closed = self._closed_finger_qpos()
+        self._open = float(sum(self._finger[0][1])) - self._closed
 
     def _closed_finger_qpos(self) -> float:
         """Whichever end of the finger travel brings the two fingertips together."""
@@ -142,20 +143,21 @@ class ArmChain:
         R = self.data.geom_xmat[geom].reshape(3, 3)
         return verts @ R.T + self.data.geom_xpos[geom]
 
-    def set_joints(self, q6: np.ndarray) -> None:
-        """Pose the arm at ``q6`` with the gripper closed."""
-        self._pose(q6, self._closed)
+    def set_joints(self, q6: np.ndarray, opening: float = 0.0) -> None:
+        """Pose the arm at ``q6`` with the gripper ``opening`` open (0 closed, 1 fully open)."""
+        opening = np.clip(opening, 0.0, 1.0)
+        self._pose(q6, self._closed + opening * (self._open - self._closed))
 
-    def probe_point(self, q6: np.ndarray) -> np.ndarray:
+    def probe_point(self, q6: np.ndarray, opening: float = 0.0) -> np.ndarray:
         """Lowest fingertip point in the i2rt base frame (3,)."""
-        self.set_joints(q6)
+        self.set_joints(q6, opening)
         pts = np.concatenate([self._tip_points(g, v) for g, v in self._tip_geoms])
         p = pts[np.argmin(pts[:, 2])].copy()
         p[2] -= self.base_z
         return p
 
-    def probe_z(self, q6: np.ndarray) -> float:
-        return float(self.probe_point(q6)[2])
+    def probe_z(self, q6: np.ndarray, opening: float = 0.0) -> float:
+        return float(self.probe_point(q6, opening)[2])
 
     def _descends_from(self, body: int, root: int) -> bool:
         while body != 0:
@@ -164,14 +166,14 @@ class ArmChain:
             body = int(self.model.body_parentid[body])
         return root == 0
 
-    def fingertip_clearance(self, q6: np.ndarray) -> float:
+    def fingertip_clearance(self, q6: np.ndarray, opening: float = 0.0) -> float:
         """Height of the lowest other moving arm part above the fingertips, in metres.
 
         Positive means the fingertips lead the descent and the probe is the part that lands.
         The static base mesh is excluded: it is bolted to the rail above the table and never
         approaches it, but it does hang below a hovering gripper.
         """
-        self.set_joints(q6)
+        self.set_joints(q6, opening)
         tip_z = min(self._tip_points(g, v)[:, 2].min() for g, v in self._tip_geoms)
         tip_ids = {g for g, _ in self._tip_geoms}
         lowest = np.inf
