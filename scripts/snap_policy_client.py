@@ -50,6 +50,9 @@ control period, so the policy always predicts a chunk, executes
 action k is due k control periods after its observation, and any action
 already due when planning finishes is dropped.
 
+``rd serve`` reaches each action one period after it is sent, so step k sends
+chunk element k + 1.
+
 The policy code comes from the imitation repo on ``PYTHONPATH``; ``snap_model``
 and ``snap_decoder`` come from the checkpoint folder.  The script declares its
 own dependencies, so ``uv run`` builds an isolated environment::
@@ -493,7 +496,7 @@ def run_episode(client, model, shape_meta, tokenizer, hz: float) -> None:
                     tokenizer.set_poses(obs["scene_camera"].extrinsics)
                 inputs = to_model_input(obs, shape_meta)
                 chunk = model.get_action(**inputs, return_full_chunk=True)[0]
-                plan = list(chunk[: model.action_horizon])
+                plan = list(chunk[1 : model.action_horizon + 1])
                 t2 = time.perf_counter()
                 obs_ms.append((t1 - t0) * 1e3)
                 tok_ms.append(tokenizer.ms)

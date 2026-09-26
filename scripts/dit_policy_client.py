@@ -34,6 +34,10 @@ and then replans.  Actions are never sent late: planned action k is due k
 control periods after its observation, and any action already due when
 planning finishes is dropped.
 
+``rd serve`` reaches each action one period after it is sent, so every tick
+sends the action for one period ahead: chunk element k + 1 at step k, or the
+temporal-aggregation blend for the next step.
+
 The policy code comes from the imitation repo on ``PYTHONPATH``; the script
 declares its own dependencies, so ``uv run`` builds an isolated environment::
 
@@ -226,9 +230,9 @@ def run_episode(client, model, shape_meta, hz: float, chunk_exec: bool) -> None:
                 inputs = to_model_input(obs, shape_meta)
                 if chunk_exec:
                     chunk = model.get_action(**inputs, return_full_chunk=True)[0]
-                    plan = list(chunk[: model.action_horizon])
+                    plan = list(chunk[1 : model.action_horizon + 1])
                 else:
-                    plan = [model.get_action(**inputs)[0]]
+                    plan = [model.get_action(**inputs, steps_ahead=1)[0]]
                 t2 = time.perf_counter()
                 obs_ms.append((t1 - t0) * 1e3)
                 infer_ms.append((t2 - t1) * 1e3)
