@@ -288,6 +288,9 @@ class ReplayCommand:
     source: Literal["raw", "processed"] = "raw"
     """Data source: 'raw' loads joint commands directly from robot_data.npz (no IK); 'processed' loads EE poses from lowdim pkls and solves IK"""
 
+    save: Optional[str] = None
+    """Write the left follower's commands and measured state during the replay to this .npz (robot_data.npz keys)"""
+
 
 @dataclass
 class VisualizeCommand:
@@ -523,9 +526,9 @@ def main():
             command = tyro.cli(
                 ReplayCommand, description="Replay recorded follower arm motion"
             )
-            if command.recording_dir is not None:
-                from pathlib import Path
+            from pathlib import Path
 
+            if command.recording_dir is not None:
                 recording_dir = Path(command.recording_dir)
             elif command.source == "processed":
                 recording_dir = select_processed_recording()
@@ -537,6 +540,7 @@ def main():
                 speed=command.speed,
                 stride=command.stride,
                 visualize=command.visualize,
+                save=Path(command.save) if command.save else None,
             )
 
         elif subcommand == "list_devices":

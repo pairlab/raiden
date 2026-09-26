@@ -291,6 +291,7 @@ def run_replay(
     camera_hz: int = 30,
     stride: int = 1,
     visualize: bool = False,
+    save: Optional[Path] = None,
 ) -> None:
     """Replay a recorded episode.
 
@@ -309,6 +310,8 @@ def run_replay(
             processed source only).
         stride: Subsample every N-th frame to match the shardify stride
             (default 1 = native rate, 3 = 10 Hz from 30 Hz recordings).
+        save: Write the left follower's commands and measured state during the
+            replay to this ``.npz``, with the keys of ``robot_data.npz``.
     """
     if (recording_dir / "robot_data.npz").exists():
         _run_raw_replay(
@@ -318,6 +321,7 @@ def run_replay(
             control_hz=control_hz,
             stride=stride,
             visualize=visualize,
+            save=save,
         )
     elif (recording_dir / "lowdim").exists():
         _run_processed_replay(
@@ -328,6 +332,7 @@ def run_replay(
             camera_hz=camera_hz,
             stride=stride,
             visualize=visualize,
+            save=save,
         )
     else:
         raise FileNotFoundError(
@@ -342,6 +347,7 @@ def _run_raw_replay(
     control_hz: int = 150,
     stride: int = 1,
     visualize: bool = False,
+    save: Optional[Path] = None,
 ) -> None:
     """Replay directly from raw joint commands in robot_data.npz (no IK)."""
     joints_l, joints_r, timestamps = _load_raw_joints(recording_dir)
@@ -371,6 +377,7 @@ def _run_raw_replay(
         speed=speed,
         control_hz=control_hz,
         visualize=visualize,
+        save=save,
     )
 
 
@@ -382,6 +389,7 @@ def _run_processed_replay(
     camera_hz: int = 30,
     stride: int = 1,
     visualize: bool = False,
+    save: Optional[Path] = None,
 ) -> None:
     """Replay from processed lowdim pkl files using IK from EE poses."""
     use_right = arms == "bimanual"
@@ -435,12 +443,30 @@ def _run_processed_replay(
             control_hz=control_hz,
             robot=robot,
             visualize=visualize,
+            save=save,
         )
     except KeyboardInterrupt:
         print("\nReplay interrupted.")
     finally:
         robot.move_to_home_positions()
         robot.close()
+
+
+def _save_trace(path: Path, trace: list) -> None:
+    """Save (t_ns, command, observations) rows under the ``robot_data.npz`` keys."""
+    t_ns, cmd, obs = zip(*trace)
+    data = {
+        "timestamps": np.array(t_ns, dtype=np.int64),
+        "follower_l_joint_cmd": np.stack(cmd).astype(np.float32),
+    }
+    for key in obs[0]:
+        data[f"follower_l_{key}"] = np.stack([o[key] for o in obs])
+    data["follower_l_joint_pos_7d"] = np.concatenate(
+        [data["follower_l_joint_pos"], data["follower_l_gripper_pos"]], axis=1
+    ).astype(np.float32)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **data)
+    print(f"Saved {len(t_ns)} measured frames → {path}")
 
 
 def _stream_trajectories(
@@ -452,6 +478,7 @@ def _stream_trajectories(
     recording_dir: Optional[Path] = None,
     robot: Optional["RobotController"] = None,
     visualize: bool = False,
+    save: Optional[Path] = None,
 ) -> None:
     """Connect to (or reuse) the robot, move to start, then stream joint trajectories.
 
@@ -502,6 +529,7 @@ def _stream_trajectories(
         rr_kin = _get_kinematics()
 
     n_frames = len(traj_l)
+    trace: list = []
     try:
         # ── move to start pose ─────────────────────────────────────────────
         print("\nMoving to start position...")
@@ -540,6 +568,9 @@ def _stream_trajectories(
 
             if robot.follower_l is not None:
                 robot.follower_l.command_joint_pos(traj_l[i])
+                if save is not None:
+                    obs = robot.follower_l.get_observations()
+                    trace.append((time.time_ns(), traj_l[i], obs))
             if use_right and robot.follower_r is not None and traj_r is not None:
                 robot.follower_r.command_joint_pos(traj_r[i])
 
@@ -593,6 +624,8 @@ def _stream_trajectories(
     except KeyboardInterrupt:
         print("\nReplay interrupted.")
     finally:
+        if save is not None and trace:
+            _save_trace(save, trace)
         if owns_robot:
             robot.move_to_home_positions()
             robot.close()
