@@ -7,6 +7,9 @@ and deletes or relabels saved episodes when nothing is recording.
 
 Frames: while a recording runs, the recorder's capture threads hand theirs over (``monitor``); in between, a pump
 reads the open cameras itself, paused around every pipeline restart (``pause_pump`` / ``resume_pump``).
+
+Counts, coverage and the dataset summary (``data/raw/<task>/README.md``, see ``raiden.dataset_stats``) cover every
+episode of the task, not only this session's; the coverage grids count successes only.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ import cv2
 import numpy as np
 from aiohttp import WSMsgType, web
 
-from raiden import qc
+from raiden import dataset_stats, qc
 from raiden._config import CAMERA_CONFIG, DB_DIR
 from raiden.camera_config import CameraConfig
 from raiden.db.database import get_db
@@ -94,7 +97,7 @@ class RecordUI:
         self._host, self._port, self._open_browser = host, port, open_browser
         self._data = Path(data_dir)
         self._lock = threading.RLock()
-        self._state: Dict = dict(phase="setup", notice="", live={}, episodes=[], coverage=[], session_tally={})
+        self._state: Dict = dict(phase="setup", notice="", live={}, episodes=[], coverage=[], dataset={})
         self._cmd: Optional[str] = None  # the one pending session command
         self._setup_q: "queue.Queue[dict]" = queue.Queue()
         self._frames: Dict[str, Tuple[int, np.ndarray]] = {}  # camera -> (seq, latest frame)
@@ -119,6 +122,8 @@ class RecordUI:
         self._log_lock = threading.Lock()
         self._streams = None
         self._last_poll = 0.0
+        self._session_start: Optional[datetime] = None
+        self._write_lock = threading.Lock()  # one writer of the QC files at a time
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -160,9 +165,13 @@ class RecordUI:
     def setup_session(self) -> Tuple[str, str, int]:
         """Block until the page picks the task and teacher; returns (task name, instruction, teacher id)."""
         db = get_db()
+        demos = [d for d in db.get_demonstrations() if Path(d.get("raw_data_path") or "").is_dir()]
+        tasks = [dict(name=t["name"], instruction=t["instruction"],
+                      total=sum(d.get("task_id") == t["id"] for d in demos),
+                      success=sum(d.get("task_id") == t["id"] and d.get("status") == "success" for d in demos))
+                 for t in db.get_tasks()]
         with self._lock:
-            self._state["setup"] = dict(tasks=[dict(name=t["name"], instruction=t["instruction"]) for t in db.get_tasks()],
-                                        teachers=[t["name"] for t in db.get_teachers()])
+            self._state["setup"] = dict(tasks=tasks, teachers=[t["name"] for t in db.get_teachers()])
             self._state["phase"] = "setup"
         while True:
             s = self._setup_q.get()
@@ -194,8 +203,10 @@ class RecordUI:
         teacher_id = teacher["id"] if teacher else db.add_teacher(tname)
         with self._lock:
             self._task = task["name"]
-            self._state.update(task=task["name"], instruction=task["instruction"], teacher=tname, phase="init")
+            self._state.update(task=task["name"], instruction=task["instruction"], teacher=tname, phase="init",
+                               readme=str(self._readme()))
             self._state.pop("setup", None)
+        self._session_start = dataset_stats.log_session(self._qc_dir(), tname)
         self._load_results()
         return task["name"], task["instruction"], teacher_id
 
@@ -224,16 +235,18 @@ class RecordUI:
         self.update(calibrating=bool(getattr(interface, "calibrating", False)), device_status=status,
                     device_help=getattr(interface, "banner", "") or "")
 
-    def set_tally(self, tally: Dict[str, int]) -> None:
-        with self._lock:
-            self._state["session_tally"] = dict(tally)
-
     def notice(self, text: str) -> None:
         with self._lock:
             self._state["notice"] = f"{datetime.now():%H:%M:%S} {text}"
 
     def episode_saved(self, saved_dir: Path) -> None:
-        self._qc_q.put(Path(saved_dir))
+        """Count the episode at once (label from the DB); its QC follows a few seconds later."""
+        saved_dir = Path(saved_dir)
+        with self._lock:
+            self._results.setdefault(saved_dir.name, dict(episode=saved_dir.name, reasons=[], duration_s=None,
+                                                          qc_pending=True))
+        self._publish_results()
+        self._qc_q.put(saved_dir)
 
     def monitor(self, inner=None) -> _Monitor:
         return _Monitor(self, inner)
@@ -397,6 +410,9 @@ class RecordUI:
     def _qc_dir(self) -> Path:
         return self._data / "qc" / (self._task or "none")
 
+    def _readme(self) -> Path:
+        return self._data / "raw" / (self._task or "none") / "README.md"
+
     def _load_results(self) -> None:
         f = self._qc_dir() / "qc_results.json"
         with self._lock:
@@ -433,11 +449,28 @@ class RecordUI:
             self._publish_results()
 
     def _publish_results(self) -> None:
+        try:
+            self._publish()
+        except Exception as e:  # called from the recorder loop and the QC thread: never end the session over it
+            traceback.print_exc()
+            self.notice(f"updating the episode list failed: {e!r}")
+
+    def _publish(self) -> None:
+        try:
+            db = get_db()
+            demos, teachers = db.get_demonstrations(), {t["id"]: t["name"] for t in db.get_teachers()}
+        except Exception as e:  # keep the last labels
+            demos = None
+            self.notice(f"DB read failed: {e!r}")
+        starts = dataset_stats.logged_starts(self._qc_dir())
         with self._lock:
+            if demos is not None and self._task:
+                dataset_stats.refresh(self._results, self._task, demos, teachers, self._data / "raw" / self._task)
             qc.apply_duration_outliers(self._results)
             G, outside = qc.coverage(self._results, self._geo)
             eps = [dict(episode=k, duration_s=r.get("duration_s"), label=r.get("label"), reasons=r.get("reasons", []),
-                        croissant=r.get("croissant"), oven=r.get("oven"), closes=r.get("closes"))
+                        croissant=r.get("croissant"), oven=r.get("oven"), closes=r.get("closes"),
+                        qc_pending=bool(r.get("qc_pending")))
                    for k, r in sorted(self._results.items(), reverse=True)]
             O, o_out = qc.oven_coverage(self._results, self._geo)
             oy0, oy1 = self._geo.oven_region[2], self._geo.oven_region[3]
@@ -445,15 +478,26 @@ class RecordUI:
                                oven_grid=np.linspace(oy1, oy0, qc.OVEN_GRID + 1).round(3).tolist(),
                                oven_sim_x=round((self._geo.oven_region[0] + self._geo.oven_region[1]) / 2, 3))
             bx0, bx1, by0, by1 = self._geo.blue
+            checked = [e for e in eps if not e["qc_pending"]]
             self._state.update(episodes=eps, coverage=G.tolist(), coverage_outside=outside,
                                grid=dict(x=np.linspace(bx0, bx1, qc.GRID_X + 1).round(3).tolist(),
                                          y=np.linspace(by1, by0, qc.GRID_Y + 1).round(3).tolist()),
-                               qc_tally=dict(total=len(eps), passed=sum(not e["reasons"] for e in eps)))
-            results = dict(self._results)
-        if self._task:
+                               qc_tally=dict(total=len(checked), passed=sum(not e["reasons"] for e in checked)),
+                               dataset=dataset_stats.summary(self._results, starts, self._session_start))
+            results = {k: dict(r) for k, r in self._results.items()}
+            instruction = self._state.get("instruction", "")
+        if not self._task:
+            return
+        with self._write_lock:
             d = self._qc_dir()
             d.mkdir(parents=True, exist_ok=True)
-            json.dump(results, open(d / "qc_results.json", "w"), indent=1)
+            dataset_stats.write_atomic(d / "qc_results.json", json.dumps(results, indent=1))
+            readme = self._readme()
+            if readme.parent.is_dir():
+                cc = {n: self._cfg.get_color_controls(n) for n in ("scene_camera", "left_wrist_camera")}
+                dataset_stats.write_atomic(readme, dataset_stats.markdown(
+                    self._task, instruction, results, self._geo, self._settings, cc, starts,
+                    dataset_stats.read_notes(readme)))
 
     def _log(self, text: str) -> None:
         if self._task:

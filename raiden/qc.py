@@ -344,14 +344,13 @@ def apply_duration_outliers(results: Dict[str, Dict]) -> None:
                 r["reasons"].append(f"duration outlier ({r['duration_s']:.1f} s vs median {m:.1f} s)")
 
 
-def coverage(results: Dict[str, Dict], geo: Geometry) -> Tuple[np.ndarray, int]:
+def coverage(results: Dict[str, Dict], geo: Geometry, label: Optional[str] = "success") -> Tuple[np.ndarray, int]:
     """(GRID_X x GRID_Y counts of croissant starts over the blue box; row 0 nearest the robot, column 0 the robot's
-    left), and the number outside it."""
-    bx0, bx1, by0, by1 = geo.blue
+    left), and the number outside it. Only episodes labelled ``label`` count (None: all)."""
     G = np.zeros((GRID_X, GRID_Y), int)
     outside = 0
     for r in results.values():
-        if not r.get("croissant"):
+        if (label is not None and r.get("label") != label) or not r.get("croissant"):
             continue
         cell = grid_cell(*r["croissant"], geo)
         if cell is None:
@@ -361,12 +360,13 @@ def coverage(results: Dict[str, Dict], geo: Geometry) -> Tuple[np.ndarray, int]:
     return G, outside
 
 
-def oven_coverage(results: Dict[str, Dict], geo: Geometry) -> Tuple[np.ndarray, int]:
-    """(OVEN_GRID counts of oven positions over the sim's y range, column 0 the robot's left; number outside)."""
+def oven_coverage(results: Dict[str, Dict], geo: Geometry, label: Optional[str] = "success") -> Tuple[np.ndarray, int]:
+    """(OVEN_GRID counts of oven positions over the sim's y range, column 0 the robot's left; number outside).
+    Only episodes labelled ``label`` count (None: all)."""
     G = np.zeros(OVEN_GRID, int)
     outside = 0
     for r in results.values():
-        if not r.get("oven"):
+        if (label is not None and r.get("label") != label) or not r.get("oven"):
             continue
         j = oven_cell(r["oven"][1], geo)
         if j is None:
@@ -410,14 +410,15 @@ def tally_text(results: Dict[str, Dict], geo: Geometry) -> str:
     G, outside = coverage(results, geo)
     bx0, bx1, by0, by1 = geo.blue
     ys, xs = np.linspace(by1, by0, GRID_Y + 1), np.linspace(bx0, bx1, GRID_X + 1)
-    out.append(f"croissant starts over the blue box (top = far from the robot; left = robot's left, +y); {outside} outside:")
+    out.append(f"croissant starts of the {labels.get('success', 0)} successes over the blue box (top = far from the "
+               f"robot; left = robot's left, +y); {outside} outside:")
     out.append("            " + " ".join(f"{(ys[j] + ys[j + 1]) / 2:+6.2f}" for j in range(GRID_Y)) + "   <- y (m)")
     for i in reversed(range(GRID_X)):
         cells = " ".join(f"{G[i, j]:>6d}" if G[i, j] else "     ." for j in range(GRID_Y))
         out.append(f"  x {xs[i]:.2f}-{xs[i + 1]:.2f} {cells}")
     O, o_out = oven_coverage(results, geo)
     oy = np.linspace(geo.oven_region[3], geo.oven_region[2], OVEN_GRID + 1)
-    out.append(f"oven positions over the sim's y range (left = robot's left); {o_out} outside:")
+    out.append(f"oven positions of the successes over the sim's y range (left = robot's left); {o_out} outside:")
     out.append("            " + " ".join(f"{(oy[j] + oy[j + 1]) / 2:+6.3f}" for j in range(OVEN_GRID)) + "   <- y (m)")
     out.append("            " + " ".join(f"{O[j]:>6d}" if O[j] else "     ." for j in range(OVEN_GRID)))
     return "\n".join(out)

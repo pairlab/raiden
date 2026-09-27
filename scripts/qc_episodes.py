@@ -2,10 +2,12 @@
 """Per-episode QC of real demos while they are being recorded (checks: ``raiden/qc.py``).
 
 For every finished episode of a task (metadata.json with complete=true) it prints one line, PASS or the reasons,
-then the running tally and the croissant coverage of the blue box. Results go to data/qc/<task>/ (qc_log.txt,
-qc_results.json); ``rd record --ui`` writes the same files. Deleted episodes drop out of the tally.
+then the running tally and the coverage of the successful demos. Results go to data/qc/<task>/ (qc_log.txt,
+qc_results.json) and the dataset summary to data/raw/<task>/README.md (``raiden.dataset_stats``); ``rd record --ui``
+writes the same files. Deleted episodes drop out; labels are read from the DB on every pass.
 
     uv run python scripts/qc_episodes.py croissant_oven_real_newrig --watch
+    uv run python scripts/qc_episodes.py croissant_oven_real_newrig     # one pass: rebuild the summary
 """
 
 import argparse
@@ -14,7 +16,7 @@ import time
 import traceback
 from pathlib import Path
 
-from raiden import qc
+from raiden import dataset_stats, qc
 from raiden._config import CAMERA_CONFIG
 from raiden.camera_config import CameraConfig
 
@@ -55,8 +57,8 @@ def main():
 
     say(f"QC {args.task}: {raw}  (blue box x {geo.blue[0]:.3f}-{geo.blue[1]:.3f}, y {geo.blue[2]:+.3f}..{geo.blue[3]:+.3f};"
         f" white x {geo.white[0]:.3f}-{geo.white[1]:.3f}, y ±{geo.white[3]:.3f}; wrist tips {list(st.ref_tips)})")
+    changed = True  # the first pass always writes the summary
     while True:
-        changed = False
         eps = sorted(p for p in raw.iterdir() if p.is_dir() and p.name.isdigit()) if raw.exists() else []
         for gone in set(results) - {e.name for e in eps}:
             say(f"{gone} deleted: dropped from the tally")
@@ -79,10 +81,24 @@ def main():
             results[ep.name] = r
             changed = True
             say(qc.line(r))
+        db = get_db()
+        before = {k: r.get("label") for k, r in results.items()}
+        dataset_stats.refresh(results, args.task, db.get_demonstrations(),
+                              {t["id"]: t["name"] for t in db.get_teachers()}, raw)
+        changed = changed or before != {k: r.get("label") for k, r in results.items()}
         if changed:
             qc.apply_duration_outliers(results)
             say(qc.tally_text(results, geo))
-            json.dump(results, open(state_file, "w"), indent=1)
+            dataset_stats.write_atomic(state_file, json.dumps(results, indent=1))
+            if raw.is_dir():
+                task = db.get_task_by_name(args.task)
+                cc = {n: cfg.get_color_controls(n) for n in ("scene_camera", "left_wrist_camera")}
+                readme = raw / "README.md"
+                dataset_stats.write_atomic(readme, dataset_stats.markdown(
+                    args.task, task["instruction"] if task else "", results, geo, st, cc,
+                    dataset_stats.logged_starts(out), dataset_stats.read_notes(readme)))
+                print(f"summary: {readme}", flush=True)
+        changed = False
         if not args.watch:
             break
         time.sleep(5)

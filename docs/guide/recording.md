@@ -149,9 +149,12 @@ the terminal prompts. Real recording only.
   wrist aim, pauses, croissant start, gripper cycles, duration) and listed with
   PASS or the reasons. Pending episodes can be labelled there, and episodes
   deleted, files and DB row together, while nothing is recording.
-- **Coverage:** where the croissant started in the episodes so far, on a grid
-  over the blue box, and where the oven stood, over the sim's range of oven
-  positions; the current placements are outlined.
+- **Coverage:** where the croissant started in the successful episodes so far
+  (every session), on a grid over the blue box, and where the oven stood, over
+  the sim's range of oven positions; the current placements are outlined.
+- **Dataset:** the header and a side panel count every episode of the task
+  across sessions (successes, their minutes, failures, unlabelled, sessions,
+  successes passing QC) next to this session's count.
 - **Oven:** found from its three knob faces (a knob-face template, matched where
   the oven model puts them), drawn on the table in green or red, and checked
   against the sim: x within 1.5 cm of the sim's, y in the sim's range, the whole
@@ -164,6 +167,15 @@ the terminal prompts. Real recording only.
 The limits and the camera pose come from the vla-benchmark twin
 (`~/robot/vla-benchmark`: rig.json, layout.json and the croissant task JSON).
 `scripts/qc_episodes.py <task> --watch` runs the same checks without the page.
+
+Each task gets a summary, `data/raw/<task>/README.md`, rebuilt whenever an
+episode is checked, relabelled or deleted: totals, success rate, the coverage
+grids, a table per session, QC flag counts, every episode with its placements
+and flags, and the setup (placement limits, colour lock, wrist reference).
+Write notes between the markers in its Notes section; the rest is overwritten.
+Sessions come from `data/qc/<task>/sessions.jsonl` (one line per
+`rd record --ui` start), and a 30 min break also starts one. To rebuild it
+without recording, run `scripts/qc_episodes.py <task>` once.
 
 ## Uploading to S3
 

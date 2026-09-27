@@ -61,7 +61,8 @@
   <h1>raiden recording</h1>
   <div><span id="task">—</span> <span class="dim" id="instruction"></span></div>
   <div class="dim">teacher <span id="teacher">—</span></div>
-  <div>session: <span class="ok" id="t_succ">0</span> success · <span class="bad" id="t_fail">0</span> failure <span id="t_pend" class="warn"></span></div>
+  <div title="every episode of this task, all sessions">dataset: <span class="ok" id="d_succ">0</span> success · <span class="bad" id="d_fail">0</span> failure <span id="d_pend" class="warn"></span> <span class="dim" id="d_min"></span></div>
+  <div class="dim">this session: <span id="t_sess">nothing yet</span></div>
   <div>QC: <span id="q_pass">0</span> / <span id="q_total">0</span> pass</div>
 </header>
 
@@ -122,13 +123,22 @@
         <div class="row"><span>scene brightness</span><span id="s_mean" class="dim">—</span></div>
       </section>
       <section>
-        <h2>Croissant coverage of the blue box</h2>
-        <div class="dim" style="font-size:12px;margin-bottom:6px">top = far from the robot · left = robot's left · outlined = croissant now · <span id="outside"></span></div>
+        <h2>Dataset · all sessions</h2>
+        <div class="row"><span>successes</span><span id="ds_succ">—</span></div>
+        <div class="row"><span>failures · unlabelled</span><span id="ds_other">—</span></div>
+        <div class="row"><span>success rate of labelled</span><span id="ds_rate">—</span></div>
+        <div class="row"><span>sessions</span><span id="ds_sess">—</span></div>
+        <div class="row"><span>successes passing QC</span><span id="ds_qc">—</span></div>
+        <div class="dim" style="font-size:11px;margin-top:3px;word-break:break-all">summary: <span id="ds_file"></span></div>
+      </section>
+      <section>
+        <h2>Croissant starts of successes</h2>
+        <div class="dim" style="font-size:12px;margin-bottom:6px">blue box · top = far from the robot · left = robot's left · outlined = croissant now · <span id="outside"></span></div>
         <table id="grid"></table>
       </section>
       <section>
-        <h2>Oven coverage of the sim's y range</h2>
-        <div class="dim" style="font-size:12px;margin-bottom:6px">left = robot's left · outlined = oven now · <span id="oven_outside"></span></div>
+        <h2>Oven y of successes</h2>
+        <div class="dim" style="font-size:12px;margin-bottom:6px">sim's y range · left = robot's left · outlined = oven now · <span id="oven_outside"></span></div>
         <table id="oven_grid" style="width:100%"></table>
       </section>
 
@@ -158,15 +168,24 @@ function render() {
   $('setup').classList.toggle('hidden', !setup);
   $('session').classList.toggle('hidden', setup);
   if (setup && S.setup && !setupFilled) {
-    $('s_task').innerHTML = S.setup.tasks.slice().reverse().map(t => `<option value="${t.name}">${t.name} — ${t.instruction}</option>`).join('');
+    $('s_task').innerHTML = S.setup.tasks.slice().reverse().map(t => `<option value="${t.name}">${t.name} — ${t.instruction} · ${t.total ? `${t.success} success of ${t.total}` : 'no episodes yet'}</option>`).join('');
     $('s_teacher').innerHTML = S.setup.teachers.map(t => `<option>${t}</option>`).join('');
     setupFilled = true;
   }
   $('task').textContent = S.task || '—'; $('instruction').textContent = S.instruction ? `“${S.instruction}”` : '';
   $('teacher').textContent = S.teacher || '—';
-  const t = S.session_tally || {};
-  $('t_succ').textContent = t.success || 0; $('t_fail').textContent = t.failure || 0;
-  $('t_pend').textContent = t.pending ? `· ${t.pending} unlabelled` : '';
+  const d = S.dataset || {}, t = d.session;
+  $('d_succ').textContent = d.success || 0; $('d_fail').textContent = d.failure || 0;
+  $('d_pend').textContent = d.unlabelled ? `· ${d.unlabelled} unlabelled` : '';
+  $('d_min').textContent = d.success ? `· ${d.success_min} min of successes` : '';
+  $('t_sess').textContent = t && t.success + t.failure + t.unlabelled ? `${t.success} success · ${t.failure} failure` + (t.unlabelled ? ` · ${t.unlabelled} unlabelled` : '') : 'nothing yet';
+  const labelled = (d.success || 0) + (d.failure || 0);
+  $('ds_succ').textContent = d.total ? `${d.success} · ${d.success_min} min` + (d.median_s ? ` · median ${d.median_s.toFixed(0)} s` : '') : '—';
+  $('ds_other').textContent = d.total ? `${d.failure} · ${d.unlabelled}` : '—';
+  $('ds_rate').textContent = labelled ? `${Math.round(100 * d.success / labelled)}% of ${labelled}` : '—';
+  $('ds_sess').textContent = d.sessions ? `${d.sessions} since ${d.first.slice(5, 10)}` : '—';
+  $('ds_qc').textContent = d.succ_checked ? `${d.succ_pass} / ${d.succ_checked}` : '—';
+  $('ds_file').textContent = S.readme || '';
   const q = S.qc_tally || {}; $('q_pass').textContent = q.passed || 0; $('q_total').textContent = q.total || 0;
   $('notice').textContent = S.notice || '';
   const ph = S.phase;
@@ -223,7 +242,7 @@ function render() {
     const g = S.oven_grid, live = o && o.cell !== null && o.cell !== undefined ? o.cell : null;
     $('oven_grid').innerHTML = '<tr>' + g.slice(0, -1).map((y, j) => `<th>${((y + g[j + 1]) / 2 >= 0 ? '+' : '') + ((y + g[j + 1]) / 2).toFixed(3)}</th>`).join('') + '</tr><tr>' +
       S.oven_coverage.map((n, j) => `<td class="${n ? '' : 'zero'} ${live === j ? 'live' : ''}">${n || '·'}</td>`).join('') + '</tr>';
-    $('oven_outside').textContent = S.oven_outside ? `${S.oven_outside} outside` : '';
+    $('oven_outside').textContent = `${S.oven_coverage.reduce((a, b) => a + b, 0) + (S.oven_outside || 0)} successes` + (S.oven_outside ? `, ${S.oven_outside} outside` : '');
   }
   // coverage grid
   if (S.coverage && S.grid) {
@@ -234,14 +253,14 @@ function render() {
         `<td class="${n ? '' : 'zero'} ${live && live[0] === i && live[1] === j ? 'live' : ''}">${n || '·'}</td>`).join('') + '</tr>';
     }
     $('grid').innerHTML = h;
-    $('outside').textContent = S.coverage_outside ? `${S.coverage_outside} outside` : '';
+    $('outside').textContent = `${d.success || 0} successes` + (S.coverage_outside ? `, ${S.coverage_outside} outside` : '');
   }
   // episodes
   const busy = ['recording', 'verdict', 'saving'].includes(ph);
   $('eps').innerHTML = (S.episodes || []).map(e => `<tr>
     <td>${e.episode}</td><td>${e.duration_s ? e.duration_s.toFixed(0) + ' s' : ''}</td>
     <td class="${e.label === 'success' ? 'ok' : e.label === 'failure' ? 'bad' : 'warn'}">${e.label || ''}</td>
-    <td class="qc">${e.reasons.length ? '<span class="bad">FLAG</span><div class="reasons">' + e.reasons.join('<br>') + '</div>' : '<span class="ok">PASS</span>'}</td>
+    <td class="qc">${e.qc_pending ? '<span class="dim">QC running…</span>' : e.reasons.length ? '<span class="bad">FLAG</span><div class="reasons">' + e.reasons.join('<br>') + '</div>' : '<span class="ok">PASS</span>'}</td>
     <td style="white-space:nowrap">
       <button title="mark success" onclick="send('label',{episode:'${e.episode}',status:'success'})">✓</button>
       <button title="mark failure" onclick="send('label',{episode:'${e.episode}',status:'failure'})">✗</button>

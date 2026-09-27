@@ -1163,7 +1163,6 @@ def run_recording(
             recorder = None
             if record_ui is not None:
                 record_ui.set_phase("init")
-                record_ui.set_tally(tally)
 
             # ── per-episode: init robots ──────────────────────────────────
             robot_controller = RobotController(
@@ -1331,7 +1330,6 @@ def run_recording(
                 print("\nRecording aborted — marked as failure.")
                 print(_tally_line(tally) + "\n")
                 if record_ui is not None:
-                    record_ui.set_tally(tally)
                     record_ui.episode_saved(saved_dir)
                     record_ui.notice("recording aborted (e-stop): marked failure, session ended")
                 break
@@ -1355,7 +1353,6 @@ def run_recording(
             tally[verdict or "pending"] += 1
             print(f"✓ Recording saved to: {saved_dir}\n")
             if record_ui is not None:
-                record_ui.set_tally(tally)
                 record_ui.episode_saved(saved_dir)
             # Loop back — cameras stay open, robots reinited next iteration.
             # The running tally prints under that iteration's READY banner.
