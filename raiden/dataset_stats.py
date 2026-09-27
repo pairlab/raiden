@@ -24,8 +24,9 @@ NOTES_END = "<!-- end of notes -->"
 LABELS = ("success", "failure", "unlabelled")
 # (text in a QC reason, the check it belongs to), first match wins
 FLAG_KINDS = (
+    ("oven moved", "oven moved during the episode"),
     ("duration outlier", "duration far from the median"), ("duration", "duration out of range"),
-    ("pause", "pause"), ("gripper closes", "regrasp (gripper closes)"),
+    ("pause", "pause"), ("gripper closes", "gripper closes not 1 (regrasp, handle grasp or no grasp)"),
     ("croissant centre", "croissant centre outside the blue box"), ("croissant (", "croissant may cross the white box"),
     ("croissant not found", "croissant not found"), ("oven x", "oven x off the sim's"),
     ("oven y", "oven y outside the sim's range"), ("oven (", "oven crosses the white box"),
@@ -214,13 +215,16 @@ def markdown(task: str, instruction: str, results: Dict[str, Dict], geo: qc.Geom
     else:
         out.append("None.")
 
-    out += ["", "## Episodes", "", "| # | saved | teacher | length | label | croissant x, y | oven x, y | QC |",
-            "|---|---|---|---:|---|---|---|---|"]
+    out += ["", "## Episodes", "", "Oven moved: from where its knobs are first seen to where they are last seen (mm).", "",
+            "| # | saved | teacher | length | label | croissant x, y | oven x, y | oven moved | QC |",
+            "|---|---|---|---:|---|---|---|---|---|"]
     for r in rs:
         qc_text = "QC running" if r.get("qc_pending") else "; ".join(r.get("reasons", [])).replace("|", "/") or "pass"
         length = f"{r['duration_s']:.0f} s" if r.get("duration_s") else "?"
+        m = r.get("oven_moved")
+        moved = f"{m[0] * 1000:+.0f}, {m[1] * 1000:+.0f}" if m else "–"
         out.append(f"| {r['episode']} | {_when(r.get('saved_at'))} | {r.get('teacher') or '?'} | {length} "
-                   f"| {r.get('label')} | {_xy(r.get('croissant'))} | {_xy(r.get('oven'))} | {qc_text} |")
+                   f"| {r.get('label')} | {_xy(r.get('croissant'))} | {_xy(r.get('oven'))} | {moved} | {qc_text} |")
 
     wx0, wx1, wy0, wy1 = geo.white
     ox0, ox1, oy0, oy1 = geo.oven_region
@@ -233,6 +237,8 @@ def markdown(task: str, instruction: str, results: Dict[str, Dict], geo: qc.Geom
             f"  - oven origin: x {(ox0 + ox1) / 2:.3f} ± {qc.OVEN_X_TOL:.3f}, y {oy0:+.3f}..{oy1:+.3f}",
             f"- Colour lock in camera.json now: {locks}. Episodes recorded with other values are flagged.",
             f"- Wrist fingertip reference rows {st.ref_tips[0]} / {st.ref_tips[1]} (arm at home), ±{st.max_tip_px} px.",
+            f"- Gripper: exactly {st.closes} close per episode (the croissant grasp; the door is hooked open, gripper open).",
+            f"- Oven: moves at most {st.max_oven_move * 1000:.0f} mm during an episode (first to last seen knobs).",
             "", "## Notes", "", NOTES_BEGIN] + ([notes] if notes else []) + [NOTES_END, ""]
     return "\n".join(out)
 

@@ -34,15 +34,16 @@ def main():
     ap.add_argument("--min-wrist-mean", type=float, default=d.min_wrist_mean)
     ap.add_argument("--scene-mean", type=float, nargs=2, default=list(d.scene_mean))
     ap.add_argument("--max-pause", type=float, default=d.max_pause)
-    ap.add_argument("--max-closes", type=int, default=d.max_closes)
+    ap.add_argument("--closes", type=int, default=d.closes, help="expected gripper closes per episode")
     ap.add_argument("--min-s", type=float, default=d.min_s)
     ap.add_argument("--max-s", type=float, default=d.max_s)
+    ap.add_argument("--max-oven-move", type=float, default=d.max_oven_move, help="m, first to last seen knobs")
     ap.add_argument("--out", default="", help="default data/qc/<task>")
     args = ap.parse_args()
     from raiden.db.database import get_db
 
     st = qc.QCSettings(tuple(args.ref_tips), args.max_tip_px, args.min_wrist_mean, tuple(args.scene_mean),
-                       args.max_pause, args.max_closes, args.min_s, args.max_s)
+                       args.max_pause, args.closes, args.min_s, args.max_s, args.max_oven_move)
     raw = REPO / "data/raw" / args.task
     out = Path(args.out) if args.out else REPO / "data/qc" / args.task
     out.mkdir(parents=True, exist_ok=True)

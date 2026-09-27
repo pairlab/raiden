@@ -8,7 +8,10 @@ Used by ``scripts/qc_episodes.py`` (a watcher) and by ``rd record --ui``. For on
 * pauses: stretches with the arm and gripper still, outside the first and last 0.5 s.
 * croissant start (first scene frame, the orange blob projected to its centre-of-mass height): centre of mass in the
   blue box, the whole croissant (51 mm radius) in the white box.
-* gripper: close events of the open/closed command; more than ``max_closes`` suggests a regrasp.
+* oven: where it starts (knob faces, first scene frame) against the sim's position, and how far it moved between where
+  the knobs are first and last seen (the sim's oven is welded to the table).
+* gripper: close events of the open/closed command. The door is hooked open with the gripper open, so the only close
+  is the croissant grasp: anything but ``closes`` is flagged (0: no grasp; more: a regrasp or a handle grasp).
 * duration: outside ``min_s``/``max_s``, or far from the median of the other episodes.
 
 The placement limits come from the vla-benchmark twin (rig.json, layout.json and the task JSON), so the checks follow
@@ -17,6 +20,7 @@ the sim's spawn regions.
 
 from __future__ import annotations
 
+import datetime
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +28,7 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+import pyrealsense2 as rs
 
 from raiden.camera_config import CameraConfig
 from raiden.cameras.realsense import RealSenseCamera
@@ -39,7 +44,7 @@ OVEN_KNOB_FACES = np.array([[-0.129, -0.150, 0.165], [-0.129, -0.150, 0.115], [-
 OVEN_X_TOL = 0.015  # real oven x may differ this much from the sim's fixed x
 OVEN_GRID = 5  # bins over the sim's oven y range
 STILL_RAD_S = 0.02
-QC_VERSION = 2  # results from an older version are checked again (2: oven position)
+QC_VERSION = 3  # results from an older version are checked again (2: oven position, 3: oven moved, 1 close)
 GRID_X, GRID_Y = 3, 6
 VLA_DEFAULT = Path.home() / "robot/vla-benchmark"
 TASK_JSON = "mesa/task_suites/bddl_files/raiden_lab/croissant_oven_heating_region/source/000.json"
@@ -52,9 +57,10 @@ class QCSettings:
     min_wrist_mean: float = 100.0
     scene_mean: Tuple[float, float] = (90.0, 140.0)
     max_pause: float = 1.0
-    max_closes: int = 2
+    closes: int = 1  # the croissant grasp; the door is hooked open with the gripper open (2026-09-27)
     min_s: float = 5.0
     max_s: float = 90.0
+    max_oven_move: float = 0.015  # m between where the oven's knobs are first and last seen
 
 
 @dataclass
@@ -212,6 +218,80 @@ def oven_position(img: np.ndarray, geo: Geometry, min_score: float = 0.55) -> Op
     return float(xy[0]), float(xy[1]), round(score, 3)
 
 
+def _open_bag(bag: Path):
+    p, c = rs.pipeline(), rs.config()
+    rs.config.enable_device_from_file(c, str(bag), repeat_playback=False)
+    c.enable_stream(rs.stream.color)
+    playback = p.start(c).get_device().as_playback()
+    playback.set_real_time(False)
+    return p, playback
+
+
+def _oven_matches(bag: Path, geo: Geometry, crop, ts0: float, t0: float, t1: float,
+                  stop_after: Optional[int] = None, every: int = 3) -> List[Tuple[float, float, float]]:
+    """(t, x, y) of the oven at every ``every``-th colour frame of a scene bag between t0 and t1 s after its first
+    frame (timestamp ``ts0``, ms), where the knobs are seen; stops early after ``stop_after`` matches. The window is
+    judged by each frame's own timestamp: right after a seek the bag still returns a frame from before it."""
+    p, playback = _open_bag(bag)
+    found, i = [], 0
+    try:
+        if t0 > 0:
+            playback.seek(datetime.timedelta(seconds=t0))
+        while stop_after is None or len(found) < stop_after:
+            ok, fs = p.try_wait_for_frames(2000)
+            if not ok:
+                break
+            cf = fs.get_color_frame()
+            if not cf:
+                continue
+            t = (cf.get_timestamp() - ts0) / 1000
+            if t < t0 - 0.1:
+                continue
+            if t > t1:
+                break
+            if i % every == 0:
+                img = np.asanyarray(cf.get_data())
+                if crop is not None:
+                    x, y, w, h = crop
+                    img = img[y:y + h, x:x + w]
+                o = oven_position(img, geo)
+                if o is not None:
+                    found.append((t, o[0], o[1]))
+            i += 1
+    finally:
+        p.stop()
+    return found
+
+
+def oven_start_end(bag: Path, geo: Geometry, crop=None, span: float = 12.0, n: int = 5):
+    """(start, end, last_seen_s, duration_s) of the oven in a scene bag. start and end are the oven (x, y) where its
+    knobs are first and last seen: the median of the first and of the last ``n`` matches (every 3rd frame, ~10 Hz).
+    The start is searched in the first ``span`` s. The end is searched in the last ``span`` s, then in earlier windows
+    until there are ``n`` matches: the arm often hides the knobs for the last seconds, so the end can be well before
+    the end of the episode (``last_seen_s``). None for an end with fewer than 3 matches."""
+    p, playback = _open_bag(bag)
+    try:
+        duration = playback.get_duration().total_seconds()
+        ok, fs = p.try_wait_for_frames(2000)
+        ts0 = fs.get_color_frame().get_timestamp() if ok and fs.get_color_frame() else None
+    finally:
+        p.stop()
+    if ts0 is None:
+        return None, None, None, duration
+    start = _oven_matches(bag, geo, crop, ts0, 0.0, span, stop_after=n)
+    end, t1 = [], duration + 1.0
+    while len(end) < n and t1 > 0:
+        t0 = max(t1 - span, 0.0)
+        end = _oven_matches(bag, geo, crop, ts0, t0, t1) + end
+        t1 = t0
+    start, end = start[:n], end[-n:]
+
+    def mid(q):
+        return tuple(float(v) for v in np.median(np.array(q)[:, 1:], axis=0)) if len(q) >= 3 else None
+
+    return mid(start), mid(end), (float(end[-1][0]) if len(end) >= 3 else None), duration
+
+
 def oven_verdict(x: float, y: float, geo: Geometry) -> Tuple[bool, bool, bool]:
     """(x within OVEN_X_TOL of the sim's, y within the sim's range, whole oven inside the white box) at yaw 0."""
     ox0, ox1, oy0, oy1 = geo.oven_region
@@ -314,12 +394,22 @@ def check(ep: Path, task: str, geo: Geometry, cfg: CameraConfig, st: QCSettings,
                 r["reasons"].append(f"oven y {oy:+.3f} outside the sim's ±{geo.oven_region[3]:.3f}")
             if not o_white:
                 r["reasons"].append(f"oven ({ox:.3f}, {oy:+.3f}) crosses the white box")
+        a, b, seen, dur = oven_start_end(ep / "cameras/scene_camera.bag", geo, cfg.get_crop("scene_camera"))
+        if a and b:
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            r["oven_moved"] = [round(dx, 3), round(dy, 3)]
+            r["oven_last_seen_s"] = round(seen, 1)
+            if np.hypot(dx, dy) > st.max_oven_move:
+                hidden = f" by {seen:.0f} s, knobs hidden for the last {dur - seen:.0f} s" if dur - seen > 3 else ""
+                r["reasons"].append(f"oven moved {np.hypot(dx, dy) * 1000:.0f} mm (x {dx * 1000:+.0f}, "
+                                    f"y {dy * 1000:+.0f} mm){hidden}")
     d = np.load(ep / "robot_data.npz")
     t = (d["timestamps"] - d["timestamps"][0]) / 1e9
     gcmd = d["follower_l_joint_cmd"][:, 6]
     r["closes"] = int(np.sum((gcmd[:-1] >= 0.5) & (gcmd[1:] < 0.5)))
-    if r["closes"] > st.max_closes:
-        r["reasons"].append(f"{r['closes']} gripper closes (> {st.max_closes}: regrasp?)")
+    if r["closes"] != st.closes:
+        why = "croissant not grasped?" if r["closes"] < st.closes else "regrasp or handle grasp?"
+        r["reasons"].append(f"{r['closes']} gripper closes (expected {st.closes}: {why})")
     r["pauses"] = pauses(t, d["follower_l_joint_pos"], gcmd, d["follower_l_gripper_pos"][:, 0], st.max_pause)
     for start, length in r["pauses"]:
         r["reasons"].append(f"pause {length:.1f} s at {start:.1f} s")
