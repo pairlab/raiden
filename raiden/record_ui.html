@@ -151,6 +151,9 @@ let S = {}, ws;
 const $ = id => document.getElementById(id);
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
+  // An <img> stream never reconnects by itself: restart the views on every (re)connect, e.g. a tab left open for the
+  // next rd record --ui run, or they stay frozen on the last frame while the rest of the page is live.
+  ws.onopen = () => document.querySelectorAll('.view img').forEach(i => { i.src = i.src.split('?')[0] + '?' + Date.now(); });
   ws.onmessage = e => { S = JSON.parse(e.data); render(); };
   ws.onclose = () => setTimeout(connect, 1000);
 }

@@ -12,6 +12,7 @@ Usage::
     uv run python scripts/camera_preview.py --web        # browser viewer (over SSH)
     uv run python scripts/camera_preview.py --cameras scene_camera
     uv run python scripts/camera_preview.py --grid       # rule-of-thirds overlay
+    uv run python scripts/camera_preview.py --grid --reference   # + each camera's frame from a recorded episode
     uv run python scripts/camera_preview.py --sim        # watch the MESA digital twin instead
     uv run python scripts/camera_preview.py --sim --view # + operator view and task panel
 
@@ -20,12 +21,39 @@ Ctrl-C to stop.
 
 import argparse
 import time
+from pathlib import Path
 
 import cv2
 
 from raiden._config import CAMERA_CONFIG
 from raiden.camera_config import CameraConfig
 from raiden.monitor import LiveMonitor
+
+
+def _draw_grid(img):
+    img = img.copy()
+    h, w = img.shape[:2]
+    for k in (1, 2):
+        cv2.line(img, (w * k // 3, 0), (w * k // 3, h), (0, 255, 255), 1)
+        cv2.line(img, (0, h * k // 3), (w, h * k // 3), (0, 255, 255), 1)
+    return img
+
+
+def _reference_frame(episode: Path, name: str, crop, frame: int = 5):
+    """The camera's frame *frame* of a recorded episode (arm at home), cropped as recorded."""
+    from raiden.cameras.realsense import RealSenseCamera
+
+    bag = episode / "cameras" / f"{name}.bag"
+    if not bag.exists():
+        return None
+    cam = RealSenseCamera.from_bag(name, bag, crop=crop)
+    img = None
+    for _ in range(frame + 1):
+        if not cam.grab():
+            break
+        img = cam.get_frame().color
+    cam.close()
+    return img
 
 
 def main() -> None:
@@ -43,6 +71,14 @@ def main() -> None:
     )
     ap.add_argument(
         "--no-guides", action="store_true", help="hide the gripper grasp guides"
+    )
+    ap.add_argument(
+        "--reference",
+        nargs="?",
+        const="data/raw/croissant_oven_real_newrig/0000",
+        default="",
+        help="show each camera's frame from this recorded episode next to the live view, "
+        "to put a bumped camera back (default episode: croissant_oven_real_newrig/0000)",
     )
     ap.add_argument(
         "--web",
@@ -105,6 +141,20 @@ def main() -> None:
     if args.view:
         print(f"  ✓ {args.view} (operator view, not recorded)")
 
+    # Each reference sits right after its live camera and is logged once: the monitor keeps the last frame.
+    references = {}
+    if args.reference and not args.sim:
+        for name in names:
+            img = _reference_frame(Path(args.reference), name, cfg.get_crop(name))
+            if img is None:
+                print(f"  no {name}.bag in {args.reference}, no reference for it")
+                continue
+            references[f"{name} reference"] = _draw_grid(img) if args.grid else img
+            print(f"  ✓ {name} reference from {args.reference}")
+    panel_names = [
+        p for n in names for p in (n, f"{n} reference") if p == n or p in references
+    ]
+
     guides = None
     if not args.no_guides:
         from raiden.guides import make_guides
@@ -116,7 +166,7 @@ def main() -> None:
             print("  grasp guides: no arm connection, so nothing to draw (use --sim)")
 
     monitor = LiveMonitor(
-        names,
+        panel_names,
         sim=args.sim,
         view=args.view,
         web=args.web,
@@ -124,6 +174,8 @@ def main() -> None:
         app_id="camera_preview",
         guides=guides,
     )
+    for name, img in references.items():
+        monitor.log(name, img)
 
     joint_conn = None
     if guides is not None and args.sim:
@@ -141,15 +193,7 @@ def main() -> None:
                     continue
                 img = cam.get_frame().color
                 if args.grid:
-                    img = img.copy()
-                    h, w = img.shape[:2]
-                    for k in (1, 2):
-                        cv2.line(
-                            img, (w * k // 3, 0), (w * k // 3, h), (0, 255, 255), 1
-                        )
-                        cv2.line(
-                            img, (0, h * k // 3), (w, h * k // 3), (0, 255, 255), 1
-                        )
+                    img = _draw_grid(img)
                 monitor.log(cam.name, img)
             if joint_conn is not None:
                 try:

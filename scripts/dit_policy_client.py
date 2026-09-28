@@ -27,16 +27,22 @@
 """Run an imitation DiT checkpoint closed-loop on the left YAM arm through ``rd serve``.
 
 Every control tick sends one absolute joint action ``[l_joint(6), l_gripper]``.
-By default the policy runs as its checkpoint was configured: with temporal
-aggregation it is queried on the current observation every tick.  With
-``--chunk-exec`` it predicts a full chunk, executes ``action_horizon`` steps
-and then replans.  Actions are never sent late: planned action k is due k
-control periods after its observation, and any action already due when
-planning finishes is dropped.
+By default the policy predicts a full chunk, executes ``action_horizon`` steps
+and then replans, so every action sent is one the model predicted, as in
+training.  ``--temporal-agg`` instead queries it on the current observation
+every tick and sends the uniform average of all overlapping chunks, a
+smoothing the training labels never had.  Actions are never sent late: planned
+action k is due k control periods after its observation, and any action
+already due when planning finishes is dropped.
 
 ``rd serve`` reaches each action one period after it is sent, so every tick
 sends the action for one period ahead: chunk element k + 1 at step k, or the
 temporal-aggregation blend for the next step.
+
+``--binary-gripper`` rounds the gripper to 1 (open) or 0 (closed) before it is
+sent, as teleop recorded it since raiden c25c840; the server's clip then
+floors 0 to the minimum opening, exactly as teleop did.  Use it for
+checkpoints trained on binary gripper labels (e.g. nr_ditM).
 
 The policy code comes from the imitation repo on ``PYTHONPATH``; the script
 declares its own dependencies, so ``uv run`` builds an isolated environment::
@@ -209,7 +215,9 @@ class CudaGraphSampler:
         return self.out.cpu().numpy()
 
 
-def run_episode(client, model, shape_meta, hz: float, chunk_exec: bool) -> None:
+def run_episode(
+    client, model, shape_meta, hz: float, temporal_agg: bool, binary_gripper: bool
+) -> None:
     period = 1.0 / hz
     model.reset()
     plan: list[np.ndarray] = []
@@ -228,11 +236,11 @@ def run_episode(client, model, shape_meta, hz: float, chunk_exec: bool) -> None:
                 obs = client.get_obs()
                 t1 = time.perf_counter()
                 inputs = to_model_input(obs, shape_meta)
-                if chunk_exec:
+                if temporal_agg:
+                    plan = [model.get_action(**inputs, steps_ahead=1)[0]]
+                else:
                     chunk = model.get_action(**inputs, return_full_chunk=True)[0]
                     plan = list(chunk[1 : model.action_horizon + 1])
-                else:
-                    plan = [model.get_action(**inputs, steps_ahead=1)[0]]
                 t2 = time.perf_counter()
                 obs_ms.append((t1 - t0) * 1e3)
                 infer_ms.append((t2 - t1) * 1e3)
@@ -248,6 +256,9 @@ def run_episode(client, model, shape_meta, hz: float, chunk_exec: bool) -> None:
                     continue
 
             action = plan.pop(0)
+            if binary_gripper:
+                action = action.copy()
+                action[6] = 1.0 if action[6] >= 0.5 else 0.0
             client.put_action(action)
             sent += 1
 
@@ -287,10 +298,15 @@ def main() -> None:
     ap.add_argument("--uri", default="ws://localhost:8765", help="rd serve address")
     ap.add_argument("--hz", type=float, default=30.0, help="control rate")
     ap.add_argument(
-        "--chunk-exec",
+        "--temporal-agg",
         action="store_true",
-        help="execute action_horizon steps of each full chunk, then replan "
-        "(default: temporal aggregation, replan every tick)",
+        help="replan every tick and send the average of all overlapping chunks "
+        "(default: execute action_horizon steps of each full chunk, then replan)",
+    )
+    ap.add_argument(
+        "--binary-gripper",
+        action="store_true",
+        help="round the gripper action to 1 (open) or 0 (closed), as teleop recorded it",
     )
     args = ap.parse_args()
 
@@ -336,7 +352,14 @@ def main() -> None:
             except (KeyboardInterrupt, EOFError):
                 print()
                 break
-            run_episode(client, model, shape_meta, args.hz, args.chunk_exec)
+            run_episode(
+                client,
+                model,
+                shape_meta,
+                args.hz,
+                args.temporal_agg,
+                args.binary_gripper,
+            )
             stop_and_home(client)
 
 
