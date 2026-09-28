@@ -39,7 +39,7 @@ zed = ["pyzed"]
 realsense = ["pyrealsense2>=2.54"]
 docs = [
   "mkdocs>=1.5,<2.0",
-  "mkdocs-material>=9.0",
+  "mkdocs-material>=9.7.7",
   "mkdocstrings[python]>=0.24",
 ]
 lerobot = ["lerobot>=0.4"]
