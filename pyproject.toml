@@ -53,7 +53,7 @@ build-constraint-dependencies = ["scikit-build-core<0.10"]
 
 [tool.uv.sources]
 i2rt = { path = "third_party/i2rt" }
-pyzed = { path = "packages/pyzed-5.2-cp311-cp311-linux_x86_64.whl" }
+pyzed = { path = "packages/pyzed-5.5-cp311-cp311-linux_x86_64.whl" }
 pyroki = { git = "https://github.com/chungmin99/pyroki.git" }
 chiral = { git = "https://github.com/TRI-ML/chiral" }
 

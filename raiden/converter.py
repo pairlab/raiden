@@ -60,9 +60,6 @@ _IMG_EXT = ".png"
 # follow the frames through timestamp selection and trimming.
 _POSES_FILE = "camera_poses.npy"
 
-# Cameras whose images are physically mounted upside-down and need a 180° correction.
-_FLIP_CAMERAS = {"right_wrist_camera"}
-
 # Camera role → robot_data joint key.
 _ROLE_TO_JOINT_KEY: Dict[str, str] = {
     "left_wrist": "follower_l_joint_pos",
@@ -135,13 +132,15 @@ _R_FLIP_180 = np.array(
 # ---------------------------------------------------------------------------
 
 
-def _count_svo2_frames(svo_path: Path) -> int:
+def _count_svo2_frames(svo_path: Path, mono: bool = False) -> int:
     """Return the total frame count of an SVO2 file without extracting any frames."""
     from raiden.cameras.zed import ZedCamera
 
     # Depth is never needed for counting; always use DEPTH_MODE.NONE to avoid
     # wasting GPU memory.
-    camera = ZedCamera.from_svo(svo_path.stem, svo_path, compute_sdk_depth=False)
+    camera = ZedCamera.from_svo(
+        svo_path.stem, svo_path, compute_sdk_depth=False, mono=mono
+    )
     n = camera.get_total_frames()
     camera.close()
     return n
@@ -153,6 +152,7 @@ def _extract_svo2_synchronized(
     rgb_dirs: List[Path],
     depth_dirs: List[Path],
     flips: List[bool],
+    monos: List[bool],
     max_frames: Optional[int] = None,
     sync_threshold_ns: int = 16_666_667,  # half a frame at 30 fps
 ) -> Dict[str, Tuple[np.ndarray, Optional[dict]]]:
@@ -173,13 +173,13 @@ def _extract_svo2_synchronized(
     """
     from raiden.cameras.zed import ZedCamera
 
-    for d in rgb_dirs + depth_dirs:
+    for d in rgb_dirs + [d for d, mono in zip(depth_dirs, monos) if not mono]:
         d.mkdir(parents=True, exist_ok=True)
 
     # Open all cameras.
     cams: Dict[str, ZedCamera] = {
-        name: ZedCamera.from_svo(name, svo_path)
-        for name, svo_path in zip(names, svo_paths)
+        name: ZedCamera.from_svo(name, svo_path, mono=mono)
+        for name, svo_path, mono in zip(names, svo_paths, monos)
     }
 
     total_frames = {name: cam.get_total_frames() for name, cam in cams.items()}
@@ -245,12 +245,13 @@ def _extract_svo2_synchronized(
             color = cv2.rotate(frame.color, cv2.ROTATE_180) if flip else frame.color
             cv2.imwrite(str(rgb_dir_map[name] / f"{frame_idx:010d}{_IMG_EXT}"), color)
 
-            depth_mm = (frame.depth * 1000.0).clip(0, 65535).astype(np.uint16)
-            if flip:
-                depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_180)
-            np.savez_compressed(
-                str(depth_dir_map[name] / f"{frame_idx:010d}.npz"), depth=depth_mm
-            )
+            if frame.depth is not None:
+                depth_mm = (frame.depth * 1000.0).clip(0, 65535).astype(np.uint16)
+                if flip:
+                    depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_180)
+                np.savez_compressed(
+                    str(depth_dir_map[name] / f"{frame_idx:010d}.npz"), depth=depth_mm
+                )
 
             timestamps[name].append(frame.timestamp_ns)
 
@@ -1240,6 +1241,9 @@ def convert_recording(
             "  Warning: bimanual_transform not found in calibration; right wrist extrinsics will be in right_arm_base frame"
         )
 
+    cam_cfg = CameraConfig(CAMERA_CONFIG)
+    flip_cameras = {n for n in cam_cfg.list_camera_names() if cam_cfg.is_upside_down(n)}
+
     # ── extract frames ────────────────────────────────────────────────────
     frame_counts: Dict[str, int] = {}
     camera_infos: Dict[str, Optional[dict]] = {}
@@ -1273,7 +1277,7 @@ def convert_recording(
                 pre_counts[name] = len(list(rgb_dir_check.glob("*.png")))
             else:
                 print(f"  Pre-scanning {svo_path.name} ...")
-                pre_counts[name] = _count_svo2_frames(svo_path)
+                pre_counts[name] = _count_svo2_frames(svo_path, cam_cfg.is_mono(name))
                 print(f"    {pre_counts[name]} frames")
         max_frames_svo2 = min(pre_counts.values()) if pre_counts else None
         if max_frames_svo2 is not None:
@@ -1287,7 +1291,8 @@ def convert_recording(
             names=svo2_names,
             rgb_dirs=[seq_dir / "rgb" / n for n in svo2_names],
             depth_dirs=[seq_dir / "depth" / n for n in svo2_names],
-            flips=[n in _FLIP_CAMERAS for n in svo2_names],
+            flips=[n in flip_cameras for n in svo2_names],
+            monos=[cam_cfg.is_mono(n) for n in svo2_names],
             max_frames=max_frames_svo2,
         )
         for name, (ts_arr, info) in sync_results.items():
@@ -1319,7 +1324,7 @@ def convert_recording(
                 cam_timestamps[name] = None
             continue
 
-        flip = name in _FLIP_CAMERAS
+        flip = name in flip_cameras
         print(f"  Extracting {bag_path.name}" + (" (flipped)" if flip else ""))
         ts_arr, info = _extract_bag(
             bag_path, rgb_dir, depth_dir, flip=flip, max_frames=bag_max
@@ -1414,7 +1419,6 @@ def convert_recording(
     cameras = list(frame_counts.keys())
 
     # ── wrist camera → joint key mapping from camera config roles ─────────
-    cam_cfg = CameraConfig(CAMERA_CONFIG)
     wrist_camera_joint_keys: Dict[str, str] = {
         name: _ROLE_TO_JOINT_KEY[role]
         for name in cameras
@@ -1431,7 +1435,7 @@ def convert_recording(
         calib=calib,
         robot_data=robot_data,
         rec_meta=rec_meta,
-        flip_cameras=_FLIP_CAMERAS,
+        flip_cameras=flip_cameras,
         right_base_to_left_base=T_left_base_from_right_base,
         cam_timestamps=cam_timestamps,
         wrist_camera_joint_keys=wrist_camera_joint_keys,

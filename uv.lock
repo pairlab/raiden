@@ -2353,14 +2353,14 @@ wheels = [
 
 [[package]]
 name = "pyzed"
-version = "5.2"
-source = { path = "packages/pyzed-5.2-cp311-cp311-linux_x86_64.whl" }
+version = "5.5"
+source = { path = "packages/pyzed-5.5-cp311-cp311-linux_x86_64.whl" }
 dependencies = [
     { name = "cython" },
     { name = "numpy" },
 ]
 wheels = [
-    { filename = "pyzed-5.2-cp311-cp311-linux_x86_64.whl", hash = "sha256:c236065cc97f7235fb2e73586c0a60b700bb7361ed73252330f8f5a87addc71a" },
+    { filename = "pyzed-5.5-cp311-cp311-linux_x86_64.whl", hash = "sha256:12893e6861c94b8a59c0695d88b55824e95754335dd66923155b5d87de5bde31" },
 ]
 
 [package.metadata]
@@ -2487,7 +2487,7 @@ requires-dist = [
     { name = "pysondb", specifier = ">=1.6.1" },
     { name = "pyspacemouse", specifier = ">=1.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
-    { name = "pyzed", marker = "extra == 'zed'", path = "packages/pyzed-5.2-cp311-cp311-linux_x86_64.whl" },
+    { name = "pyzed", marker = "extra == 'zed'", path = "packages/pyzed-5.5-cp311-cp311-linux_x86_64.whl" },
     { name = "questionary", specifier = ">=2.0" },
     { name = "rerun-sdk", specifier = ">=0.16" },
     { name = "scipy", specifier = ">=1.11" },

@@ -143,10 +143,16 @@ class DemonstrationRecorder:
         # Sequential starts would introduce a per-camera startup offset (e.g.
         # ~50 frames for RealSense due to pipeline restart) that misaligns ZED
         # and bag frames.
+        errors: Dict[str, Exception] = {}
+
         def _start_one(camera) -> None:
             path = self.cameras_dir / f"{camera.name}.{camera.recording_extension}"
             t0 = time.time_ns()
-            camera.start_recording(path)
+            try:
+                camera.start_recording(path)
+            except Exception as exc:
+                errors[camera.name] = exc
+                return
             self._camera_start_times_ns[camera.name] = t0
 
         start_threads = [
@@ -157,6 +163,8 @@ class DemonstrationRecorder:
             t.start()
         for t in start_threads:
             t.join()
+        if errors:
+            raise RuntimeError(f"Camera recording failed to start: {errors}")
 
         # One camera grab thread per camera (naturally rate-limited by SDK)
         for camera in self.cameras:
@@ -289,6 +297,8 @@ class DemonstrationRecorder:
         - ZED cameras override this to return the ZED SDK hardware clock, which
           is on the same clock as the frame timestamps in the SVO2 file.
           Direct interpolation at conversion time requires no correction.
+          A streamed ZED camera's frames carry the sender's clock instead, so
+          the sender's clock must be synced to this host's.
         - RealSense cameras fall back to ``time.time_ns()`` (system wall clock),
           while frame timestamps use the RealSense hardware clock.  The offset
           between the two clocks is measured once per session and stored in

@@ -11,6 +11,16 @@ Maps semantic camera names to hardware serial numbers, camera types, and roles.
         "right_wrist":   {"serial": 14932342,       "type": "zed",        "role": "right_wrist"}
     }
 
+A ZED camera can also be received from the network (``"stream"``, sent by
+``scripts/zed_stream.py``) and be a mono ZED X One (``"mono": true``, no depth)::
+
+    "left_wrist_camera": {"serial": 301058360, "type": "zed", "role": "left_wrist",
+                          "stream": "192.168.50.2:30000", "mono": true}
+
+Other optional keys: ``"resolution"`` (ZED: an ``sl.RESOLUTION`` name, default
+``"HD720"``; RealSense: ``[width, height]``) and ``"upside_down": true`` for a
+camera mounted upside down, whose images are rotated 180° at conversion.
+
 Roles
 -----
 - ``"scene"``       : fixed overhead / scene camera (multiple allowed)
@@ -127,6 +137,16 @@ class CameraConfig:
                 )
             return tuple(int(v) for v in crop)
         return None
+
+    def is_mono(self, name: str) -> bool:
+        """True for a mono ZED camera (ZED X One): opened with ``sl.CameraOne``, no depth."""
+        entry = self.cameras.get(name)
+        return isinstance(entry, dict) and bool(entry.get("mono", False))
+
+    def is_upside_down(self, name: str) -> bool:
+        """True for a camera mounted upside down: its images are rotated 180° at conversion."""
+        entry = self.cameras.get(name)
+        return isinstance(entry, dict) and bool(entry.get("upside_down", False))
 
     def get_resolution(self, name: str) -> Optional[tuple[int, int]]:
         """Return the (width, height) a RealSense camera streams at, or None for other cameras.
@@ -250,7 +270,15 @@ class CameraConfig:
         if cam_type == "zed":
             from raiden.cameras.zed import ZedCamera
 
-            return ZedCamera(name, int(serial), fps=fps)
+            opts = entry if isinstance(entry, dict) else {}
+            return ZedCamera(
+                name,
+                int(serial),
+                fps=fps,
+                stream=opts.get("stream"),
+                mono=self.is_mono(name),
+                resolution=opts.get("resolution", "HD720"),
+            )
 
         if cam_type == "realsense":
             from raiden.cameras.realsense import RealSenseCamera

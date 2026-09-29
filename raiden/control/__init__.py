@@ -29,6 +29,7 @@ def build_interface(
         return OculusInterface(
             ip_address=oculus_ip or None,
             hand_for_left_arm=oculus_hand,
+            hand_for_right_arm="l" if oculus_hand == "r" else "r",
             pos_scale=oculus_pos_scale,
             rot_scale=oculus_rot_scale,
         )

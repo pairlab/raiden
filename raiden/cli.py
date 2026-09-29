@@ -71,7 +71,7 @@ class TeleopCommand:
     """Negate all SpaceMouse rotation axes (spacemouse mode only)"""
 
     oculus_hand: Literal["l", "r"] = "l"
-    """Quest controller driving the left arm (oculus mode; the right arm always uses the right controller)"""
+    """Quest controller driving the left arm (oculus mode; the right arm uses the other controller)"""
 
     oculus_pos_scale: float = 0.7
     """Robot metres per controller metre (oculus mode only)"""
@@ -118,7 +118,7 @@ class RecordCommand:
     """Negate all SpaceMouse rotation axes (spacemouse mode only)"""
 
     oculus_hand: Literal["l", "r"] = "l"
-    """Quest controller driving the left arm (oculus mode; the right arm always uses the right controller)"""
+    """Quest controller driving the left arm (oculus mode; the right arm uses the other controller)"""
 
     oculus_pos_scale: float = 0.7
     """Robot metres per controller metre (oculus mode only)"""

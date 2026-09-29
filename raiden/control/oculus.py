@@ -406,7 +406,7 @@ class OculusInterface(TeleopInterface):
             self._origin[hand] = None
             print(
                 f"\n  [Oculus {H}] CALIBRATION 1/2: hold {_KEYS[hand]['btn']} and move ~20 cm along the "
-                f"ROBOT's +x (straight out from its base), then release. Press {self._calib_buttons} "
+                f"{self._arm(hand)} arm's +x (straight out from its base), then release. Press {self._calib_buttons} "
                 "again to cancel.",
                 flush=True,
             )
@@ -459,8 +459,8 @@ class OculusInterface(TeleopInterface):
         if c["stage"] == "x":
             c.update(stage="y", x=axis, kx=k)
             print(
-                f"  [Oculus {H}] CALIBRATION 2/2: hold {name} and move ~20 cm along the ROBOT's +y "
-                "(its left), then release.",
+                f"  [Oculus {H}] CALIBRATION 2/2: hold {name} and move ~20 cm along the {self._arm(hand)} "
+                "arm's +y (its left), then release.",
                 flush=True,
             )
         elif k == c["kx"]:
@@ -492,6 +492,10 @@ class OculusInterface(TeleopInterface):
         _CALIB_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(_CALIB_FILE, "w") as f:
             json.dump({h: R.tolist() for h, R in self._saved_R.items()}, f)
+
+    def _arm(self, hand: str) -> str:
+        """The arm this controller drives, e.g. "LEFT"; each arm has its own base frame."""
+        return next(side for side, h in self._hand.items() if h == hand).upper()
 
     def _to_robot(self, hand: str, T: np.ndarray) -> np.ndarray:
         R = self._R[hand]

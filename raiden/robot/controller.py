@@ -1124,6 +1124,7 @@ class RobotController:
         q_full = follower.get_joint_pos()
         q_arm = q_full[:6].copy()
         gripper_intent = _binary_gripper(q_full[6])
+        gripper_cmd = float(np.clip(q_full[6], _GRIPPER_MIN_OPENING, 1.0))
         hold_pos: Optional[np.ndarray] = None
         was_paused = False
 
@@ -1148,16 +1149,15 @@ class RobotController:
                 gripper_actual = follower.get_joint_pos()[6]
                 result = target_fn(side, fk(q_arm), gripper_actual)
                 if result is None:
-                    # Hold the virtual pose so the arm stays put without drifting.
-                    cmd = np.append(q_arm, gripper_actual)
+                    # Hold the virtual pose so the arm stays put without drifting, and the
+                    # gripper command: its measured opening would drop a grasp's force.
+                    cmd = np.append(q_arm, gripper_cmd)
                 else:
                     T_target, gripper = result
                     q_arm = ik_step(q_arm, T_target)
                     gripper_intent = _binary_gripper(gripper)
-                    cmd = np.append(
-                        q_arm,
-                        float(np.clip(gripper, _GRIPPER_MIN_OPENING, 1.0)),
-                    )
+                    gripper_cmd = float(np.clip(gripper, _GRIPPER_MIN_OPENING, 1.0))
+                    cmd = np.append(q_arm, gripper_cmd)
                 follower.command_joint_pos(cmd)
                 # Record the operator's intent; the clamp above stays motor-side.
                 self._last_commanded_pos[side] = np.append(cmd[:6], gripper_intent)

@@ -5,8 +5,8 @@ Prints every button edge with the controller's tracking state, plus the interfac
 calibration messages, for `--seconds` (default 40).  A finished calibration is saved to
 ~/.config/raiden/oculus_calibration.json, as in `rd record`.
 
-    uv run python scripts/quest_ready_check.py            # left controller
-    uv run python scripts/quest_ready_check.py --hand r
+    uv run python scripts/quest_ready_check.py            # left controller, left arm
+    uv run python scripts/quest_ready_check.py --hand r   # right controller, right arm
 """
 
 import argparse
@@ -50,9 +50,9 @@ def main() -> None:
     ap.add_argument("--seconds", type=float, default=40.0)
     args = ap.parse_args()
 
-    it = OculusInterface(hand_for_left_arm=args.hand)
+    it = OculusInterface()
     it.open()
-    robot = _NoRobot("left")
+    robot = _NoRobot("right" if args.hand == "r" else "left")
     it.start_ready(robot)
     time.sleep(1.5)  # first OS tracking reading
     print(it.ready_hint)
