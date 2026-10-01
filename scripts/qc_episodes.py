@@ -29,7 +29,7 @@ def main():
     ap.add_argument("task")
     ap.add_argument("--watch", action="store_true", help="keep checking new episodes every 5 s")
     ap.add_argument("--vla", default=str(qc.VLA_DEFAULT), help="vla-benchmark checkout (rig, task JSON)")
-    ap.add_argument("--ref-tips", type=int, nargs=2, default=list(d.ref_tips), help="wrist fingertip rows (blue, black), arm at home")
+    ap.add_argument("--ref-tips", type=int, nargs=2, default=list(d.ref_tips), help="wrist fingertip rows (left, right), arm at home")
     ap.add_argument("--max-tip-px", type=int, default=d.max_tip_px)
     ap.add_argument("--min-wrist-mean", type=float, default=d.min_wrist_mean)
     ap.add_argument("--scene-mean", type=float, nargs=2, default=list(d.scene_mean))

@@ -52,8 +52,8 @@ TASK_JSON = "mesa/task_suites/bddl_files/raiden_lab/croissant_oven_heating_regio
 
 @dataclass
 class QCSettings:
-    ref_tips: Tuple[int, int] = (312, 304)  # wrist fingertip rows (blue, black), arm at home, 2026-09-26 19:05
-    max_tip_px: int = 15
+    ref_tips: Tuple[int, int] = (312, 304)  # wrist fingertip rows (left, right), arm at home, 2026-09-26 19:05
+    max_tip_px: int = 25  # ~2 deg of wrist-camera tilt (15 until 2026-09-30)
     min_wrist_mean: float = 100.0
     scene_mean: Tuple[float, float] = (90.0, 140.0)
     max_pause: float = 1.0
@@ -118,24 +118,35 @@ def first_frame(bag: Path, name: str, crop) -> Optional[np.ndarray]:
 
 
 def fingertips(img: np.ndarray) -> List[Optional[Tuple[int, int]]]:
-    """[blue-finger tip, black-finger tip] as (row, col), None where not found."""
+    """[left-finger tip, right-finger tip] as (row, col), None where not found. Each finger enters its own half of the
+    frame from the bottom. Both fingers are black since 2026-09-30; the left one was blue before, still matched so old
+    episodes check the same."""
     b, g, r = [img[..., i].astype(np.int32) for i in range(3)]
-    blue = (b - r > 60) & (b - g > 20) & (b > 110)  # the blue finger enters bottom left
-    dark = img.max(2) < 45  # the black finger enters bottom right
+    finger = (img.max(2) < 45) | ((b - r > 60) & (b - g > 20) & (b > 110))
+    h, w = finger.shape
     tips: List[Optional[Tuple[int, int]]] = []
-    for mask, right in ((blue, False), (dark, True)):
-        m = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    for c0, c1 in ((0, w // 2), (w // 2, w)):
+        m = cv2.morphologyEx(finger[:, c0:c1].astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
         n, lab, st, _ = cv2.connectedComponentsWithStats(m)
-        h, w = m.shape
-        cands = [k for k in range(1, n) if st[k, 4] > 800 and st[k, 1] + st[k, 3] >= h - 2
-                 and ((st[k, 0] + st[k, 2] > w // 2) if right else st[k, 0] < w // 2)]
+        cands = [k for k in range(1, n) if st[k, 4] > 800 and st[k, 1] + st[k, 3] >= h - 2]
         if not cands:
             tips.append(None)
             continue
         k = max(cands, key=lambda k: st[k, 4])
         ys, xs = np.nonzero(lab == k)
-        tips.append((int(ys.min()), int(xs[ys.argmin()])))
+        tips.append((int(ys.min()), int(xs[ys.argmin()]) + c0))
     return tips
+
+
+def tip_reasons(tips: List[Optional[Tuple[int, int]]], st: "QCSettings") -> List[str]:
+    """Why the fingertips say the wrist camera slipped: a tip found off its reference row by more than max_tip_px, or
+    neither tip found. One finger alone may be hidden or missed; the other still shows where the camera points."""
+    out = [f"wrist: {label} tip row {tip[0]} vs {ref} (camera slipped?)"
+           for label, tip, ref in zip(("left", "right"), tips, st.ref_tips)
+           if tip is not None and abs(tip[0] - ref) > st.max_tip_px]
+    if all(t is None for t in tips):
+        out.append("wrist: no fingertip found (camera slipped?)")
+    return out
 
 
 def croissant_position(img: np.ndarray, geo: Geometry) -> Optional[Tuple[float, float, int]]:
@@ -354,13 +365,9 @@ def check(ep: Path, task: str, geo: Geometry, cfg: CameraConfig, st: QCSettings,
         r["reasons"].append("wrist bag unreadable")
     else:
         r["wrist_mean"] = round(float(w.mean()), 1)
-        tb, tk = fingertips(w)
-        r["wrist_tips"] = [tb[0] if tb else None, tk[0] if tk else None]
-        for label, tip, ref in (("blue", tb, st.ref_tips[0]), ("black", tk, st.ref_tips[1])):
-            if tip is None:
-                r["reasons"].append(f"wrist: {label} fingertip not found (camera slipped?)")
-            elif abs(tip[0] - ref) > st.max_tip_px:
-                r["reasons"].append(f"wrist: {label} tip row {tip[0]} vs {ref} (camera slipped?)")
+        tips = fingertips(w)
+        r["wrist_tips"] = [t[0] if t else None for t in tips]
+        r["reasons"] += tip_reasons(tips, st)
         if r["wrist_mean"] < st.min_wrist_mean:
             r["reasons"].append(f"wrist brightness {r['wrist_mean']:.0f} < {st.min_wrist_mean:.0f} (camera slipped?)")
     s = first_frame(ep / "cameras/scene_camera.bag", "scene_camera", cfg.get_crop("scene_camera"))

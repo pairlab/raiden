@@ -396,9 +396,8 @@ class RecordUI:
         wl = self._state.get("live", {}).get("wrist")
         if check:
             tips = qc.fingertips(raw)
-            ok = [t is not None and abs(t[0] - r_) <= self._settings.max_tip_px for t, r_ in zip(tips, ref)]
-            wl = dict(tips=[list(t) if t else None for t in tips], ok=all(ok), mean=round(raw_mean, 1),
-                      bright_ok=raw_mean >= self._settings.min_wrist_mean)
+            wl = dict(tips=[list(t) if t else None for t in tips], ok=not qc.tip_reasons(tips, self._settings),
+                      mean=round(raw_mean, 1), bright_ok=raw_mean >= self._settings.min_wrist_mean)
             live["wrist"] = wl
         if wl:
             for t in wl["tips"]:

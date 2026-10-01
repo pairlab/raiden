@@ -2425,6 +2425,7 @@ name = "raiden"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "boto3" },
     { name = "chiral" },
     { name = "i2rt" },
@@ -2467,6 +2468,7 @@ zed = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.14" },
     { name = "boto3", specifier = ">=1.42.66" },
     { name = "chiral", git = "https://github.com/TRI-ML/chiral" },
     { name = "i2rt", directory = "third_party/i2rt" },
