@@ -216,19 +216,33 @@ class CudaGraphSampler:
 
 
 def run_episode(
-    client, model, shape_meta, hz: float, temporal_agg: bool, binary_gripper: bool
-) -> None:
+    client,
+    model,
+    shape_meta,
+    hz: float,
+    temporal_agg: bool,
+    binary_gripper: bool,
+    stop: threading.Event | None = None,
+    max_steps: int | None = None,
+    watch_stdin: bool = True,
+) -> dict:
+    """Run one episode; returns counts and the per-plan obs / inference times (ms).
+
+    ``stop`` lets the caller end the episode (Ctrl-C still sets it), ``max_steps``
+    ends it after that many actions, and ``watch_stdin=False`` leaves the keyboard
+    to the caller instead of ending on Enter.
+    """
     period = 1.0 / hz
     model.reset()
     plan: list[np.ndarray] = []
     obs_ms, infer_ms = [], []
     sent = dropped = sent_log = 0
     t_start = t_log = time.perf_counter()
-    stop = threading.Event()
+    stop = stop if stop is not None else threading.Event()
     previous_handler = signal.signal(signal.SIGINT, lambda *_: stop.set())
     try:
-        while not stop.is_set():
-            if enter_pressed():
+        while not stop.is_set() and (max_steps is None or sent < max_steps):
+            if watch_stdin and enter_pressed():
                 print("Enter pressed.")
                 break
             if not plan:
@@ -288,6 +302,13 @@ def run_episode(
             f"{dropped} late actions dropped; infer p50 {np.median(infer_ms):.1f} "
             f"p99 {np.percentile(infer_ms, 99):.1f} max {max(infer_ms):.1f}ms"
         )
+    return {
+        "sent": sent,
+        "dropped": dropped,
+        "elapsed_s": elapsed,
+        "obs_ms": obs_ms,
+        "infer_ms": infer_ms,
+    }
 
 
 def main() -> None:
