@@ -215,6 +215,34 @@ class CudaGraphSampler:
         return self.out.cpu().numpy()
 
 
+# rd serve interpolates every joint state to this camera's capture time (server.py
+# _get_reference_camera), as the converter does for the training data.
+REF_CAMERA = "scene_camera"
+
+
+MAX_CAPTURE_AGE_S = 0.5  # older than this is not a live frame: fall back to the fetch time
+_age_warned = set()
+
+
+def capture_age_s(obs) -> float | None:
+    """Seconds since the observation's reference frame was captured, or None if the
+    observation carries no usable capture time. rd serve stamps frames with the
+    RealSense global-time device timestamp in host-epoch ns; chiral's default (and
+    the mock's) is monotonic seconds, which says nothing about the wall clock."""
+    try:
+        ts = float(obs[REF_CAMERA].timestamp or 0.0)
+    except (KeyError, TypeError, ValueError):
+        ts = 0.0
+    age = time.time() - ts / 1e9 if ts > 1e17 else None  # host-epoch ns only
+    if age is None or not 0.0 <= age <= MAX_CAPTURE_AGE_S:
+        why = "no host-epoch capture timestamp" if age is None else f"capture age {age:.3f} s"
+        if why.split(" ")[0] not in _age_warned:
+            _age_warned.add(why.split(" ")[0])
+            print(f"from_capture: {why}; timing this observation from its fetch instead")
+        return None
+    return age
+
+
 def run_episode(
     client,
     model,
@@ -225,17 +253,26 @@ def run_episode(
     stop: threading.Event | None = None,
     max_steps: int | None = None,
     watch_stdin: bool = True,
+    from_capture: bool = False,
 ) -> dict:
     """Run one episode; returns counts and the per-plan obs / inference times (ms).
 
     ``stop`` lets the caller end the episode (Ctrl-C still sets it), ``max_steps``
     ends it after that many actions, and ``watch_stdin=False`` leaves the keyboard
     to the caller instead of ending on Enter.
+
+    ``from_capture``: time the plan from the observation's capture (the reference
+    camera's frame timestamp, which the joint states are interpolated to, as in
+    the training data), not from when the client fetched it. Plan step k is due k
+    periods after the capture: without temporal aggregation the steps already due
+    when the plan arrives are dropped; with it, the blend for the step due next is
+    sent (``steps_ahead`` = 1 + the periods elapsed since the capture). Default off:
+    the observation is taken as current when fetched.
     """
     period = 1.0 / hz
     model.reset()
     plan: list[np.ndarray] = []
-    obs_ms, infer_ms = [], []
+    obs_ms, infer_ms, age_ms, ahead_log = [], [], [], []
     sent = dropped = sent_log = 0
     t_start = t_log = time.perf_counter()
     stop = stop if stop is not None else threading.Event()
@@ -249,23 +286,37 @@ def run_episode(
                 t0 = time.perf_counter()
                 obs = client.get_obs()
                 t1 = time.perf_counter()
+                # The observation shows the world at t_obs: its capture, or (default) its fetch.
+                age = capture_age_s(obs) if from_capture else None
+                t_obs = t0 if age is None else t1 - age
                 inputs = to_model_input(obs, shape_meta)
                 if temporal_agg:
-                    plan = [model.get_action(**inputs, steps_ahead=1)[0]]
+                    ahead = 1
+                    if from_capture:  # the step due next at the expected send time
+                        infer_est = np.median(infer_ms[-8:]) / 1e3 if infer_ms else 0.0
+                        ahead = min(max(1, 1 + int((t1 + infer_est - t_obs) / period)), model.chunk_size - 1)
+                    plan = [model.get_action(**inputs, steps_ahead=ahead)[0]]
                 else:
                     chunk = model.get_action(**inputs, return_full_chunk=True)[0]
                     plan = list(chunk[1 : model.action_horizon + 1])
                 t2 = time.perf_counter()
                 obs_ms.append((t1 - t0) * 1e3)
                 infer_ms.append((t2 - t1) * 1e3)
+                age_ms.append((t1 - t_obs) * 1e3)
                 if not np.isfinite(plan).all():
                     print("Non-finite action; stopping.")
                     break
-                # plan[k] is due k periods after the observation; drop the ones already due.
-                late = min(int((t2 - t0) / period), len(plan))
+                if temporal_agg:
+                    # The blend was chosen for its due time; drop it only if inference ran over a period.
+                    ahead_log.append(ahead)
+                    late = min(int((t2 - t0) / period), len(plan))
+                    next_tick = t0 + late * period
+                else:
+                    # plan[k] (chunk step k + 1) goes out k periods after t_obs; drop the ones already past.
+                    late = min(int((t2 - t_obs) / period), len(plan))
+                    next_tick = t_obs + late * period
                 dropped += late
                 del plan[:late]
-                next_tick = t0 + late * period
                 if not plan:
                     continue
 
@@ -308,6 +359,8 @@ def run_episode(
         "elapsed_s": elapsed,
         "obs_ms": obs_ms,
         "infer_ms": infer_ms,
+        "age_ms": age_ms,  # capture (or fetch) to fetch done, per plan
+        "steps_ahead": ahead_log,  # temporal aggregation: the blend step sent, per plan
     }
 
 
