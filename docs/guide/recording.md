@@ -231,3 +231,92 @@ aws configure
 >
 > - Reduce recording duration where possible.
 > - Ensure the recording disk has sufficient free space before starting a session.
+
+## Local Isaac collection
+
+Launch `mesa_isaac/scripts/raiden_sim_server.py` in the Isaac environment with
+its accepted calibration and placement ID (see `mesa_isaac/README.md`). Then
+run Raiden in its own environment:
+
+```bash
+rd record --control oculus --arms single --sim 127.0.0.1:5599 --data-dir data/isaac --monitor
+```
+
+The standard Quest path uses six absolute joint targets and normalized aperture
+(1 = open). Each simulation reset starts an episode. Quest B/Y, the middle pedal,
+or Enter saves it and resets; Quest A/X, the right pedal, or `r` discards it and
+resets. `q` discards the active episode and ends the session. Quest calibration
+discards the active episode and starts a fresh reset after calibration finishes.
+Saving is the operator's label; the Isaac task checker is disabled. The monitor
+shows the calibrated scene and wrist cameras. `--ui` falls back to the terminal
+workflow for simulated collection.
+
+Isaac recordings retain native frames and full scene/controller state. Their
+raw layout includes:
+
+```text
+<episode>/
+    robot_data.npz                 # ~100 Hz sampled robot observations/commands
+    calibration_results.json       # episode rig calibration, not the live hardware file
+    sim_rig.json                   # camera intrinsics and optical transforms
+    sim_metadata.json              # backend/package versions, scene/twin hashes, settings
+    sim_initial_state.json         # physical/controller state before the first logged tick
+    sim_action_log.npz             # every physics tick, requested/effective targets and clocks
+    sim_action_events.jsonl         # native incoming command events, timing and clamp results
+    sim_action_states.jsonl         # high-rate portable physical/controller state history
+    sim_action_metadata.json
+    cameras/<name>.simrec/
+        timestamps.npy             # original native capture timestamps
+        camera_info.json
+        camera_poses.npy           # matching T_base_cam, OpenCV optical convention
+        sim_state.jsonl            # full scene/controller snapshot behind each frame
+        rgb/0000000000.png          # lossless BGR PNGs, frames mode only
+```
+
+To defer storing pixels, add `--sim-record-mode states`. Live monitoring still
+uses the server's camera frames. With the matching Isaac server running,
+materialize the pixels afterwards, then convert the episode normally:
+
+```bash
+python scripts/isaac_replay.py data/isaac/raw/<task>/0000 --mode states --rerender
+rd convert --data-dir data/isaac
+```
+
+`rd convert` selects successful demonstrations from the database under that
+root. To convert one explicit episode directly, use the Python API (replace
+`<task>` with the recorded task name):
+
+```bash
+python -c "from raiden.converter import convert_recording; convert_recording('data/isaac/raw/<task>/0000')"
+```
+
+Rerender restores each recorded physical state and checks its optical camera
+pose against the capture. It rejects scene, calibration, twin, physics backend,
+step size, or controller metadata changes. For a deliberate calibration/scene
+experiment, use `--allow-scene-change --out /tmp/rerender_experiment`; this keeps
+the original captures and poses intact. Rerendering does not replay dynamics.
+RTX lighting/temporal accumulation can produce small RGB differences even when
+camera poses and restored physical states agree.
+
+To test dynamics, replay the original native per-tick target log instead:
+
+```bash
+python scripts/isaac_replay.py data/isaac/raw/<task>/0000 --mode commands --repeat 2 --out /tmp/isaac_replay
+```
+
+This checks that tick times are contiguous from the saved initial state and
+applies every target with the original hold interval. Its optional traces retain
+all portable scene fields for calibration analysis; the per-frame training
+export remains separate. Isaac's portable state restores physical state,
+controller latches and gains, but does not include solver/contact warmstarts.
+The replay reports variation across repeats rather than promising bit-identical
+physics. Replay restores the prior server state and leaves the server paused;
+resume it explicitly through the simulator before starting another collection.
+Use `scripts/sim_replay.py` for MuJoCo episodes. These two replay scripts only
+address simulator RPC servers; `rd replay` is the separate hardware workflow.
+
+For a recording smoke test without a headset, use a temporary data root:
+
+```bash
+python scripts/sim_scripted_episode.py --sim 127.0.0.1:5599 --seconds 3 --out /tmp/isaac_record_smoke
+```

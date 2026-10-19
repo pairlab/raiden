@@ -192,6 +192,9 @@ def make_guides(cameras, *, sim: str = "") -> GraspGuides:
                 size=size,
             )
             continue
+        if "T_grasp_cam" in entry:
+            guides.add_camera(name, K, T_tool_cam=np.asarray(entry["T_grasp_cam"]), size=size)
+            continue
         if "T_tool_cam" in entry:
             guides.add_camera(
                 name,

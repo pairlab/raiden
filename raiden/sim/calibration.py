@@ -12,6 +12,7 @@ from typing import Dict
 import numpy as np
 
 from raiden.sim.client import SimConnection
+from raiden.sim.serialization import write_json
 
 
 def _grasp_from_tcp(T_tcp_cam: np.ndarray) -> np.ndarray:
@@ -91,29 +92,28 @@ def base_in_world(
 def sim_calibration(rig: dict) -> dict:
     cams = rig["cameras"]
     out = {
-        "source": "mesa digital twin (rig.json)",
+        "source": rig.get("calibration_source", "mesa digital twin (rig.json)"),
+        "backend": rig.get("backend", "mujoco"),
         "cameras": {},
-        "table": {"T_base_table": table_pose(rig["layout"]).tolist()},
+        "table": rig["table"] if "table" in rig else {"T_base_table": table_pose(rig["layout"]).tolist()},
     }
     for name, cam in cams.items():
         if "T_base_cam" in cam:
             T = np.asarray(cam["T_base_cam"], dtype=np.float64)
-            out["cameras"][name] = {
-                "extrinsics": {
-                    "success": True,
-                    "rotation_matrix": T[:3, :3].tolist(),
-                    "translation_vector": T[:3, 3].tolist(),
-                }
-            }
+            method = "extrinsics"
+        elif "T_grasp_cam" in cam:
+            T = np.asarray(cam["T_grasp_cam"], dtype=np.float64)
+            method = "hand_eye_calibration"
         elif "T_tool_cam" in cam:
             T = _grasp_from_tcp(np.asarray(cam["T_tool_cam"], dtype=np.float64))
-            out["cameras"][name] = {
-                "hand_eye_calibration": {
-                    "success": True,
-                    "rotation_matrix": T[:3, :3].tolist(),
-                    "translation_vector": T[:3, 3].tolist(),
-                }
-            }
+            method = "hand_eye_calibration"
+        else:
+            continue
+        out["cameras"][name] = {method: {
+            "success": True,
+            "rotation_matrix": T[:3, :3].tolist(),
+            "translation_vector": T[:3, 3].tolist(),
+        }}
     return out
 
 
@@ -125,14 +125,19 @@ def write_sim_calibration(dest_dir: Path, rig: dict) -> Path:
 
 
 def write_sim_files(dest_dir: Path, address: str) -> None:
-    """Write ``calibration_results.json`` and ``sim_model.xml`` for a sim recording.
+    """Copy episode rig/calibration and the backend's replay description.
 
-    ``sim_model.xml`` is the MuJoCo model that the per-frame states in the camera recordings'
-    ``sim_state.npz`` replay in.
+    Isaac uses ``sim_metadata.json`` with immutable asset/calibration identifiers;
+    MuJoCo uses its self-contained ``sim_model.xml``.
     """
     conn = SimConnection(address)
     try:
-        write_sim_calibration(dest_dir, conn.call("get_rig"))
-        (Path(dest_dir) / "sim_model.xml").write_text(conn.call("get_model_xml"))
+        rig = conn.call("get_rig")
+        write_sim_calibration(dest_dir, rig)
+        write_json(Path(dest_dir) / "sim_rig.json", rig)
+        if rig.get("backend") == "isaac":
+            write_json(Path(dest_dir) / "sim_metadata.json", conn.call("get_metadata"))
+        else:
+            (Path(dest_dir) / "sim_model.xml").write_text(conn.call("get_model_xml"))
     finally:
         conn.close()

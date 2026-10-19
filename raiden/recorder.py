@@ -895,7 +895,7 @@ def _run_sim_episodes(
                 last_saved, n_saved = saved_dir, n_saved + 1
                 print(f"✓ Saved as success → {saved_dir}  ({n_saved} this session)")
                 task.poll(force=True)
-                if not task.status.get("success"):
+                if task.status.get("enabled", True) and not task.status.get("success"):
                     print("  Note: the sim does not score this episode a success.")
             else:
                 recorder.discard()
@@ -948,6 +948,7 @@ def run_recording(
     monitor_view: str = "",
     monitor_web: bool = False,
     sim_fps: int = 30,
+    sim_record_mode: str = "frames",
     ui: bool = False,
     ui_port: int = 8765,
     ui_host: str = "127.0.0.1",
@@ -1054,7 +1055,7 @@ def run_recording(
         if sim:
             from raiden.sim import load_sim_cameras
 
-            cameras = load_sim_cameras(sim, camera_config_file, fps=sim_fps)
+            cameras = load_sim_cameras(sim, camera_config_file, fps=sim_fps, record_mode=sim_record_mode)
         else:
             cameras = load_cameras_from_config(camera_config_file)
     except Exception as e:
@@ -1078,11 +1079,8 @@ def run_recording(
         except Exception as exc:
             print(f"  grasp guides unavailable ({type(exc).__name__}: {exc})")
             guides = None
-        # Sim: operator views (default ``operator`` and ``topdown``) take the scene camera's
-        # panel; the wrist camera stays.  Display only -- what is recorded does not change.
-        view = {"": "operator,topdown" if sim else "", "none": ""}.get(
-            monitor_view, monitor_view
-        )
+        default_view = "operator,topdown" if sim and cameras[0].backend != "isaac" else ""
+        view = {"": default_view, "none": ""}.get(monitor_view, monitor_view)
         shown = [c.name for c in cameras if not view or "wrist" in c.name]
         live_monitor = make_monitor(
             shown, sim=sim, view=view, web=monitor_web, guides=guides

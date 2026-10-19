@@ -30,6 +30,12 @@ OBJ_TOL_M = 0.005
 
 def load_episode(ep_dir: Path, camera: str) -> dict:
     """Recorded camera-frame states and success flags, and the per-tick commands."""
+    metadata = ep_dir / "sim_metadata.json"
+    if metadata.exists():
+        import json
+        if json.loads(metadata.read_text()).get("backend") == "isaac":
+            sys.exit("This is an Isaac episode; use scripts/isaac_replay.py. "
+                     "scripts/sim_replay.py restores MuJoCo states only.")
     simrec = ep_dir / "cameras" / f"{camera}.simrec" / "sim_state.npz"
     if not simrec.exists():
         sys.exit(f"{simrec} not found: is {ep_dir} a sim episode?")

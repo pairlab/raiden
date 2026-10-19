@@ -364,13 +364,7 @@ def _extract_simrec(
     model_xml: Path,
     T_world_base: Optional[np.ndarray],
 ) -> Tuple[np.ndarray, Optional[dict]]:
-    """Write a :class:`raiden.sim.SimCamera` recording into the sequence layout.
-
-    ``sim_dir`` holds ``timestamps.npy`` (host ns), ``camera_info.json`` and ``sim_state.npz``,
-    the state each frame was rendered from.  The frames, color and depth, are rendered again
-    from those states in ``model_xml`` (the episode's ``sim_model.xml``), and each frame's
-    camera pose is read from the same state into ``rgb_dir/camera_poses.npy``.
-    """
+    """Extract retained Isaac RGB/poses or render MuJoCo snapshots into the sequence."""
     ts_path = sim_dir / "timestamps.npy"
     ts_arr = (
         np.load(str(ts_path)).astype(np.int64)
@@ -383,7 +377,32 @@ def _extract_simrec(
         with open(info_path) as f:
             info = json.load(f)
     rgb_dir.parent.mkdir(parents=True, exist_ok=True)
-    if (sim_dir / "sim_state.npz").exists():
+    if (sim_dir / "sim_state.jsonl").exists():
+        rows = [json.loads(line) for line in (sim_dir / "sim_state.jsonl").read_text().splitlines() if line.strip()]
+        if len(rows) != len(ts_arr) or not np.array_equal([row["t_ns"] for row in rows], ts_arr):
+            raise ConversionError(f"{sim_dir.name}: camera timestamps and state snapshots disagree")
+        raw_rgb = sim_dir / "rgb"
+        images = sorted(raw_rgb.glob("[0-9]*.png"))
+        if len(images) != len(ts_arr):
+            raise ConversionError(
+                f"{sim_dir.name}: {len(ts_arr)} Isaac states but {len(images)} RGB frames; "
+                "run `python scripts/isaac_replay.py <episode> --mode states --rerender` "
+                "against the matching Isaac server before conversion"
+            )
+        poses_path = sim_dir / _POSES_FILE
+        if not poses_path.exists():
+            raise ConversionError(f"{sim_dir.name}: missing exact recorded camera poses")
+        poses = np.load(poses_path, allow_pickle=False)
+        if poses.shape != (len(ts_arr), 4, 4) or not np.isfinite(poses).all():
+            raise ConversionError(f"{sim_dir.name}: invalid recorded camera poses")
+        rgb_dir.mkdir(parents=True, exist_ok=True)
+        for i, source in enumerate(images):
+            if source.name != f"{i:010d}.png":
+                raise ConversionError(f"{sim_dir.name}: missing RGB frame {i}")
+            shutil.copyfile(source, rgb_dir / source.name)
+        np.save(rgb_dir / _POSES_FILE, poses.astype(np.float32))
+        print(f"    {len(images)} recorded Isaac frames copied with their exact camera poses")
+    elif (sim_dir / "sim_state.npz").exists():
         from raiden.sim.render import render_states
 
         if not model_xml.exists() or info is None:
@@ -443,16 +462,28 @@ def _sim_base_frame(
 
 
 def _load_sim_log(simrec_dirs: List[Path]) -> Optional[Dict[str, np.ndarray]]:
-    """Merge every sim camera's ``sim_state.npz`` into one log sorted by time.
-
-    Each file holds the state its camera's frames were rendered from, so the reference camera's
-    frames find their own snapshot exactly.
-    """
-    parts = [
-        dict(np.load(d / "sim_state.npz"))
-        for d in simrec_dirs
-        if (d / "sim_state.npz").exists()
-    ]
+    """Merge native JSONL or MuJoCo NPZ snapshots, preserving their capture times."""
+    parts = []
+    for directory in simrec_dirs:
+        state_file = directory / "sim_state.jsonl"
+        if state_file.exists():
+            rows = [json.loads(line) for line in state_file.read_text().splitlines() if line.strip()]
+            if not rows:
+                continue
+            objects = list(rows[0].get("objects", {}))
+            subtasks = rows[0].get("subtasks", [])
+            parts.append(dict(
+                t_ns=np.asarray([row["t_ns"] for row in rows], dtype=np.int64),
+                state=np.asarray([row["state"] for row in rows], dtype=object),
+                objects=np.asarray(objects),
+                object_poses=np.asarray([[row.get("objects", {})[name] for name in objects] for row in rows]),
+                subtasks=np.asarray(subtasks),
+                subtask_done=np.asarray([row.get("subtasks_done", []) for row in rows], dtype=bool),
+                success=np.asarray([row.get("success", False) for row in rows], dtype=bool),
+            ))
+        elif (directory / "sim_state.npz").exists():
+            with np.load(directory / "sim_state.npz", allow_pickle=False) as log:
+                parts.append(dict(log))
     if not parts:
         return None
     order = np.argsort(np.concatenate([p["t_ns"] for p in parts]), kind="stable")
@@ -690,8 +721,8 @@ def _build_lowdim(
                              ``table.T_base_table``; identity when the calibration has none.
 
     Sim recordings add, from the snapshot rendered nearest to the frame (see ``_load_sim_log``):
-    ``sim_state``            (1 + nq + nv,) float64  MuJoCo ``[time, qpos, qvel]``; replay it in
-                             the episode's ``sim_model.xml`` to re-render from any camera.
+    ``sim_state``            MuJoCo: ``[time, qpos, qvel]`` float64; Isaac: portable scene/controller dict.
+                             Raw native action events and state histories remain separate from this export.
     ``object_poses``         dict[str → (4, 4) float32]  task objects in the left_arm_base frame.
     ``subtasks``             dict[str → bool]  BDDL subtask predicates, in task order.
     ``success``              bool  task goal satisfied.
@@ -996,8 +1027,11 @@ def _build_lowdim(
         and int(sim_ref_ts[0]) > _WALL_CLOCK_MIN_NS
     ):
         t = sim_log["t_ns"]
-        j = np.clip(np.searchsorted(t, sim_ref_ts), 1, len(t) - 1)
-        sim_idx = np.where(sim_ref_ts - t[j - 1] <= t[j] - sim_ref_ts, j - 1, j)
+        if len(t) == 1:
+            sim_idx = np.zeros(len(sim_ref_ts), dtype=int)
+        else:
+            j = np.clip(np.searchsorted(t, sim_ref_ts), 1, len(t) - 1)
+            sim_idx = np.where(sim_ref_ts - t[j - 1] <= t[j] - sim_ref_ts, j - 1, j)
         gap_ms = np.abs(t[sim_idx] - sim_ref_ts).max() / 1e6
         print(f"  sim state: nearest snapshot at most {gap_ms:.1f} ms from its frame")
 
@@ -1336,7 +1370,7 @@ def convert_recording(
             cam_timestamps[name] = None
         print(f"  ✓ {name}: {len(ts_arr)} frames\n")
 
-    # Simulated cameras store the state of each frame, not its pixels; render them.
+    # Extract native Isaac frames or render MuJoCo states.
     sim_base = _sim_base_frame(simrec_dirs, rec_path / "sim_model.xml", calib)
     for sim_dir in simrec_dirs:
         name = sim_dir.stem
@@ -1441,6 +1475,12 @@ def convert_recording(
     if (rec_path / "sim_model.xml").exists():
         shutil.copy(rec_path / "sim_model.xml", seq_dir / "sim_model.xml")
         print("  ✓ sim_model.xml")
+    for filename in ("sim_metadata.json", "sim_rig.json", "sim_initial_state.json",
+                     "sim_action_log.npz", "sim_action_events.jsonl", "sim_action_states.jsonl",
+                     "sim_action_metadata.json", "sim_rerender_metadata.json"):
+        source = rec_path / filename
+        if source.exists():
+            shutil.copyfile(source, seq_dir / filename)
 
     # ── sequence metadata ─────────────────────────────────────────────────
     _build_sequence_metadata(seq_dir, cameras, frame_counts, rec_meta, camera_infos)
@@ -1455,8 +1495,10 @@ def convert_recording(
         print("  ✓ metadata_shared.json")
 
         if calib_path.exists():
-            shutil.copy(calib_path, rec_path / "calibration_results.json")
-            print(f"  ✓ calibration_results.json (copied from {calib_path})")
+            destination = rec_path / "calibration_results.json"
+            if calib_path.resolve() != destination.resolve():
+                shutil.copy(calib_path, destination)
+            print(f"  ✓ calibration_results.json ({calib_path})")
         else:
             print(f"  Warning: calibration_results.json not found at {calib_path}")
 

@@ -140,10 +140,8 @@ class RecordCommand:
     """Show the frames being recorded live in Rerun (plus the task panel when --sim)"""
 
     monitor_view: str = ""
-    """Sim only: operator views (comma-separated) shown in place of the scene camera, never
-    recorded. Default operator,topdown (behind the arm base, and above the table); also
-    leftshoulder (MESA's), rightshoulder, midshoulder, egocentric, agentview, behindview,
-    frontview, birdview, sideview; 'none' shows the scene camera. Implies --monitor"""
+    """MuJoCo operator views, comma-separated; default operator,topdown. Isaac defaults
+    to its calibrated scene and wrist cameras. 'none' shows recorded cameras. Implies --monitor"""
 
     monitor_web: bool = False
     """Serve the monitor in a browser (Rerun) instead of the local OpenCV window"""
@@ -151,6 +149,9 @@ class RecordCommand:
     sim_fps: int = 30
     """Sim only: camera rate. 30 matches the real D435 so sim and real episodes have the
     same temporal density; raise it to collect faster if the server can render that fast"""
+
+    sim_record_mode: Literal["frames", "states"] = "frames"
+    """Isaac only: retain rendered RGB, or save states and rerender afterwards with scripts/isaac_replay.py"""
 
     ui: bool = False
     """Run the session from a browser page: task and teacher, live views with the placement
@@ -529,6 +530,7 @@ def main():
                 monitor_view=command.monitor_view,
                 monitor_web=command.monitor_web,
                 sim_fps=command.sim_fps,
+                sim_record_mode=command.sim_record_mode,
                 ui=command.ui,
                 ui_port=command.ui_port,
                 ui_host=command.ui_host,

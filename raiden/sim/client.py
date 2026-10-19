@@ -34,8 +34,8 @@ class SimConnection:
             self._conn = Client((host, port), authkey=_AUTHKEY)
         except ConnectionRefusedError as exc:
             raise ConnectionRefusedError(
-                f"no raiden sim server at {host}:{port}; start it in the MESA repo with "
-                "`DISPLAY=:0 MUJOCO_GL=glfw uv run python scripts/raiden_sim_server.py`"
+                f"no raiden sim server at {host}:{port}; start the MuJoCo MESA server or "
+                "mesa_isaac/scripts/raiden_sim_server.py in its Isaac environment"
             ) from exc
         self._lock = threading.Lock()
 

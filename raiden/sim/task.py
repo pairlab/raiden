@@ -73,7 +73,10 @@ class TaskMonitor:
         for subtask, done in zip(self.status["subtasks"], self.status["done"]):
             lines.append(f"- [{'x' if done else ' '}] {subtask}")
         lines.append("")
-        lines.append("**SUCCESS**" if self.status["success"] else "_in progress_")
+        if not self.status.get("enabled", True):
+            lines.append("_manual collection; task scoring disabled_")
+        else:
+            lines.append("**SUCCESS**" if self.status["success"] else "_in progress_")
         return "\n".join(lines)
 
     def close(self) -> None:

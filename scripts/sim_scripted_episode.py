@@ -12,7 +12,6 @@ it and, if lerobot is installed, exports it. Start the MESA server first:
 from __future__ import annotations
 
 import argparse
-import shutil
 import time
 from pathlib import Path
 
@@ -21,7 +20,7 @@ import numpy as np
 from raiden._config import CAMERA_CONFIG
 from raiden.recorder import DemonstrationRecorder
 from raiden.robot.controller import RobotController
-from raiden.sim import load_sim_cameras, write_sim_files
+from raiden.sim import ActionLog, load_sim_cameras, write_sim_files
 
 
 class _ScriptedInterface:
@@ -40,6 +39,8 @@ def main() -> None:
     )
     ap.add_argument("--seconds", type=float, default=8.0)
     ap.add_argument("--export", action="store_true", help="also export to LeRobot")
+    ap.add_argument("--no-convert", action="store_true", help="retain only the raw episode")
+    ap.add_argument("--sim-record-mode", choices=("frames", "states"), default="frames")
     ap.add_argument(
         "--sim-fps", type=int, default=30, help="camera rate (30 = real D435)"
     )
@@ -57,7 +58,7 @@ def main() -> None:
     task = "sim_smoke"
     rec_dir = Path(args.out) / "raw" / task / "0000"
     if rec_dir.exists():
-        shutil.rmtree(rec_dir)
+        ap.error(f"{rec_dir} already exists; choose a fresh --out directory")
 
     rc = RobotController(
         use_right_leader=False,
@@ -67,7 +68,7 @@ def main() -> None:
         sim=args.sim,
     )
     rc.setup_for_teleop_recording()
-    cameras = load_sim_cameras(args.sim, CAMERA_CONFIG, fps=args.sim_fps)
+    cameras = load_sim_cameras(args.sim, CAMERA_CONFIG, fps=args.sim_fps, record_mode=args.sim_record_mode)
 
     # Scripted EE path in the arm base frame: lift 10 cm and reach 10 cm forward over 3 s,
     # hold, close the gripper at 3 s and open it again at 6 s.
@@ -108,14 +109,20 @@ def main() -> None:
         interface=_ScriptedInterface(),
         extra_metadata={"simulator": {"address": args.sim}},
     )
+    action_log = ActionLog(args.sim)
+    action_log.start()
     rc.start_cartesian_teleop(target_fn, dt=0.01)
     recorder.start_recording()
     rc.enable_estop()
     time.sleep(args.seconds)
     saved = recorder.stop_recording(
-        complete=True
-    )  # also shuts the controller down (home + close)
+        complete=True, shutdown_robots=False
+    )
+    action_log.save(saved)
+    action_log.close()
+    rc.stop_cartesian_teleop()
     write_sim_files(saved, args.sim)
+    rc.close()
     for cam in cameras:
         cam.close()
     if monitor is not None:
@@ -128,7 +135,10 @@ def main() -> None:
     )
     for cam in cameras:
         n = len(np.load(saved / "cameras" / f"{cam.name}.simrec" / "timestamps.npy"))
-        print(f"{cam.name}: {n} frames (states; the converter renders the pixels)")
+        print(f"{cam.name}: {n} native simulation frames ({args.sim_record_mode})")
+    if args.no_convert:
+        print(f"Raw episode saved -> {saved}")
+        return
 
     from raiden.converter import convert_recording
 
