@@ -258,6 +258,14 @@ class DemonstrationRecorder:
     def _finalize_cameras(self) -> None:
         # Finalise SVO2 / bag files but keep cameras open — run in parallel so
         # all cameras stop at the same time (avoids trailing frames on one camera).
+        # Read controls before stop_recording restarts the RealSense pipeline.
+        self._camera_capture_receipts = {}
+        for camera in self.cameras:
+            if hasattr(camera, "color_controls") and hasattr(camera, "get_camera_info"):
+                try:
+                    self._camera_capture_receipts[camera.name] = camera.get_camera_info()
+                except Exception as error:
+                    self._camera_capture_receipts[camera.name] = {"readback_error": str(error)}
         stop_threads = [
             threading.Thread(target=camera.stop_recording, daemon=True)
             for camera in self.cameras
@@ -428,6 +436,8 @@ class DemonstrationRecorder:
         }
         if color_controls:
             meta_dict["color_controls"] = color_controls
+        if getattr(self, "_camera_capture_receipts", None):
+            meta_dict["camera_capture_receipts"] = self._camera_capture_receipts
         meta_dict.update(self.extra_metadata)
 
         with open(output_file, "w") as f:
@@ -865,6 +875,7 @@ def _run_sim_episodes(
     try:
         robot_controller.setup_for_teleop_recording()
         interface.setup(robot_controller)
+        robot_controller.reset_sim_episode()
         if use_stdin:
             tty.setcbreak(sys.stdin.fileno())
         while True:

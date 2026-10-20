@@ -9,7 +9,6 @@ the LeRobot export run unchanged.
 
 from raiden.sim.action_log import ActionLog
 from raiden.sim.calibration import table_pose, write_sim_calibration, write_sim_files
-from raiden.sim.camera import SimCamera, load_sim_cameras
 from raiden.sim.client import DEFAULT_ADDRESS, SimConnection, parse_address
 from raiden.sim.follower import SimFollower
 from raiden.sim.task import TaskMonitor
@@ -27,3 +26,12 @@ __all__ = [
     "write_sim_calibration",
     "write_sim_files",
 ]
+
+
+def __getattr__(name: str):
+    # Physics-only replay runs in Isaac's separate environment without camera SDKs.
+    if name in ("SimCamera", "load_sim_cameras"):
+        from raiden.sim import camera
+
+        return getattr(camera, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

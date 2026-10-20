@@ -55,6 +55,7 @@ import numpy as np
 import pyrealsense2 as rs
 
 from .base import Camera, CameraFrame
+from .realsense_receipt import color_frame_receipt, device_color_receipt
 
 
 def _enable_global_time(device: rs.device) -> None:
@@ -495,9 +496,20 @@ class RealSenseCamera(Camera):
         ).as_video_stream_profile()
         intr = color_stream.get_intrinsics()
         ppx, ppy, width, height = self._cropped_intrinsics(intr)
+        receipt = device_color_receipt(self._profile.get_device())
+        device_info = receipt["device"]
+        latest = getattr(self, "_latest_frames", None)
+        frame = latest.get_color_frame() if latest is not None else None
         return {
-            "serial_number": self._serial,
-            "model": "RealSense",
+            "serial_number": device_info.get("serial_number") or self._serial,
+            "model": device_info.get("name") or "RealSense",
+            "native_width": intr.width,
+            "native_height": intr.height,
+            "stream_format": str(color_stream.format()),
+            "distortion_model": str(intr.model),
+            "policy_crop": list(self._crop) if self._crop is not None else None,
+            "color_receipt": receipt,
+            "last_color_frame_receipt": color_frame_receipt(frame) if frame else None,
             "fps": self._fps,
             "width": width,
             "height": height,

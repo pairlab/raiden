@@ -2,7 +2,6 @@
 
 import os
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path as _Path
@@ -20,17 +19,14 @@ import pyspacemouse
 import yourdfpy
 from scipy.spatial.transform import Rotation
 
-# Add the third_party/i2rt to the path
-sys.path.insert(
-    0, os.path.join(os.path.dirname(__file__), "..", "..", "third_party", "i2rt")
-)
+from raiden.robot_poses import FOLLOWER_HOME_POS
 
-from i2rt.motor_drivers.can_interface import CanInterface  # noqa: E402
-from i2rt.robots.get_robot import get_yam_robot  # noqa: E402
-from i2rt.robots.motor_chain_robot import MotorChainRobot  # noqa: E402
-from i2rt.robots.robot import Robot  # noqa: E402
-from i2rt.robots.utils import ARM_YAM_XML_PATH as _ARM_YAM_XML_PATH  # noqa: E402
-from i2rt.robots.utils import GripperType  # noqa: E402
+from i2rt.motor_drivers.can_interface import CanInterface
+from i2rt.robots.get_robot import get_yam_robot
+from i2rt.robots.motor_chain_robot import MotorChainRobot
+from i2rt.robots.robot import Robot
+from i2rt.robots.utils import ARM_YAM_XML_PATH as _ARM_YAM_XML_PATH
+from i2rt.robots.utils import GripperType
 
 from raiden.robot._jparse import jparse_step  # noqa: E402
 from raiden.robot.footpedal import try_open_footpedal  # noqa: E402
@@ -59,7 +55,6 @@ __all__ = [
 ]
 
 # Default home positions
-FOLLOWER_HOME_POS = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])  # 6 joints + gripper
 # Unfolded start pose for Cartesian teleop (elbow bent, clear of joint limits).
 CARTESIAN_READY_POSE = np.array([0.0, 1.0, 1.0, 0.0, 0.0, 0.0])
 LEADER_HOME_POS = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # 6 joints only
@@ -71,7 +66,7 @@ LEADER_HOME_POS = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # 6 joints only
 FOLLOWER_KP = np.array([80.0, 80.0, 80.0, 40.0, 10.0, 10.0, 20.0])
 FOLLOWER_KD = np.array([5.0, 5.0, 5.0, 1.5, 1.5, 1.5, 0.5])
 
-# Sim reset: time for the re-sampled objects to land before the next episode records.
+# Allow reset contacts to settle before recording.
 _SIM_SETTLE_S = 0.2
 
 # Keep roughly 20 mm between the LINEAR_4310 jaws at the most-closed command.
@@ -1605,8 +1600,6 @@ class RobotController:
         self.stop_teleoperation()
         self.move_to_home_positions()
         self._last_commanded_pos = {"right": None, "left": None}
-        # The reset places the objects ~10 mm above the table; they land and settle in
-        # ~80 ms (sim time = wall time).  Wait so an episode never opens on falling objects.
         time.sleep(_SIM_SETTLE_S)
 
     def shutdown(self):

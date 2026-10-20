@@ -842,7 +842,7 @@ hf-transfer = [
 [[package]]
 name = "i2rt"
 version = "0.0.1"
-source = { directory = "third_party/i2rt" }
+source = { editable = "third_party/i2rt" }
 dependencies = [
     { name = "click" },
     { name = "dm-env" },
@@ -2471,7 +2471,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14" },
     { name = "boto3", specifier = ">=1.42.66" },
     { name = "chiral", git = "https://github.com/TRI-ML/chiral" },
-    { name = "i2rt", directory = "third_party/i2rt" },
+    { name = "i2rt", editable = "third_party/i2rt" },
     { name = "iterfzf", specifier = ">=1.4.0" },
     { name = "jax" },
     { name = "jaxlie" },
