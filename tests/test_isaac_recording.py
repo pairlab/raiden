@@ -1,6 +1,7 @@
 """Portable Isaac recordings convert without importing an Isaac or MuJoCo runtime."""
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import tempfile
@@ -11,9 +12,16 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from raiden.converter import ConversionError, _extract_simrec, _load_sim_log, _sim_base_frame, convert_recording
+from raiden.converter import (
+    ConversionError,
+    _extract_simrec,
+    _load_sim_log,
+    _sim_base_frame,
+    convert_recording,
+)
 from raiden.sim.action_log import ActionLog
 from raiden.sim.camera import SimCamera
+from raiden.sim.serialization import jsonable, write_json
 
 SPEC = importlib.util.spec_from_file_location("isaac_replay", Path(__file__).parents[1] / "scripts/isaac_replay.py")
 REPLAY = importlib.util.module_from_spec(SPEC)
@@ -121,6 +129,176 @@ class IsaacRecordingTest(unittest.TestCase):
             REPLAY.validate_server(Live(), self.root)
         REPLAY.validate_server(Live(), self.root, allow_scene_change=True)
 
+    def test_replay_accepts_other_reset_realizations_but_keeps_scene_identity(self):
+        self.record("states")
+        metadata = json.loads((self.root / "sim_metadata.json").read_text())
+        metadata["scene"].update(
+            asset_physics={"manifest_sha256": "approved"},
+            initial_state={"placement_randomization": {"sample_index": 1, "x": .5}},
+            physical_initial_state={"croissant": {"position": [.5, .2, .9]}},
+        )
+        write_json(self.root / "sim_metadata.json", metadata)
+        live = copy.deepcopy(metadata)
+        live["scene"].update(
+            initial_state={"placement_randomization": {"sample_index": 2, "x": .6}},
+            physical_initial_state={"croissant": {"position": [.6, .1, .9]}},
+        )
+
+        class Server:
+            def call(self, method):
+                return live
+
+        REPLAY.validate_server(Server(), self.root)
+        live["scene"]["initial_state"] = {"source": "portable_state", "reset_context": {}}
+        REPLAY.validate_server(Server(), self.root)
+        live["scene"]["asset_physics"]["manifest_sha256"] = "changed"
+        with self.assertRaisesRegex(ValueError, "scene"):
+            REPLAY.validate_server(Server(), self.root)
+
+    def test_native_state_and_multiview_roundtrip(self):
+        dt, initial_time = .002, .2
+        tick_times = initial_time + dt * np.arange(4)
+        timestamps = 1_800_000_000_000_000_000 + np.arange(4, dtype=np.int64) * 2_000_000
+        commands = np.column_stack((np.arange(18).reshape(3, 6) / 100, [.75, .5, 0.]))
+        states = []
+        for index, (sim_time, t_ns) in enumerate(zip(tick_times, timestamps, strict=True)):
+            target = commands[max(0, index - 1)] if index else np.array([0.] * 6 + [1.])
+            root_pose = np.array([[0., 0., 0., 0., 0., 0., 1.]])
+            states.append({
+                "backend": "isaac", "state_version": 1, "physics_dt": dt,
+                "sim_time": sim_time, "t_ns": t_ns, "monotonic_ns": t_ns - 100,
+                "cmd": target, "requested_cmd": target, "kp": np.ones(6) * 80,
+                "kd": np.ones(6) * 4, "command_sequence": index,
+                "joint_names": {"robot": [f"joint_{j}" for j in range(6)] + ["finger", "finger_mirror"],
+                                "oven": ["door"]},
+                "reset_context": {"placement_randomization": {"seed": 7, "sample_index": 2}},
+                "motor": {"computed_effort_Nm": np.arange(8), "applied_effort_Nm": np.arange(8) / 2},
+                "scene": {
+                    "articulation": {
+                        "robot": {"root_pose": root_pose, "root_velocity": np.zeros((1, 6)),
+                                  "joint_position": np.array([list(target[:6]) + [.04 * target[6], -.04 * target[6]]]),
+                                  "joint_velocity": np.ones((1, 8)) * index / 100},
+                        "oven": {"root_pose": root_pose + [[.7, .3, .9, 0, 0, 0, 0]],
+                                 "root_velocity": np.zeros((1, 6)), "joint_position": [[index / 10]],
+                                 "joint_velocity": [[.1]]},
+                    },
+                    "rigid_object": {"croissant": {
+                        "root_pose": root_pose + [[.4 + index / 100, .2, .92, 0, 0, 0, 0]],
+                        "root_velocity": np.ones((1, 6)) * index / 100,
+                    }},
+                },
+            })
+        payload = {
+            "initial_state": states[0], "states": np.array(states, dtype=object),
+            "state_t_ns": timestamps, "state_sim_time": tick_times,
+            "cmd": commands, "requested_cmd": commands.copy(), "sim_time": tick_times[1:],
+            "t_ns": timestamps[1:] - 1, "step_monotonic_ns": timestamps[1:] - 100,
+            "command_sequence": np.arange(1, 4, dtype=np.int64),
+            "command_t_ns": timestamps[:-1], "command_monotonic_ns": timestamps[:-1] - 100,
+            "application_timestamp_phase": "host before target write and physics step; sim_time is after step",
+            "state_timestamp_phase": "initial state and after every physics step; terminal inclusive",
+            "command_events": [{"sequence": index + 1, "requested_cmd": command,
+                                "first_apply_sim_time": tick_times[index], "t_ns": timestamps[index]}
+                               for index, command in enumerate(commands)],
+            "metadata": {"backend": "isaac", "physics_dt": dt},
+        }
+
+        class NativeLog:
+            def call(self, method):
+                return payload
+
+        with patch("raiden.sim.action_log.SimConnection", return_value=NativeLog()):
+            ActionLog().save(self.root)
+        saved_states = REPLAY.load_rows(self.root / "sim_action_states.jsonl")
+        self.assertEqual([row["state"] for row in saved_states], jsonable(states))
+        self.assertEqual(json.loads((self.root / "sim_initial_state.json").read_text()), jsonable(states[0]))
+        with np.load(self.root / "sim_action_log.npz", allow_pickle=False) as saved:
+            np.testing.assert_array_equal(saved["cmd"], commands)
+            np.testing.assert_allclose(saved["state_sim_time"][:-1], saved["sim_time"] - dt, atol=1e-15)
+            np.testing.assert_array_equal(saved["state_t_ns"], timestamps)
+            self.assertEqual(saved["cmd"].shape, (3, 7))
+            self.assertEqual(saved["state_sim_time"].shape, (4,))
+            self.assertEqual(saved["command_sequence"].dtype, np.int64)
+            self.assertEqual(saved["cmd"].dtype, np.float64)
+        events = REPLAY.load_rows(self.root / "sim_action_events.jsonl")
+        self.assertEqual([row["first_apply_sim_time"] for row in events], tick_times[:-1].tolist())
+
+        captures = [0, 1, 3]
+
+        def pose(name, state):
+            result = np.eye(4)
+            result[0, 3] = .5 if name == "scene_camera" else state["scene"]["articulation"]["robot"]["joint_position"][0][0]
+            return result
+
+        class CameraConnection(Connection):
+            def call(self, method, **kwargs):
+                if method != "render":
+                    return super().call(method, **kwargs)
+                name = kwargs["cameras"][0]
+                index = captures[self.index]
+                self.index += 1
+                return {name: {
+                    "rgb": np.full((3, 4, 3), index, dtype=np.uint8), "t_ns": timestamps[index],
+                    "frame_id": 100 + index, "T_base_cam": pose(name, states[index]),
+                    "sim": {"state": states[index], "objects": {"oven": np.eye(4), "croissant": np.eye(4)},
+                            "subtasks_done": [], "success": False},
+                }}
+
+        paths = [self.root / f"cameras/{name}.simrec" for name in ("scene_camera", "wrist_camera")]
+        with patch("raiden.sim.camera.SimConnection", CameraConnection), patch("raiden.sim.camera.time.sleep"):
+            for path in paths:
+                camera = SimCamera(path.stem, record_mode="states")
+                camera.open()
+                camera.start_recording(path)
+                for _ in captures:
+                    self.assertTrue(camera.grab())
+                camera.close()
+                rows = REPLAY.load_rows(path / "sim_state.jsonl")
+                self.assertEqual([row["frame_id"] for row in rows], [100, 101, 103])
+                self.assertEqual([row["state"] for row in rows], jsonable([states[i] for i in captures]))
+                np.testing.assert_array_equal(np.load(path / "timestamps.npy"), timestamps[captures])
+                self.assertEqual(np.load(path / "camera_poses.npy").shape, (3, 4, 4))
+                self.assertFalse((path / "rgb").exists())
+        merged = _load_sim_log(paths)
+        self.assertEqual(merged["object_poses"].shape, (6, 2, 4, 4))
+        self.assertEqual(merged["subtask_done"].shape, (6, 0))
+        self.assertFalse(merged["success"].any())
+        self.assertEqual(merged["state"][0], jsonable(states[0]))
+
+        class ReplayConnection:
+            def call(self, method, **kwargs):
+                if method == "get_metadata":
+                    return {"physics_dt": dt}
+                if method == "reset_to":
+                    self.state = copy.deepcopy(kwargs["state"])
+                    self.index = round((self.state["sim_time"] - initial_time) / dt)
+                elif method == "step":
+                    np.testing.assert_array_equal(kwargs["cmd"], commands[self.index])
+                    self.index += 1
+                    self.state = states[self.index]
+                    return {"state": self.state}
+                elif method == "render":
+                    name = kwargs["cameras"][0]
+                    return {name: {"rgb": np.full((3, 4, 3), self.index, dtype=np.uint8),
+                                   "T_base_cam": pose(name, self.state)}}
+                else:
+                    raise AssertionError(method)
+
+        rendered = self.root / "rendered"
+        self.assertEqual(REPLAY.rerender(ReplayConnection(), self.root, output=rendered),
+                         {"scene_camera": 3, "wrist_camera": 3})
+        for source in paths:
+            target = rendered / source.name
+            loaded_times, _ = _extract_simrec(target, self.root / "extracted" / source.stem,
+                                            self.root / "depth", self.root / "sim_model.xml", None)
+            np.testing.assert_array_equal(loaded_times, timestamps[captures])
+            np.testing.assert_array_equal(np.load(target / "camera_poses.npy"), np.load(source / "camera_poses.npy"))
+            self.assertFalse((source / "rgb").exists())
+        report = REPLAY.replay_commands(ReplayConnection(), self.root)[0]
+        self.assertEqual(report["ticks"], 3)
+        self.assertEqual(report["recorded_state_samples_compared"], 3)
+        self.assertEqual(max(report["max_abs_scene_field_error"].values()), 0.)
+
     def test_rerender_preserves_recorded_poses_and_rejects_wrong_pose(self):
         self.record("states")
         rows = REPLAY.load_rows(self.simrec / "sim_state.jsonl")
@@ -197,7 +375,7 @@ class IsaacRecordingTest(unittest.TestCase):
         with patch("raiden.sim.action_log.SimConnection", Connection):
             log = ActionLog()
         initial = {"backend": "isaac", "scene": {"q": np.array([1., 2.])}}
-        log._call = lambda method: {"initial_state": initial, "cmd": np.zeros((2, 7)), "sim_time": np.array([.002, .004]),
+        log._c.call = lambda method: {"initial_state": initial, "cmd": np.zeros((2, 7)), "sim_time": np.array([.002, .004]),
             "states": np.array([{"q": np.array([1., 2.]), "t_ns": 123, "sim_time": .002}], dtype=object),
             "state_t_ns": np.array([123]), "state_sim_time": np.array([.002]),
             "command_events": [{"requested_cmd": np.ones(7), "t_ns": 123}],

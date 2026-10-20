@@ -21,24 +21,14 @@ class ActionLog:
 
     def __init__(self, address: str = DEFAULT_ADDRESS):
         self._c = SimConnection(address)
-        self._warned = False
-
-    def _call(self, method: str):
-        try:
-            return self._c.call(method)
-        except (RuntimeError, EOFError, OSError) as exc:
-            if not self._warned:
-                print(f"  Note: no per-tick action log ({method}: {exc})")
-                self._warned = True
-            return None
 
     def start(self) -> None:
-        self._call("start_action_log")
+        self._c.call("start_action_log")
 
     def save(self, episode_dir: Path) -> None:
-        log = self._call("stop_action_log")
-        if not log:
-            return
+        log = self._c.call("stop_action_log")
+        if not isinstance(log, dict) or not log:
+            raise RuntimeError("simulator returned no native action log")
         dest = Path(episode_dir)
         log = dict(log)
         initial = log.pop("initial_state", None)
@@ -58,11 +48,12 @@ class ActionLog:
         structured = [key for key, value in arrays.items() if value.dtype.hasobject]
         if structured:
             raise ValueError(f"unexpected structured action log fields: {structured}")
-        if arrays:
-            np.savez_compressed(str(dest / FILENAME), **arrays)
+        if "cmd" not in arrays or "sim_time" not in arrays:
+            raise ValueError("native action log is missing cmd or sim_time")
+        np.savez_compressed(str(dest / FILENAME), **arrays)
 
     def discard(self) -> None:
-        self._call("stop_action_log")
+        self._c.call("stop_action_log")
 
     def close(self) -> None:
         self._c.close()

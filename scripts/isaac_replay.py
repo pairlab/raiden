@@ -54,7 +54,19 @@ def validate_server(conn, episode: Path, *, allow_scene_change=False) -> dict:
         "controller", "torque_limits_Nm", "finger_stops_m", "finger_target",
         "joint_limits_rad", "joint_limit_margin_rad", "gravity_implementation",
     )
-    mismatches = [key for key in identifiers if key in metadata and metadata[key] != live.get(key)]
+    mismatches = []
+    for key in identifiers:
+        if key not in metadata:
+            continue
+        recorded, current = metadata[key], live.get(key)
+        if key == "scene":
+            # Each replay restores the episode's state instead of the live reset realization.
+            reset_fields = {"initial_state", "physical_initial_state"}
+            recorded = {k: v for k, v in recorded.items() if k not in reset_fields}
+            if isinstance(current, dict):
+                current = {k: v for k, v in current.items() if k not in reset_fields}
+        if recorded != current:
+            mismatches.append(key)
     if mismatches and not allow_scene_change:
         raise ValueError(f"server differs from episode in {mismatches}; use the recorded scene, or "
                          "--allow-scene-change for an intentional calibration/physics experiment")

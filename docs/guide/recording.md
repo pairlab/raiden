@@ -263,7 +263,7 @@ raw layout includes:
     sim_initial_state.json         # physical/controller state before the first logged tick
     sim_action_log.npz             # every physics tick, requested/effective targets and clocks
     sim_action_events.jsonl         # native incoming command events, timing and clamp results
-    sim_action_states.jsonl         # high-rate portable physical/controller state history
+    sim_action_states.jsonl         # initial state, then one state after every native tick
     sim_action_metadata.json
     cameras/<name>.simrec/
         timestamps.npy             # original native capture timestamps
@@ -272,6 +272,14 @@ raw layout includes:
         sim_state.jsonl            # full scene/controller snapshot behind each frame
         rgb/0000000000.png          # lossless BGR PNGs, frames mode only
 ```
+
+The native action log has one command row per physics tick and one more state
+row than commands, including the initial and terminal states. Camera JSONL
+records the state at each image capture, with shared server frame IDs and
+timestamps for matching views; individual camera streams can drop frames.
+An episode is marked complete only after its native action bundle is saved.
+If finalization fails, the incomplete directory is retained for recovery and is
+not reused by the next recording.
 
 To defer storing pixels, add `--sim-record-mode states`. Live monitoring still
 uses the server's camera frames. With the matching Isaac server running,
@@ -291,8 +299,9 @@ python -c "from raiden.converter import convert_recording; convert_recording('da
 ```
 
 Rerender restores each recorded physical state and checks its optical camera
-pose against the capture. It rejects scene, calibration, twin, physics backend,
-step size, or controller metadata changes. For a deliberate calibration/scene
+pose against the capture. Live reset poses and sample indices may differ; replay
+restores those from the recording. It rejects scene, calibration, twin, physics
+backend, step size, or controller metadata changes. For a deliberate calibration/scene
 experiment, use `--allow-scene-change --out /tmp/rerender_experiment`; this keeps
 the original captures and poses intact. Rerendering does not replay dynamics.
 RTX lighting/temporal accumulation can produce small RGB differences even when

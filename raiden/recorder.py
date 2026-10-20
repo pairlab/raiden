@@ -187,7 +187,8 @@ class DemonstrationRecorder:
         print(hint + "\n")
 
     def stop_recording(
-        self, complete: bool = True, shutdown_robots: bool = True
+        self, complete: bool = True, shutdown_robots: bool = True,
+        finalize: Callable[[Path], None] | None = None,
     ) -> Path:
         """Stop the current recording episode and persist data.
 
@@ -202,6 +203,8 @@ class DemonstrationRecorder:
                       can be detected as incomplete and overridden next run.
             shutdown_robots: Set to False to keep the robots up (sim collection,
                       where the next episode starts from a scene reset).
+            finalize: Save additional required artifacts before marking complete.
+                      A failed finalizer retains an incomplete episode for recovery.
         """
         if not self.is_recording:
             return self.recording_dir
@@ -232,6 +235,17 @@ class DemonstrationRecorder:
         print("!" * 60 + "\n")
 
         self._save_robot_data()
+        if finalize is not None:
+            self._save_metadata(duration, complete=False)
+            try:
+                finalize(self.recording_dir)
+            except Exception as error:
+                self.extra_metadata.update(
+                    preserve_incomplete=True,
+                    finalization_error=f"{type(error).__name__}: {error}",
+                )
+                self._save_metadata(duration, complete=False)
+                raise
         self._save_metadata(duration, complete=complete)
 
         return self.recording_dir
@@ -581,9 +595,8 @@ def _peek_next_episode(task_dir: Path) -> str:
 def _next_recording_dir(task_dir: Path) -> Path:
     """Return the directory to record the next episode into.
 
-    If the last episode directory has no metadata or ``complete=False``, it is
-    treated as an incomplete recording, wiped, and reused.  Otherwise a new
-    numbered directory is created.
+    Reuse an incomplete last recording unless it was explicitly retained after a
+    persistence failure. Otherwise create a new numbered directory.
     """
     existing = sorted(d for d in task_dir.iterdir() if d.is_dir() and d.name.isdigit())
 
@@ -591,12 +604,14 @@ def _next_recording_dir(task_dir: Path) -> Path:
         last_dir = existing[-1]
         meta_file = last_dir / "metadata.json"
         is_incomplete = True
+        preserve_incomplete = False
         if meta_file.exists():
             with open(meta_file) as f:
                 meta = json.load(f)
             is_incomplete = not meta.get("complete", False)
+            preserve_incomplete = meta.get("preserve_incomplete", False)
 
-        if is_incomplete:
+        if is_incomplete and not preserve_incomplete:
             print(f"  Overriding incomplete recording: {last_dir}")
             shutil.rmtree(last_dir)
             last_dir.mkdir()
@@ -899,9 +914,8 @@ def _run_sim_episodes(
             action = _wait_for_sim_action(robot_controller, interface, task, use_stdin)
             if action == "save":
                 saved_dir = recorder.stop_recording(
-                    complete=True, shutdown_robots=False
+                    complete=True, shutdown_robots=False, finalize=action_log.save
                 )
-                action_log.save(saved_dir)
                 on_saved(saved_dir)
                 last_saved, n_saved = saved_dir, n_saved + 1
                 print(f"✓ Saved as success → {saved_dir}  ({n_saved} this session)")

@@ -116,9 +116,8 @@ def main() -> None:
     rc.enable_estop()
     time.sleep(args.seconds)
     saved = recorder.stop_recording(
-        complete=True, shutdown_robots=False
+        complete=True, shutdown_robots=False, finalize=action_log.save
     )
-    action_log.save(saved)
     action_log.close()
     rc.stop_cartesian_teleop()
     write_sim_files(saved, args.sim)
