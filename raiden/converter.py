@@ -52,7 +52,6 @@ import numpy as np
 from tqdm import tqdm
 
 from raiden._config import CAMERA_CONFIG
-from raiden.camera_config import CameraConfig
 
 _SEQUENCE_NAME = "0000"
 _IMG_EXT = ".png"
@@ -83,6 +82,49 @@ _DROP_WARN_FRACTION = 0.02
 
 class ConversionError(RuntimeError):
     """Raised when a recording cannot be converted into a consistent episode."""
+
+
+def _recording_camera_settings(rec_meta: dict) -> dict[str, dict]:
+    """Resolve portable episode settings, falling back to live config for old episodes.
+
+    A recorded null role/crop is intentional. Never replace it with the current
+    machine's configuration. Capture readback is authoritative about the crop.
+    """
+    recording_config = rec_meta.get("recording_config")
+    snapshot = recording_config.get("cameras") if isinstance(recording_config, dict) else None
+    if isinstance(snapshot, dict):
+        entries = snapshot
+    else:
+        # Conversion must also work on an offline machine without a camera
+        # config; CameraConfig's constructor would create a live config there.
+        path = Path(CAMERA_CONFIG)
+        entries = json.loads(path.read_text()) if path.exists() else {}
+    settings = {
+        name: {
+            "role": entry.get("role"),
+            "type": entry.get("type", "zed"),
+            "policy_crop": entry.get("policy_crop", entry.get("crop")),
+        }
+        for name, entry in entries.items()
+        if isinstance(entry, dict)
+    }
+    for name, receipt in rec_meta.get("camera_capture_receipts", {}).items():
+        if isinstance(receipt, dict) and "policy_crop" in receipt:
+            settings.setdefault(name, {})["policy_crop"] = receipt["policy_crop"]
+    return settings
+
+
+def _recording_camera_crop(
+    settings: dict[str, dict], name: str
+) -> tuple[int, int, int, int] | None:
+    crop = settings.get(name, {}).get("policy_crop")
+    if crop is None:
+        return None
+    if len(crop) != 4:
+        raise ConversionError(
+            f"{name}: recorded policy_crop must be [x, y, width, height], got {crop!r}"
+        )
+    return tuple(int(value) for value in crop)
 
 
 def _apply_rs_clock_offset(
@@ -287,6 +329,7 @@ def _extract_bag(
     depth_dir: Path,
     flip: bool = False,
     max_frames: Optional[int] = None,
+    crop: tuple[int, int, int, int] | None = None,
 ) -> Tuple[np.ndarray, Optional[dict]]:
     """Extract color (and depth, if recorded) frames from a RealSense .bag file.
 
@@ -304,7 +347,6 @@ def _extract_bag(
     rgb_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"  Opening {bag_path.name} ...")
-    crop = CameraConfig(CAMERA_CONFIG).get_crop(bag_path.stem)
     if crop is not None:
         print(f"    crop {crop}")
     camera = RealSenseCamera.from_bag(bag_path.stem, bag_path, crop=crop)
@@ -698,23 +740,23 @@ def _build_lowdim(
     cam_timestamps: Dict[str, Optional[np.ndarray]],
     wrist_camera_joint_keys: Optional[Dict[str, str]] = None,
     sim_log: Optional[Dict[str, np.ndarray]] = None,
-) -> None:
-    """Write seq_dir/lowdim.npz with all cameras' intrinsics/extrinsics plus joints, action, language.
+) -> dict:
+    """Write per-frame lowdim files and return their feature metadata.
 
-    Output keys in lowdim.npz
-    --------------------------
-    Per-frame keys in each lowdim/<frame>.npz
-    ------------------------------------------
+    Per-frame keys in each lowdim/<frame>.pkl
+    ---------------------------------------
     ``intrinsics``           dict[camera_name → (3, 3) float32]  camera matrix K per camera.
     ``extrinsics``           dict[camera_name → (4, 4) float32]  cam-to-left_arm_base.
                              Sim cameras: read from the model and state that rendered the frame.
                              Wrist cameras: computed per-frame via FK + hand-eye calibration.
                              Scene cameras: static calibrated extrinsics.
-    ``joints``               (14,) float32  follower joint positions at this frame:
+    ``joints``               (7 or 14,) float32  follower joint positions at this frame:
                              [left_arm(6), left_gripper(1), right_arm(6), right_gripper(1)].
-    ``action``               (26,) float32  FK EE poses computed from commanded joint positions
-                             (follower_*_joint_cmd), in the left_arm_base frame:
+    ``action``               (13 or 26,) float32  FK EE poses from commanded joint positions
+                             (follower_*_joint_cmd), each in its own arm's base frame:
                              [l_pos(3), l_rot9(9), l_gripper(1), r_pos(3), r_rot9(9), r_gripper(1)].
+                             ``actual_poses`` uses the same frames, with continuous measured grippers.
+                             Only present arms are concatenated, left before right.
     ``language_task``        str  task name.
     ``language_prompt``      str  task instruction.
     ``table_pose``           (4, 4) float32  table-to-left_arm_base, from calibration
@@ -790,12 +832,14 @@ def _build_lowdim(
     def cmd_to_cam(key: str) -> Optional[np.ndarray]:
         """A commanded 7-DOF array on the camera grid, gripper still binary.
 
-        ``interp_to_cam`` interpolates every column linearly, which on the gripper
-        would invent intermediate openings the operator never commanded.
+        Arm joints interpolate linearly. Binary gripper intent holds the latest
+        command at or before the frame, including exact edges and the last sample.
         """
         arr = interp_to_cam(key)
         if arr is not None:
-            arr[:, 6] = (arr[:, 6] >= 0.5).astype(np.float32)
+            held = np.searchsorted(robot_ts, ref_ts, side="right") - 1
+            held = np.clip(held, 0, len(robot_ts) - 1)
+            arr[:, 6] = (robot_data[key][held, 6] >= 0.5).astype(np.float32)
         return arr
 
     def _fk(kin: Any, q: np.ndarray) -> np.ndarray:
@@ -886,9 +930,14 @@ def _build_lowdim(
                     ],
                     axis=1,
                 ).astype(np.float32)
+                is_right = joint_key.startswith("follower_r")
+                if is_right and right_base_to_left_base is None:
+                    raise ConversionError(
+                        f"{name}: right-wrist hand-eye extrinsics require the calibrated "
+                        "bimanual base transform to express cameras in left_arm_base"
+                    )
                 if kin is None:
                     kin = _get_kinematics()
-                is_right = joint_key.startswith("follower_r")
                 per_frame_ext = np.stack(
                     [
                         (
@@ -1076,6 +1125,38 @@ def _build_lowdim(
         with open(lowdim_dir / f"{i:010d}.pkl", "wb") as f:
             pickle.dump(frame_data, f)
 
+    command_arms = [
+        arm for arm, side in (("left", "l"), ("right", "r"))
+        if robot_data is not None and f"follower_{side}_joint_cmd" in robot_data
+    ]
+    measured_arms = [
+        arm for arm, side in (("left", "l"), ("right", "r"))
+        if robot_data is not None and f"follower_{side}_joint_pos_7d" in robot_data
+    ]
+    metadata = {
+        "action": {
+            "format": "joint_cmd", "dims": action_joints.shape[1] if action_joints is not None else 0,
+            "lowdim_key": "action_joints", "arm_order": command_arms,
+            "gripper": {"open": 1, "closed": 0, "resampling": "zero_order_hold"},
+        },
+    }
+    for field, values, arms, lowdim_key in (
+        ("action_ee", action, command_arms, "action"),
+        ("actual_poses", actual_poses, measured_arms, "actual_poses"),
+    ):
+        if values is not None:
+            metadata[field] = {
+                "format": "position_rotation_matrix_gripper", "dims": values.shape[1],
+                "lowdim_key": lowdim_key, "arm_order": arms,
+                "frames": {arm: f"{arm}_arm_base" for arm in arms},
+            }
+    if joints is not None:
+        metadata["joints"] = {
+            "dims": joints.shape[1], "arm_order": measured_arms,
+            "gripper": {"open": 1, "closed": 0, "resampling": "linear"},
+        }
+    return metadata
+
 
 # ---------------------------------------------------------------------------
 # Dataset-level metadata helpers
@@ -1088,6 +1169,8 @@ def _build_sequence_metadata(
     frame_counts: Dict[str, int],
     rec_meta: dict,
     camera_infos: Dict[str, Optional[dict]],
+    lowdim_metadata: dict | None = None,
+    camera_settings: dict[str, dict] | None = None,
 ) -> None:
     """Write metadata.json inside the sequence directory."""
     resolutions = {
@@ -1126,10 +1209,14 @@ def _build_sequence_metadata(
             else {}
         ),
         "intrinsics": {"model": "pinhole"},
-        "extrinsics": {"transform": "cam2world", "metric": True},
-        "action": {"format": "joint_cmd", "dims": 14},
+        "extrinsics": {"transform": "cam2world", "metric": True, "frame": "left_arm_base"},
+        **(lowdim_metadata or {"action": {"format": "joint_cmd", "dims": 0}}),
         "control": rec_meta.get("control", "leader"),
     }
+    if camera_settings is not None:
+        meta["camera_settings"] = {
+            name: camera_settings[name] for name in cameras if name in camera_settings
+        }
 
     with open(seq_dir / "metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
@@ -1249,6 +1336,7 @@ def convert_recording(
     if meta_path.exists():
         with open(meta_path) as f:
             rec_meta = json.load(f)
+    camera_settings = _recording_camera_settings(rec_meta)
 
     robot_data: Optional[Dict[str, np.ndarray]] = None
     robot_path = rec_path / "robot_data.npz"
@@ -1269,11 +1357,6 @@ def convert_recording(
         mat = calib["bimanual_transform"].get("right_base_to_left_base")
         if mat is not None:
             T_left_base_from_right_base = np.linalg.inv(np.array(mat, dtype=np.float32))
-    if T_left_base_from_right_base is None:
-        print(
-            "  Warning: bimanual_transform not found in calibration; right wrist extrinsics will be in right_arm_base frame"
-        )
-
     # ── extract frames ────────────────────────────────────────────────────
     frame_counts: Dict[str, int] = {}
     camera_infos: Dict[str, Optional[dict]] = {}
@@ -1356,7 +1439,8 @@ def convert_recording(
         flip = name in _FLIP_CAMERAS
         print(f"  Extracting {bag_path.name}" + (" (flipped)" if flip else ""))
         ts_arr, info = _extract_bag(
-            bag_path, rgb_dir, depth_dir, flip=flip, max_frames=bag_max
+            bag_path, rgb_dir, depth_dir, flip=flip, max_frames=bag_max,
+            crop=_recording_camera_crop(camera_settings, name),
         )
         frame_counts[name] = len(ts_arr)
         camera_infos[name] = info
@@ -1447,17 +1531,24 @@ def convert_recording(
 
     cameras = list(frame_counts.keys())
 
-    # ── wrist camera → joint key mapping from camera config roles ─────────
-    cam_cfg = CameraConfig(CAMERA_CONFIG)
+    # Cached extraction has no live camera object. Restore recorded intrinsics
+    # from its capture receipt when available, without consulting today's camera.
+    for name in cameras:
+        receipt = rec_meta.get("camera_capture_receipts", {}).get(name)
+        if (camera_infos.get(name) is None and isinstance(receipt, dict)
+                and all(key in receipt for key in ("fx", "fy", "cx", "cy", "width", "height"))):
+            camera_infos[name] = receipt
+
+    # ── wrist camera → joint key mapping from the episode's recorded roles ─
     wrist_camera_joint_keys: Dict[str, str] = {
         name: _ROLE_TO_JOINT_KEY[role]
         for name in cameras
-        if (role := cam_cfg.get_role(name)) in _ROLE_TO_JOINT_KEY
+        if (role := camera_settings.get(name, {}).get("role")) in _ROLE_TO_JOINT_KEY
     }
 
     # ── lowdim ────────────────────────────────────────────────────────────
     print("\nBuilding lowdim...")
-    _build_lowdim(
+    lowdim_metadata = _build_lowdim(
         seq_dir=seq_dir,
         cameras=cameras,
         n_frames=n_min,
@@ -1483,7 +1574,10 @@ def convert_recording(
             shutil.copyfile(source, seq_dir / filename)
 
     # ── sequence metadata ─────────────────────────────────────────────────
-    _build_sequence_metadata(seq_dir, cameras, frame_counts, rec_meta, camera_infos)
+    _build_sequence_metadata(
+        seq_dir, cameras, frame_counts, rec_meta, camera_infos,
+        lowdim_metadata=lowdim_metadata, camera_settings=camera_settings,
+    )
     print("  ✓ metadata.json")
 
     if episode_dir is None:

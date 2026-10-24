@@ -4,6 +4,7 @@ import os
 import subprocess
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path as _Path
 from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
@@ -20,6 +21,7 @@ import yourdfpy
 from scipy.spatial.transform import Rotation
 
 from raiden.robot_poses import FOLLOWER_HOME_POS
+from raiden.robot_config import load_can_channels
 
 from i2rt.motor_drivers.can_interface import CanInterface
 from i2rt.robots.get_robot import get_yam_robot
@@ -375,6 +377,7 @@ class RobotController:
         use_right_follower: bool = True,
         use_left_follower: bool = True,
         sim: Optional[str] = None,
+        can_channels: Optional[Mapping[str, str]] = None,
     ):
         """Initialize robot controller
 
@@ -385,6 +388,7 @@ class RobotController:
             use_left_follower: Initialize left follower arm
             sim: address of a running ``raiden_sim_server`` (``host:port``); when set the
                 left follower is the MESA digital twin instead of the CAN-bus arm.
+            can_channels: optional role-to-channel mapping instead of robot.json.
         """
         self.use_right_leader = use_right_leader
         self.use_left_leader = use_left_leader
@@ -395,6 +399,11 @@ class RobotController:
             raise ValueError(
                 "the simulator provides a single left follower; use arms='single'"
             )
+
+        self.can_channels = load_can_channels(
+            self._enabled_robot_names() if not self.sim else (),
+            overrides={} if self.sim and can_channels is None else can_channels,
+        )
 
         # Robot references
         self.leader_r: Optional[YAMLeaderRobot] = None
@@ -435,157 +444,165 @@ class RobotController:
             "left": None,
         }
 
+    def _enabled_robot_names(self) -> list[str]:
+        return [
+            name
+            for name, enabled in (
+                ("follower_l", self.use_left_follower),
+                ("follower_r", self.use_right_follower),
+                ("leader_l", self.use_left_leader),
+                ("leader_r", self.use_right_leader),
+            )
+            if enabled
+        ]
+
     def check_can_interfaces(self) -> bool:
-        """Check if required CAN interfaces are available"""
+        """Check the same resolved CAN channels used to initialize the arms."""
         if self.sim:
             print(f"✓ Simulated robot ({self.sim}); no CAN interfaces needed")
             return True
-        required_interfaces = []
-
-        if self.use_right_follower:
-            required_interfaces.append("can_follower_r")
-        if self.use_left_follower:
-            required_interfaces.append("can_follower_l")
-        if self.use_right_leader:
-            required_interfaces.append("can_leader_r")
-        if self.use_left_leader:
-            required_interfaces.append("can_leader_l")
-
-        missing_interfaces = []
-        for interface in required_interfaces:
-            if not check_can_interface(interface):
-                missing_interfaces.append(interface)
-
+        missing_interfaces = [
+            self.can_channels[name]
+            for name in self._enabled_robot_names()
+            if not check_can_interface(self.can_channels[name])
+        ]
         if missing_interfaces:
             raise RuntimeError(
                 f"Missing or unavailable CAN interfaces: {', '.join(missing_interfaces)}"
             )
-
         print("✓ All required CAN interfaces are available")
         return True
 
     def initialize_robots(self, gravity_comp_mode: bool = False) -> None:
-        """Initialize robots
+        """Initialize enabled arms and close them if any setup step fails.
 
-        Args:
-            gravity_comp_mode: If True, disable position control for free movement
+        With gravity_comp_mode, disable position control for free movement.
         """
         print("\nInitializing robots...")
-
-        # Each arm is on its own CAN bus, so all four can be initialized in
-        # parallel.  Results and exceptions are collected via shared dicts.
         results: Dict[str, object] = {}
-        errors: Dict[str, Exception] = {}
+        errors: Dict[str, BaseException] = {}
+        started_threads = []
 
-        if self.sim:
-            from raiden.sim import SimFollower
-
-            print(f"  - Connecting to sim follower at {self.sim}...")
-            results["left follower"] = SimFollower(self.sim)
-
-        def _init(name: str, channel: str, gripper_type) -> None:
+        def _init(name: str) -> None:
             print(f"  - Initializing {name}...")
             try:
                 results[name] = get_yam_robot(
-                    channel=channel,
-                    gripper_type=gripper_type,
+                    channel=self.can_channels[name],
+                    gripper_type=(
+                        GripperType.LINEAR_4310
+                        if name.startswith("follower")
+                        else GripperType.YAM_TEACHING_HANDLE
+                    ),
                     zero_gravity_mode=False,
                 )
-            except Exception as exc:
+            except BaseException as exc:
                 errors[name] = exc
 
-        threads = []
-        if self.use_right_follower:
-            threads.append(
-                threading.Thread(
-                    target=_init,
-                    args=("right follower", "can_follower_r", GripperType.LINEAR_4310),
-                    daemon=True,
-                )
-            )
-        if self.use_left_follower and not self.sim:
-            threads.append(
-                threading.Thread(
-                    target=_init,
-                    args=("left follower", "can_follower_l", GripperType.LINEAR_4310),
-                    daemon=True,
-                )
-            )
-        if self.use_right_leader:
-            threads.append(
-                threading.Thread(
-                    target=_init,
-                    args=(
-                        "right leader",
-                        "can_leader_r",
-                        GripperType.YAM_TEACHING_HANDLE,
-                    ),
-                    daemon=True,
-                )
-            )
-        if self.use_left_leader:
-            threads.append(
-                threading.Thread(
-                    target=_init,
-                    args=(
-                        "left leader",
-                        "can_leader_l",
-                        GripperType.YAM_TEACHING_HANDLE,
-                    ),
-                    daemon=True,
-                )
-            )
+        try:
+            if self.sim:
+                from raiden.sim import SimFollower
 
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+                print(f"  - Connecting to sim follower at {self.sim}...")
+                results["follower_l"] = SimFollower(self.sim)
+            else:
+                # Each arm has its own CAN bus; wait for every started initializer
+                # before inspecting errors or closing the arms that succeeded.
+                for name in self._enabled_robot_names():
+                    thread = threading.Thread(target=_init, args=(name,), daemon=True)
+                    thread.start()
+                    started_threads.append(thread)
+                for thread in started_threads:
+                    thread.join()
 
-        if errors:
-            raise RuntimeError(f"Robot initialization failed: {errors}")
+            if errors:
+                first_error = next(iter(errors.values()))
+                raise RuntimeError(
+                    f"Robot initialization failed: {errors}"
+                ) from first_error
 
-        if self.use_right_follower:
-            self.follower_r = results["right follower"]
-            self.follower_r.update_kp_kd(kp=FOLLOWER_KP, kd=FOLLOWER_KD)
-            self.kp_gains["follower_r"] = FOLLOWER_KP.copy()
-            self.kd_gains["follower_r"] = FOLLOWER_KD.copy()
-        if self.use_left_follower:
-            self.follower_l = results["left follower"]
-            self.follower_l.update_kp_kd(kp=FOLLOWER_KP, kd=FOLLOWER_KD)
-            self.kp_gains["follower_l"] = FOLLOWER_KP.copy()
-            self.kd_gains["follower_l"] = FOLLOWER_KD.copy()
-        # The teaching-handle leader arm is lighter than the follower (no heavy
-        # gripper), so the default gravity_comp_factor=1.3 over-compensates.
-        _LEADER_GRAVITY_COMP_FACTOR = 1.1
+            for side in ("l", "r"):
+                name = f"follower_{side}"
+                if name in results:
+                    follower = results[name]
+                    setattr(self, name, follower)
+                    follower.update_kp_kd(kp=FOLLOWER_KP, kd=FOLLOWER_KD)
+                    self.kp_gains[name] = FOLLOWER_KP.copy()
+                    self.kd_gains[name] = FOLLOWER_KD.copy()
 
-        if self.use_right_leader:
-            leader_r_base = results["right leader"]
-            leader_r_base.gravity_comp_factor = _LEADER_GRAVITY_COMP_FACTOR
-            self.leader_r = YAMLeaderRobot(leader_r_base)
-            self.last_button_state["leader_r"] = 0.0
-            self._last_verdict_state["leader_r_top"] = 0.0
-            self._last_verdict_state["leader_r_bottom"] = 0.0
-            self._last_failure_button_state["leader_r"] = 0.0
-            self.kp_gains["leader_r"] = self.leader_r._robot._kp.copy()
-            self.kd_gains["leader_r"] = self.leader_r._robot._kd.copy()
-        if self.use_left_leader:
-            leader_l_base = results["left leader"]
-            leader_l_base.gravity_comp_factor = _LEADER_GRAVITY_COMP_FACTOR
-            self.leader_l = YAMLeaderRobot(leader_l_base)
-            self.last_button_state["leader_l"] = 0.0
-            self._last_verdict_state["leader_l_top"] = 0.0
-            self._last_verdict_state["leader_l_bottom"] = 0.0
-            self._last_failure_button_state["leader_l"] = 0.0
-            self.kp_gains["leader_l"] = self.leader_l._robot._kp.copy()
-            self.kd_gains["leader_l"] = self.leader_l._robot._kd.copy()
+                name = f"leader_{side}"
+                if name in results:
+                    leader_base = results[name]
+                    # Teaching handles are lighter than follower grippers.
+                    leader_base.gravity_comp_factor = 1.1
+                    leader = YAMLeaderRobot(leader_base)
+                    setattr(self, name, leader)
+                    self.last_button_state[name] = 0.0
+                    self._last_verdict_state[f"{name}_top"] = 0.0
+                    self._last_verdict_state[f"{name}_bottom"] = 0.0
+                    self._last_failure_button_state[name] = 0.0
+                    self.kp_gains[name] = leader_base._kp.copy()
+                    self.kd_gains[name] = leader_base._kd.copy()
+
+            if gravity_comp_mode:
+                self.enable_gravity_compensation()
+        except BaseException as exc:
+            for thread in started_threads:
+                thread.join()
+            for name, robot in results.items():
+                try:
+                    robot.close()
+                except BaseException as close_error:
+                    exc.add_note(
+                        f"Closing {name} after initialization failure: {close_error!r}"
+                    )
+            self.follower_l = self.follower_r = None
+            self.leader_l = self.leader_r = None
+            self.kp_gains.clear()
+            self.kd_gains.clear()
+            raise
 
         print("✓ All robots initialized")
         print(f"  Follower kp: {FOLLOWER_KP}")
         print(f"  Follower kd: {FOLLOWER_KD}")
 
-        # Enable gravity compensation mode if requested
-        if gravity_comp_mode:
-            self.enable_gravity_compensation()
+    def recording_config(self) -> dict:
+        """Return portable settings and the meaning of each follower vector."""
+        active = [
+            name for name in self._enabled_robot_names() if name.startswith("follower")
+        ]
+        followers = {}
+        for name in active:
+            follower = getattr(self, name)
+            get_info = getattr(follower, "get_robot_info", None)
+            info = get_info() if get_info is not None else {}
+            limits = info.get("gripper_limits")
+            force = info.get("limit_gripper_effort")
+            followers[name] = {
+                "can_channel": None if self.sim else self.can_channels[name],
+                "gripper_type": GripperType.LINEAR_4310.value,
+                "kp": self.kp_gains[name].tolist() if name in self.kp_gains else None,
+                "kd": self.kd_gains[name].tolist() if name in self.kd_gains else None,
+                "gripper_limits": (
+                    np.asarray(limits).tolist() if limits is not None else None
+                ),
+                "limit_gripper_force": float(force) if force is not None else None,
+            }
+        joints = [f"joint_{index}" for index in range(1, 7)]
+        return {
+            "mode": "sim" if self.sim else "real",
+            "active_followers": active,
+            "follower_order": active.copy(),
+            "followers": followers,
+            "state_order": joints + ["gripper_aperture"],
+            "command_order": joints + ["gripper_intent"],
+            "state_gripper": {
+                "semantics": "normalized_aperture", "closed": 0.0, "open": 1.0
+            },
+            "command_gripper": {
+                "semantics": "binary_operator_intent", "closed": 0.0, "open": 1.0
+            },
+            "motor_gripper_command_range": [_GRIPPER_MIN_OPENING, 1.0],
+        }
 
     def enable_gravity_compensation(self) -> None:
         """Enable gravity compensation mode (free movement with zero stiffness)"""
@@ -649,11 +666,17 @@ class RobotController:
 
         if simultaneous:
             threads = []
+            errors = {}
 
             def move_to_home(robot, target_pos, name):
                 print(f"  - Moving {name}...")
-                smooth_move_joints(robot, target_pos, time_interval_s=2.0, steps=200)
-                print(f"  - {name} reached home")
+                try:
+                    smooth_move_joints(
+                        robot, target_pos, time_interval_s=2.0, steps=200
+                    )
+                    print(f"  - {name} reached home")
+                except BaseException as exc:
+                    errors[name] = exc
 
             if self.follower_r:
                 threads.append(
@@ -688,6 +711,10 @@ class RobotController:
                 thread.start()
             for thread in threads:
                 thread.join()
+            if errors:
+                raise RuntimeError(f"Moving robots home failed: {errors}") from next(
+                    iter(errors.values())
+                )
         else:
             # Sequential movement
             if self.follower_r:
@@ -1549,21 +1576,31 @@ class RobotController:
         self.attach_footpedal()
 
     def close(self) -> None:
-        """Close all robot instances, stopping their server threads and CAN connections."""
+        """Attempt every resource close, then raise the first cleanup error if any."""
+        errors = []
         if self._pause_timer is not None:
-            self._pause_timer.cancel()
+            try:
+                self._pause_timer.cancel()
+            except BaseException as exc:
+                errors.append(("pause timer", exc))
             self._pause_timer = None
-        if self._footpedal is not None:
-            self._footpedal.close()
-            self._footpedal = None
-        if self.follower_r:
-            self.follower_r.close()
-        if self.follower_l:
-            self.follower_l.close()
-        if self.leader_r:
-            self.leader_r._robot.close()
-        if self.leader_l:
-            self.leader_l._robot.close()
+        for name in ("_footpedal", "follower_r", "follower_l", "leader_r", "leader_l"):
+            resource = getattr(self, name)
+            if resource is None:
+                continue
+            if name.startswith("leader"):
+                resource = resource._robot
+            try:
+                resource.close()
+            except BaseException as exc:
+                errors.append((name, exc))
+            else:
+                setattr(self, name, None)
+        if errors:
+            primary = errors[0][1]
+            for name, exc in errors:
+                primary.add_note(f"Closing {name}: {exc!r}")
+            raise primary
 
     def return_to_home(self) -> None:
         """Stop teleop, move to home, re-enable leader gravity comp.
@@ -1604,9 +1641,20 @@ class RobotController:
 
     def shutdown(self):
         """Complete shutdown: stop teleop -> restore control -> go home -> close robots"""
-        time.sleep(1.0)
-        self.return_to_home()
-        self.close()
+        home_error = None
+        try:
+            time.sleep(1.0)
+            self.return_to_home()
+        except BaseException as exc:
+            home_error = exc
+            raise
+        finally:
+            try:
+                self.close()
+            except BaseException as exc:
+                if home_error is None:
+                    raise
+                home_error.add_note(f"Robot shutdown cleanup also failed: {exc!r}")
         time.sleep(1.0)
 
     def emergency_stop(self):

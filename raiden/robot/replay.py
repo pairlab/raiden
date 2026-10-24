@@ -15,8 +15,8 @@ Processed (``lowdim/<frame>.pkl``)
 
         [l_pos(3), l_rot9(9), l_gripper(1), r_pos(3), r_rot9(9), r_gripper(1)]
 
-    Poses are in the left-arm base frame.  The right arm target is transformed
-    back to right-arm base coordinates using the bimanual calibration before IK.
+    Each arm's EE poses are in that arm's own base frame and go directly to IK.
+    This differs from converted camera extrinsics, which use the left-arm base.
 """
 
 import json

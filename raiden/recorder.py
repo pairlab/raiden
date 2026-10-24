@@ -118,6 +118,17 @@ class DemonstrationRecorder:
         # Robot data accumulated during one episode
         self._robot_frames: List[Dict] = []
         self._start_time: float = 0.0
+        self._errors: List[str] = []
+        self._error_lock = threading.Lock()
+        self._camera_start_times_ns: Dict[str, int] = {}
+        self._camera_frames: Dict[str, int] = {}
+        self._camera_capture_receipts: Dict = {}
+
+        config = dict(self.extra_metadata.get("recording_config", {}))
+        config["schema_version"] = 1
+        config["robot"] = robot_controller.recording_config()
+        self.extra_metadata["recording_config"] = config
+        self._required_followers = config["robot"]["active_followers"]
 
     # ------------------------------------------------------------------
     # Public API
@@ -137,17 +148,38 @@ class DemonstrationRecorder:
         self._robot_frames = []
         self._stop_event.clear()
         self._threads = []
-        self._camera_start_times_ns: Dict[str, int] = {}
+        self._errors = []
+        self._camera_start_times_ns = {}
+        self._camera_frames = {camera.name: 0 for camera in self.cameras}
+        self._camera_capture_receipts = {}
+        # A process crash or failed start must leave a recoverable attempt, too.
+        self.extra_metadata["preserve_incomplete"] = True
+        self._save_metadata(0.0, complete=False)
+
+        names = [camera.name for camera in self.cameras]
+        required = self.extra_metadata["recording_config"].get("cameras", {})
+        missing = set(required) - set(names)
+        if not names or len(set(names)) != len(names) or missing:
+            self._record_failure(
+                "camera configuration",
+                RuntimeError(f"Required recording cameras unavailable: {sorted(missing)}; opened: {names}"),
+            )
+            self.is_recording = False
+            self._save_metadata(0.0, complete=False)
+            self.raise_if_failed()
 
         # Start all cameras in parallel so they begin recording simultaneously.
         # Sequential starts would introduce a per-camera startup offset (e.g.
         # ~50 frames for RealSense due to pipeline restart) that misaligns ZED
         # and bag frames.
         def _start_one(camera) -> None:
-            path = self.cameras_dir / f"{camera.name}.{camera.recording_extension}"
-            t0 = time.time_ns()
-            camera.start_recording(path)
-            self._camera_start_times_ns[camera.name] = t0
+            try:
+                path = self.cameras_dir / f"{camera.name}.{camera.recording_extension}"
+                t0 = time.time_ns()
+                camera.start_recording(path)
+                self._camera_start_times_ns[camera.name] = t0
+            except Exception as error:
+                self._record_failure(f"camera {camera.name} start", error)
 
         start_threads = [
             threading.Thread(target=_start_one, args=(cam,), daemon=True)
@@ -157,6 +189,14 @@ class DemonstrationRecorder:
             t.start()
         for t in start_threads:
             t.join()
+
+        if self._errors:
+            # A failed SDK call may already have opened a writer. Stop every
+            # attempted camera, including the one whose start raised.
+            self._finalize_cameras()
+            self.is_recording = False
+            self._save_metadata(time.monotonic() - self._start_time, complete=False)
+            self.raise_if_failed()
 
         # One camera grab thread per camera (naturally rate-limited by SDK)
         for camera in self.cameras:
@@ -200,7 +240,7 @@ class DemonstrationRecorder:
         Args:
             complete: Set to True when the episode was cleanly stopped by the
                       user.  Set to False on crash / Ctrl-C so the directory
-                      can be detected as incomplete and overridden next run.
+                      is retained as incomplete for recovery.
             shutdown_robots: Set to False to keep the robots up (sim collection,
                       where the next episode starts from a scene reset).
             finalize: Save additional required artifacts before marking complete.
@@ -215,16 +255,23 @@ class DemonstrationRecorder:
 
         # Stop the grab and robot-sampling threads first, so nothing reads the robot
         # while it shuts down.
-        self._join_threads()
-
-        if shutdown_robots:
-            # Motors must be closed between episodes — keeping them alive idle
-            # causes DM4310 CAN watchdog errors due to lack of regular commands.
-            # Home and close the arm *before* finalising the camera files: with depth
-            # on, finalising stalls the process past the motors' 400 ms watchdog and
-            # the arm drops onto the table.  The bags keep recording through homing;
-            # conversion drops that tail because it clips cameras to robot telemetry.
-            self.robot_controller.shutdown()
+        stop_error = None
+        try:
+            self._join_threads()
+        except BaseException as error:
+            stop_error = error
+            self._record_failure("recording workers", error)
+        finally:
+            if shutdown_robots:
+                # Home and close before finalising camera files, whose SDK stalls
+                # can exceed the motors' 400 ms CAN watchdog. Always attempt this
+                # even if joining the recording workers was interrupted.
+                try:
+                    self.robot_controller.shutdown()
+                except BaseException as error:
+                    self._record_failure("robot shutdown", error)
+                    if not isinstance(error, Exception) and stop_error is None:
+                        stop_error = error
 
         self._finalize_cameras()
 
@@ -234,9 +281,13 @@ class DemonstrationRecorder:
         print(f"  Robot frames : {len(self._robot_frames)}")
         print("!" * 60 + "\n")
 
-        self._save_robot_data()
+        self._save_metadata(duration, complete=False)
+        try:
+            self._save_robot_data()
+            self._validate_cameras()
+        except Exception as error:
+            self._record_failure("recording integrity", error)
         if finalize is not None:
-            self._save_metadata(duration, complete=False)
             try:
                 finalize(self.recording_dir)
             except Exception as error:
@@ -245,8 +296,15 @@ class DemonstrationRecorder:
                     finalization_error=f"{type(error).__name__}: {error}",
                 )
                 self._save_metadata(duration, complete=False)
+                if stop_error is not None:
+                    stop_error.add_note(f"Episode finalization also failed: {error!r}")
+                    raise stop_error from error
                 raise
-        self._save_metadata(duration, complete=complete)
+        self._save_metadata(duration, complete=complete and not self._errors)
+        if stop_error is not None:
+            raise stop_error
+        if complete:
+            self.raise_if_failed()
 
         return self.recording_dir
 
@@ -254,9 +312,21 @@ class DemonstrationRecorder:
         """Stop the episode without saving it and delete its directory; robots stay up."""
         if not self.is_recording:
             return
+        # A collection failure must not be mistaken for an operator's discard.
+        if self._errors:
+            self.stop_recording(complete=False, shutdown_robots=False)
+            self.raise_if_failed()
+            return
         self.is_recording = False
         self._stop_event.set()
         self._stop_streams()
+        if self._errors:
+            try:
+                self._save_robot_data()
+            except Exception as error:
+                self._record_failure("recording integrity", error)
+            self._save_metadata(time.monotonic() - self._start_time, complete=False)
+            self.raise_if_failed()
         shutil.rmtree(self.recording_dir, ignore_errors=True)
         print("\n  Episode discarded\n")
 
@@ -268,6 +338,8 @@ class DemonstrationRecorder:
         # Wait for threads (camera grab threads will exit within one frame period)
         for t in self._threads:
             t.join(timeout=3.0)
+            if t.is_alive():
+                self._record_failure(t.name, RuntimeError("recording worker did not stop"))
 
     def _finalize_cameras(self) -> None:
         # Finalise SVO2 / bag files but keep cameras open — run in parallel so
@@ -280,8 +352,15 @@ class DemonstrationRecorder:
                     self._camera_capture_receipts[camera.name] = camera.get_camera_info()
                 except Exception as error:
                     self._camera_capture_receipts[camera.name] = {"readback_error": str(error)}
+
+        def _stop_one(camera) -> None:
+            try:
+                camera.stop_recording()
+            except Exception as error:
+                self._record_failure(f"camera {camera.name} stop", error)
+
         stop_threads = [
-            threading.Thread(target=camera.stop_recording, daemon=True)
+            threading.Thread(target=_stop_one, args=(camera,), daemon=True)
             for camera in self.cameras
         ]
         for t in stop_threads:
@@ -289,19 +368,46 @@ class DemonstrationRecorder:
         for t in stop_threads:
             t.join()
 
+    def _record_failure(self, source: str, error: BaseException) -> None:
+        message = f"{source}: {type(error).__name__}: {error}"
+        with self._error_lock:
+            self._errors.append(message)
+        self._stop_event.set()
+        print(f"  Recording failed: {message}")
+
+    def raise_if_failed(self) -> None:
+        """Surface background failures to the session's foreground wait loop."""
+        with self._error_lock:
+            errors = list(self._errors)
+        if errors:
+            raise RuntimeError("Recording failed: " + "; ".join(errors))
+
+    def _validate_cameras(self) -> None:
+        for camera in self.cameras:
+            if camera.name not in self._camera_start_times_ns:
+                raise RuntimeError(f"Camera {camera.name} never started recording")
+            if not self._camera_frames.get(camera.name, 0):
+                raise RuntimeError(f"Camera {camera.name} recorded no frames")
+            path = self.cameras_dir / f"{camera.name}.{camera.recording_extension}"
+            if not path.exists() or (path.is_file() and not path.stat().st_size):
+                raise RuntimeError(f"Camera {camera.name} recording is missing or empty: {path}")
+
     # ------------------------------------------------------------------
     # Background threads
     # ------------------------------------------------------------------
 
     def _camera_loop(self, camera: Camera, stop_event: threading.Event) -> None:
         """Grab loop – camera SDK rate-limits to its own FPS (30 Hz)."""
-        while not stop_event.is_set():
-            if not camera.grab():
-                continue
-            if self.monitor is not None:
-                # Hands over the frame already captured; encoding happens on the monitor
-                # thread so this loop keeps the camera's own rate.
-                self.monitor.log(camera.name, camera.get_frame().color)
+        try:
+            while not stop_event.is_set():
+                if not camera.grab():
+                    raise RuntimeError("grab returned False (camera stream lost)")
+                self._camera_frames[camera.name] += 1
+                if self.monitor is not None:
+                    # Encoding happens on the monitor thread.
+                    self.monitor.log(camera.name, camera.get_frame().color)
+        except Exception as error:
+            self._record_failure(f"camera {camera.name} sampling", error)
 
     def _robot_loop(self, stop_event: threading.Event, ref_camera) -> None:
         """Read joint observations at ~100 Hz and buffer them.
@@ -325,19 +431,41 @@ class DemonstrationRecorder:
                 ts_ns = ref_camera.get_current_timestamp_ns()
                 obs = self.robot_controller.get_all_observations()
                 cmd = self.robot_controller.get_last_commanded_positions()
+                self._validate_robot_frame(obs, cmd)
+                if stop_event.is_set():
+                    return
                 self._robot_frames.append({"t": ts_ns, "obs": obs, "cmd": cmd})
                 if self.monitor is not None:
                     # Parks the array for the grasp guides; FK happens on the monitor thread.
                     for arm in ("follower_l", "follower_r"):
                         if arm in obs and "joint_pos" in obs[arm]:
                             self.monitor.log_joints(arm, obs[arm]["joint_pos"])
-            except Exception as e:
-                print(f"  Warning: robot observation failed: {e}")
+            except Exception as error:
+                self._record_failure("robot sampling", error)
+                return
 
             elapsed = time.monotonic() - loop_start
             sleep_time = target_dt - elapsed
             if sleep_time > 0:
-                time.sleep(sleep_time)
+                stop_event.wait(sleep_time)
+
+    def _validate_robot_frame(self, obs: Dict, cmd: Dict) -> None:
+        for arm in self._required_followers:
+            if arm not in obs:
+                raise RuntimeError(f"Missing observations for configured {arm}")
+            for key, shape in (("joint_pos", (6,)), ("gripper_pos", (1,))):
+                values = np.asarray(obs[arm].get(key), dtype=float)
+                if key == "gripper_pos" and values.shape == ():
+                    values = values.reshape(1)
+                if values.shape != shape or not np.isfinite(values).all():
+                    raise RuntimeError(f"Invalid {arm} {key}: expected finite shape {shape}, got {values.shape}")
+            command = cmd.get(arm)
+            # A short initial interval before the teleop's first command is valid;
+            # _save_robot_data still requires an actual command for every arm.
+            if command is not None:
+                values = np.asarray(command, dtype=float)
+                if values.shape != (7,) or not np.isfinite(values).all():
+                    raise RuntimeError(f"Invalid {arm} command: expected finite shape (7,), got {values.shape}")
 
     # ------------------------------------------------------------------
     # Persistence helpers
@@ -349,8 +477,8 @@ class DemonstrationRecorder:
         n = len(self._robot_frames)
 
         if n == 0:
-            print("  Warning: no robot frames recorded")
-            return
+            np.savez_compressed(output_file, timestamps=np.empty(0, dtype=np.int64))
+            raise RuntimeError("No robot frames recorded")
 
         data: Dict[str, np.ndarray] = {}
         data["timestamps"] = np.array(
@@ -366,9 +494,16 @@ class DemonstrationRecorder:
                 arr = np.stack([f["obs"][robot_name][key] for f in self._robot_frames])
                 data[f"{robot_name}_{key}"] = arr
 
+        # Retain measured streams even if a required arm or its command stream
+        # fails the checks below. A failed attempt remains useful for diagnosis.
+        np.savez_compressed(output_file, **data)
+        for frame in self._robot_frames:
+            self._validate_robot_frame(frame["obs"], frame["cmd"])
+
         # Build combined 7-DOF arrays for follower arms.
         # follower_<arm>_joint_pos_7d  — executed: arm joints (6) + gripper (1)
         # follower_<arm>_joint_cmd     — commanded: 7-DOF sent to command_joint_pos
+        command_errors = []
         for arm_key in ("follower_r", "follower_l"):
             jp_key = f"{arm_key}_joint_pos"
             gp_key = f"{arm_key}_gripper_pos"
@@ -386,10 +521,11 @@ class DemonstrationRecorder:
             if jp_key in data:
                 # This arm was active — cmd data is required.
                 if not any(c is not None for c in raw_cmds):
-                    raise RuntimeError(
+                    command_errors.append(
                         f"No commanded positions recorded for {arm_key}. "
                         "The teleop loop never issued a command to this arm."
                     )
+                    continue
                 fallback = None
                 filled: list = []
                 for i, c in enumerate(raw_cmds):
@@ -402,13 +538,16 @@ class DemonstrationRecorder:
                         pos[6] = _binary_gripper(pos[6])
                         filled.append(pos)
                 if len(filled) != n:
-                    raise RuntimeError(
+                    command_errors.append(
                         f"Could not build complete cmd array for {arm_key}: "
                         f"got {len(filled)}/{n} frames."
                     )
+                    continue
                 data[f"{arm_key}_joint_cmd"] = np.stack(filled).astype(np.float32)
 
         np.savez_compressed(output_file, **data)
+        if command_errors:
+            raise RuntimeError("; ".join(command_errors))
         print(f"  ✓ Robot data saved  ({n} frames) → {output_file}")
 
     def _save_metadata(self, duration: float, complete: bool = True) -> None:
@@ -453,9 +592,17 @@ class DemonstrationRecorder:
         if getattr(self, "_camera_capture_receipts", None):
             meta_dict["camera_capture_receipts"] = self._camera_capture_receipts
         meta_dict.update(self.extra_metadata)
+        # Caller-supplied metadata cannot override the recording integrity flag.
+        meta_dict["complete"] = bool(complete and not self._errors)
+        if self._errors:
+            meta_dict["recording_errors"] = list(self._errors)
+        if meta_dict["complete"]:
+            meta_dict.pop("preserve_incomplete", None)
 
-        with open(output_file, "w") as f:
+        temporary = output_file.with_suffix(".json.tmp")
+        with open(temporary, "w") as f:
             json.dump(meta_dict, f, indent=2)
+        temporary.replace(output_file)
 
         print(f"  ✓ Metadata saved → {output_file}")
 
@@ -471,11 +618,14 @@ def load_cameras_from_config(
     """Create Camera instances for every entry in camera.json."""
     cfg = CameraConfig(config_file)
     names = cfg.list_camera_names()
+    if not names:
+        raise RuntimeError(f"No recording cameras configured in {config_file}")
 
     results: dict = {}
     errors: dict = {}
 
     def _open(name: str) -> None:
+        cam = None
         try:
             cam = cfg.create_camera(name)
             cam.open()
@@ -485,6 +635,11 @@ def load_cameras_from_config(
             results[name] = cam
         except Exception as exc:
             errors[name] = exc
+            if cam is not None:
+                try:
+                    cam.close()
+                except Exception:
+                    pass
 
     threads = [
         threading.Thread(target=_open, args=(name,), daemon=True) for name in names
@@ -495,10 +650,27 @@ def load_cameras_from_config(
         t.join()
 
     if errors:
+        for camera in results.values():
+            try:
+                camera.close()
+            except Exception:
+                pass
         raise RuntimeError(f"Camera initialization failed: {errors}")
 
     # Return cameras in config order.
     return [results[name] for name in names]
+
+
+def _camera_recording_config(cfg: CameraConfig, names: List[str]) -> Dict:
+    """Portable semantic associations; native camera receipts retain capture details."""
+    return {
+        name: {
+            "role": cfg.get_role(name),
+            "type": cfg.get_camera_type(name),
+            "policy_crop": list(cfg.get_crop(name)) if cfg.get_crop(name) else None,
+        }
+        for name in names
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +759,8 @@ def _peek_next_episode(task_dir: Path) -> str:
     existing = sorted(d for d in task_dir.iterdir() if d.is_dir() and d.name.isdigit())
     if existing:
         meta_file = existing[-1] / "metadata.json"
-        if not meta_file.exists() or not json.loads(meta_file.read_text()).get("complete", False):
+        meta = json.loads(meta_file.read_text()) if meta_file.exists() else {}
+        if not meta.get("complete", False) and not meta.get("preserve_incomplete", False):
             return existing[-1].name
     return f"{int(existing[-1].name) + 1 if existing else 0:04d}"
 
@@ -705,6 +878,7 @@ def _wait_for_verdict(
     robot_controller: RobotController,
     interface: TeleopInterface,
     ui=None,
+    recording: Optional[DemonstrationRecorder] = None,
 ) -> Optional[str]:
     """After recording stops, wait for the user to mark success or failure.
 
@@ -740,6 +914,8 @@ def _wait_for_verdict(
         if ui is not None:
             ui.set_phase("verdict", verdict_deadline=time.time() + 30.0)
         while time.monotonic() < deadline:
+            if recording is not None:
+                recording.raise_if_failed()
             if interface.poll_success(robot_controller):
                 return "success"
             if interface.poll_failure(robot_controller):
@@ -809,6 +985,7 @@ def _wait_for_sim_action(
     interface: TeleopInterface,
     task,
     use_stdin: bool,
+    recording: Optional[DemonstrationRecorder] = None,
 ) -> str:
     """Block until the operator saves ("save"), discards ("discard"), calibrates ("calibrate")
     or ends ("quit").
@@ -816,6 +993,8 @@ def _wait_for_sim_action(
     Prints the sim's subtask completions meanwhile, so the operator sees when the task is done.
     """
     while True:
+        if recording is not None:
+            recording.raise_if_failed()
         if robot_controller.session_estop_requested:
             return "quit"
         if interface.calibrating:
@@ -848,6 +1027,7 @@ def _run_sim_episodes(
     monitor,
     on_saved: Callable[[Path], None],
     active_ctrl: List[Optional[RobotController]],
+    camera_configuration: Optional[Dict] = None,
 ) -> Optional[Path]:
     """Sim collection: record from every scene reset; only a success is saved.
 
@@ -902,7 +1082,10 @@ def _run_sim_episodes(
                 task_name=task_name,
                 task_instruction=task_instruction,
                 interface=interface,
-                extra_metadata={"simulator": {"address": sim}},
+                extra_metadata={
+                    "simulator": {"address": sim},
+                    "recording_config": {"cameras": camera_configuration or {}},
+                },
                 monitor=monitor,
             )
             interface.start(robot_controller)
@@ -911,7 +1094,7 @@ def _run_sim_episodes(
             action_log.start()
             recorder.start_recording(hint=f"  Episode {recording_dir.name}\n{hint}")
 
-            action = _wait_for_sim_action(robot_controller, interface, task, use_stdin)
+            action = _wait_for_sim_action(robot_controller, interface, task, use_stdin, recorder)
             if action == "save":
                 saved_dir = recorder.stop_recording(
                     complete=True, shutdown_robots=False, finalize=action_log.save
@@ -943,7 +1126,7 @@ def _run_sim_episodes(
     except Exception as e:
         print(f"\nError during recording: {e}")
         if recorder is not None and recorder.is_recording:
-            recorder.discard()
+            recorder.stop_recording(complete=False, shutdown_robots=False)
     finally:
         if old_settings is not None:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
@@ -991,8 +1174,8 @@ def run_recording(
     - Press the leader button to START each episode; press again to STOP and save.
     - After each stop the system re-initializes and shows a READY prompt.
       Press the leader button to start the next episode, or 'q' to end the session.
-    - Incomplete recordings (estop / Ctrl-C) are detected via the ``complete``
-      flag in metadata.json and overridden on the next run.
+    - Incomplete recordings (estop / Ctrl-C) are retained for recovery and
+      identified by the ``complete`` flag in metadata.json.
 
     ``ui`` serves a browser page (:mod:`raiden.record_ui`) for the session: task and
     teacher, live views with the placement limits, start/stop/label buttons and
@@ -1083,6 +1266,10 @@ def run_recording(
             cameras = load_sim_cameras(sim, camera_config_file, fps=sim_fps, record_mode=sim_record_mode)
         else:
             cameras = load_cameras_from_config(camera_config_file)
+        cfg = CameraConfig(camera_config_file)
+        camera_configuration = _camera_recording_config(
+            cfg, [camera.name for camera in cameras] if sim else cfg.list_camera_names()
+        )
     except Exception as e:
         print(f"Error initialising cameras: {e}")
         interface.close()
@@ -1128,15 +1315,25 @@ def run_recording(
     signal.signal(signal.SIGINT, emergency_stop)
 
     def _close_session() -> None:
+        cleanup = [(f"camera {cam.name}", cam.close) for cam in cameras]
         if record_ui is not None:
-            record_ui.pause_pump()
-        for cam in cameras:
-            cam.close()
+            cleanup.insert(0, ("camera preview pump", record_ui.pause_pump))
         if live_monitor is not None:
-            live_monitor.close()
-        interface.close()
+            cleanup.append(("live monitor", live_monitor.close))
+        cleanup.append(("teleop interface", interface.close))
         if record_ui is not None:
-            record_ui.close()
+            cleanup.append(("recording UI", record_ui.close))
+        errors = []
+        for name, close in cleanup:
+            try:
+                close()
+            except BaseException as error:
+                errors.append((name, error))
+        if errors:
+            first_error = errors[0][1]
+            for name, error in errors:
+                first_error.add_note(f"Closing {name}: {error!r}")
+            raise first_error
 
     if sim:
 
@@ -1163,6 +1360,7 @@ def run_recording(
                 monitor=live_monitor,
                 on_saved=_save_demo,
                 active_ctrl=_active_ctrl,
+                camera_configuration=camera_configuration,
             )
         finally:
             _close_session()
@@ -1243,9 +1441,6 @@ def run_recording(
                 quit_session = _wait_for_enter_or_quit(robot_controller, interface, record_ui)
             if quit_session:
                 print("\nEnding session.\n")
-                robot_controller.shutdown()
-                _active_ctrl[0] = None
-                robot_controller = None
                 break
 
             # ── start episode ────────────────────────────────────────────
@@ -1256,6 +1451,7 @@ def run_recording(
             extra_meta: Dict[str, object] = (
                 {"simulator": {"address": sim}} if sim else {}
             )
+            extra_meta["recording_config"] = {"cameras": camera_configuration}
             recorder = DemonstrationRecorder(
                 cameras=cameras,
                 robot_controller=robot_controller,
@@ -1266,6 +1462,7 @@ def run_recording(
                 extra_metadata=extra_meta,
                 monitor=recorder_monitor,
             )
+            _copy_calibration(recording_dir)
             if not started:
                 interface.start(robot_controller)
             if record_ui is not None:
@@ -1287,6 +1484,7 @@ def run_recording(
                 tty.setcbreak(fd)
             try:
                 while True:
+                    recorder.raise_if_failed()
                     if robot_controller.session_estop_requested:
                         break
                     if interface.poll_success(robot_controller):
@@ -1325,15 +1523,18 @@ def run_recording(
             elif forced_success:
                 verdict = "success"
             else:
-                verdict = _wait_for_verdict(robot_controller, interface, record_ui)
+                verdict = _wait_for_verdict(robot_controller, interface, record_ui, recorder)
 
             # ── stop episode (shuts down robots, keeps cameras open) ──────
             if record_ui is not None:
                 record_ui.set_phase("saving")
-            saved_dir = recorder.stop_recording(complete=not estop)
+            try:
+                saved_dir = recorder.stop_recording(complete=not estop)
+            finally:
+                # stop_recording owns shutdown, including a failed shutdown.
+                _active_ctrl[0] = None
+                robot_controller = None
             recorder = None
-            _active_ctrl[0] = None
-            robot_controller = None  # shut down inside stop_recording
             if record_ui is not None:
                 record_ui.resume_pump()
 
@@ -1383,27 +1584,30 @@ def run_recording(
     except KeyboardInterrupt:
         print("\nCancelled by user.")
         if recorder is not None and recorder.is_recording:
-            saved_dir = recorder.stop_recording(complete=False)
+            try:
+                saved_dir = recorder.stop_recording(complete=False)
+            finally:
+                _active_ctrl[0] = None
+                robot_controller = None
             _copy_calibration(saved_dir)
-            robot_controller = None
-        elif robot_controller is not None:
-            robot_controller.shutdown()
-            robot_controller = None
     except Exception as e:
         print(f"\nError during recording: {e}")
         if recorder is not None and recorder.is_recording:
-            saved_dir = recorder.stop_recording(complete=False)
+            try:
+                saved_dir = recorder.stop_recording(complete=False)
+            finally:
+                _active_ctrl[0] = None
+                robot_controller = None
             _copy_calibration(saved_dir)
-            robot_controller = None
-        elif robot_controller is not None:
-            robot_controller.shutdown()
-            robot_controller = None
     finally:
         # ── session teardown ──────────────────────────────────────────────
         # Robots are shut down per-episode; only cameras and interface remain.
-        if robot_controller is not None:
-            robot_controller.shutdown()
-        _close_session()
+        try:
+            if robot_controller is not None:
+                _active_ctrl[0] = None
+                robot_controller.shutdown()
+        finally:
+            _close_session()
 
     _report_session(last_saved_dir, s3_bucket, s3_prefix)
 

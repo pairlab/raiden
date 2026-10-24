@@ -20,6 +20,7 @@ def check_collection(tmp_path, fail_method=None):
     starts = []
     controller = SimpleNamespace(
         setup_for_teleop_recording=lambda: events.append("setup"),
+        recording_config=lambda: {"active_followers": ["follower_l"]},
         enable_estop=lambda: None,
         shutdown=lambda: events.append("shutdown"),
         reset_count=0,

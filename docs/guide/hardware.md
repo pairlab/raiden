@@ -119,8 +119,8 @@ See [Safety](safety.md) for setup and usage.
 
 ## CAN bus setup
 
-Each YAM arm communicates over its own CAN interface. Raiden expects the
-interfaces to be named as follows:
+Each YAM arm communicates over its own CAN interface. Raiden uses these
+interface names by default:
 
 | Interface name | Arm |
 |---|---|
@@ -129,11 +129,35 @@ interfaces to be named as follows:
 | `can_leader_r` | Right leader arm |
 | `can_leader_l` | Left leader arm |
 
-These names must be set as **persistent** CAN interface aliases. In a
-**single-arm setup**, only `can_follower_l` and `can_leader_l` are needed —
-the single arm is always treated as the left arm. Follow the
-i2rt guide to assign them:
+Use **persistent** CAN interface names so the mapping survives reconnects. In a
+**single-arm setup**, the follower is always treated as the left arm; a leader
+is needed only for leader-follower control. Follow the i2rt guide to assign names:
 [Setting a persistent ID for a socket CAN interface](https://github.com/i2rt-robotics/i2rt/blob/7b6d5016f05ca63f9ef0185b7143e63f2c7a5708/docs/getting-started/hardware-setup.md#persistent-can-ids).
+
+### Optional channel configuration
+
+To use existing interface names, create `~/.config/raiden/robot.json` with a
+JSON object mapping arm roles to channels. For a rig whose identified left and
+right follower interfaces are `can_left` and `can_right`:
+
+```json
+{
+  "follower_l": "can_left",
+  "follower_r": "can_right"
+}
+```
+
+The supported keys are `follower_l`, `follower_r`, `leader_l`, and `leader_r`.
+Omitted keys keep the defaults above; an absent file preserves all historical
+names. Unknown keys, non-string or empty channel names, whitespace in names,
+and channels shared by enabled arms are rejected before robot initialization.
+The resolved mapping is used for both CAN checks and driver initialization.
+Simulator collection does not require or read this file.
+
+This mapping selects interfaces; it does not identify the physical arms or
+change gripper gains. Confirm each physical arm's interface before assigning
+left and right. Camera roles and serials remain separately configured in
+`camera.json`.
 
 ### Identifying each arm
 
@@ -167,6 +191,8 @@ To reset specific interfaces only:
 ```bash
 rd reset_can --interfaces can_follower_l can_follower_r
 ```
+
+For the override above, use `rd reset_can --interfaces can_left can_right`.
 
 To use a different bitrate:
 

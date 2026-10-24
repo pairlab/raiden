@@ -8,19 +8,19 @@ The `rd record` command records a full teleoperation demonstration:
   cameras write `.bag` files. Both formats store the raw sensor stream
   (stereo pair + depth) and are converted to a structured dataset afterwards
   with `rd convert`.
-- **Robot joint data** at ~100 Hz - both leader and follower joint positions
-  and velocities are saved to `robot_data.npz`. Robot timestamps are recorded
-  via the reference camera's clock:
-  - **ZED cameras** use `sl.TIME_REFERENCE.IMAGE`, which returns the host
-    wall-clock time at the moment the frame was captured. This is on the same
-    clock as `time.time_ns()` and the frame timestamps in the SVO2 file.
-    No correction is needed at conversion time.
-  - **RealSense cameras** attempt to use `global_time_enabled` to stamp frames
-    with host wall-clock time. Because support varies across D4xx firmware
-    versions, Raiden also measures the offset between the first frame's
-    hardware timestamp and `time.time_ns()` at recording start and stores it
-    in `metadata.json` as `realsense_clock_offsets`. The converter applies this
-    offset automatically as a fallback for older firmware.
+- **Robot joint data** at ~100 Hz - leader and follower joint positions and
+  velocities are saved to `robot_data.npz`. Before reading each row, Raiden
+  samples the first camera's `get_current_timestamp_ns()`:
+  - **ZED** returns current host time through `sl.TIME_REFERENCE.CURRENT`, on
+    the same clock as its SVO2 frame timestamps.
+  - **RealSense** uses `time.time_ns()` for robot rows. Its frames use host
+    wall-clock time when `global_time_enabled` is supported. For device-relative
+    frame timestamps, the measured `realsense_clock_offsets` in `metadata.json`
+    lets conversion map them onto the host clock.
+
+Arm observations and command snapshots are read sequentially after that
+timestamp. A row shares one time label; it does not establish simultaneous
+left/right measurements or hardware synchronization with a camera exposure.
 
 All data for one recording episode lands in a single timestamped directory
 under the output folder.
@@ -34,8 +34,10 @@ rd record --arms single
 ```
 
 In single-arm mode the active arm is always named **left** for consistency.
-All poses and extrinsics are expressed in the **left-arm base frame** - this
-convention applies in both bimanual and single-arm setups.
+Bimanual robot vectors are ordered left then right. Each end-effector pose is
+expressed in its own arm's base frame; calibrated camera extrinsics use the
+left-arm base frame. Configure the physical CAN mapping as described in
+[Hardware setup](hardware.md#optional-channel-configuration).
 
 ## Thread layout
 
@@ -44,7 +46,7 @@ convention applies in both bimanual and single-arm setups.
 | `teleop-right` | Follower-right mirrors leader-right at 100 Hz (runs for whole session) |
 | `teleop-left` | Follower-left mirrors leader-left at 100 Hz (runs for whole session) |
 | `camera-<name>` | One per camera; calls `camera.grab()` in a tight loop (SDK limits to 30 fps); active only during an episode |
-| `robot-recorder` | Reads all joint observations at ~100 Hz and timestamps each sample using `camera.get_current_timestamp_ns()` (ZED SDK clock); active only during an episode |
+| `robot-recorder` | Samples reference-camera current time, then reads arm observations and commands sequentially at ~100 Hz; active only during an episode |
 
 ## Output layout
 
@@ -64,12 +66,18 @@ Each robot arm contributes keys of the form `<arm>_<field>`, e.g.:
 
 | Key | Shape | Description |
 |---|---|---|
-| `timestamps` | `(N,)` int64 | Absolute nanosecond timestamps from the ZED SDK clock. Directly comparable with the `timestamps.npy` files written by `rd convert`. |
+| `timestamps` | `(N,)` int64 | Host-clock nanoseconds sampled through the reference camera before each robot row. Converted camera timestamps use the same clock after any required RealSense offset correction. |
 | `leader_r_joint_pos` | `(N, 6)` float32 | Leader-right joint positions (rad) |
 | `leader_r_joint_vel` | `(N, 6)` float32 | Leader-right joint velocities (rad/s) |
-| `follower_r_joint_pos` | `(N, 7)` float32 | Follower-right joint positions including gripper (rad) |
-| `follower_r_joint_vel` | `(N, 7)` float32 | Follower-right joint velocities (rad/s) |
-| `follower_l_joint_pos` | `(N, 7)` float32 | Follower-left joint positions including gripper (rad) |
+| `follower_r_joint_pos` | `(N, 6)` float32 | Follower-right arm joint positions (rad) |
+| `follower_r_joint_vel` | `(N, 6)` float32 | Follower-right arm joint velocities (rad/s) |
+| `follower_l_joint_pos` | `(N, 6)` float32 | Follower-left arm joint positions (rad) |
+| `follower_{l,r}_joint_pos_7d` | `(N, 7)` float32 | Six measured arm joints followed by normalized measured gripper aperture (0 closed, 1 open) |
+| `follower_{l,r}_joint_cmd` | `(N, 7)` float32 | Six commanded arm joints followed by binary operator gripper intent (0 closed, 1 open) |
+
+Only enabled arms contribute streams. Episode `metadata.json` stores the
+resolved robot channels, gripper settings, vector ordering, and camera roles
+and settings in `recording_config` for later conversion.
 
 ## Usage
 
@@ -92,11 +100,10 @@ rd record --data-dir /mnt/storage/robot_data
 
 Episodes are written to `<data-dir>/raw/<task_name>/`.
 
-!!! warning "Gripper — Risk of Mechanical Damage"
-    The follower gripper position is mapped directly from the leader trigger
-    (0 → open, 1 → closed).  **Fully depressing the trigger drives the fingers
-    to their hard stop and can break the gripper.**  Do not hold the trigger
-    fully depressed.  See [Safety](safety.md#gripper-control) for details.
+Recorded gripper commands preserve binary operator intent: **0 closed, 1 open**.
+The motor command is separately clamped to a minimum normalized opening of
+`20/95` and passed through the driver's force limiter. Measured gripper aperture
+remains continuous; it is a separate state field.
 
 During the session:
 
@@ -111,6 +118,35 @@ During the session:
   recording starts will begin the episode instead. See
   [Soft E-Stop](hardware.md#soft-e-stop) for hardware details.
 - Press **Ctrl-C** for an immediate emergency stop.
+
+## Bimanual Quest control
+
+With both follower channels and camera roles configured for the rig:
+
+```bash
+rd record --control oculus --arms bimanual --oculus-hand l
+```
+
+The left Quest controller drives the left follower, and the right controller
+drives the right follower. `--oculus-hand l` is the default and is required for
+this bimanual CLI mapping; `--oculus-hand r` would assign both followers to the
+right controller and is rejected. For a single left-labelled follower,
+`--arms single --oculus-hand r` still selects the right controller.
+
+Calibrate at the READY prompt before recording. Hold each controller's trigger
+to move its arm relative to the clutch pose; hold its grip to close that arm's
+gripper and release to open it. Either active hand can start or stop an episode.
+
+| Phase | Real recording buttons |
+|---|---|
+| READY | A/X starts; joystick click or B/Y starts or cancels calibration |
+| Recording | A/X stops; calibration buttons are ignored |
+| Verdict | Release the stop button, then press A/X again for success; joystick click or B/Y marks failure |
+
+With `--sim`, collection is single-arm and starts recording at every scene
+reset: **B/Y saves as success**, **A/X discards**, and **joystick click discards
+and starts calibration**. These simulator button meanings differ from the real
+READY/recording/verdict sequence. See [Local Isaac collection](#local-isaac-collection).
 
 ## Marking demonstrations
 

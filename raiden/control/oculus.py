@@ -108,6 +108,9 @@ class OculusInterface(TeleopInterface):
             pos_scale: robot metres per controller metre.
             rot_scale: 0..1 gain on controller rotation (0 = translation only).
         """
+        for hand in (hand_for_left_arm, hand_for_right_arm):
+            if hand not in ("l", "r"):
+                raise ValueError("Oculus controller hands must be 'l' or 'r'")
         self._ip = ip_address
         self._hand = {"left": hand_for_left_arm, "right": hand_for_right_arm}
         self._active_hands: set = set()  # controllers driving an arm; set per episode
@@ -118,6 +121,7 @@ class OculusInterface(TeleopInterface):
         self._tracking: Dict[str, str] = {}
         self._stop = threading.Event()
         self._tracker: Optional[threading.Thread] = None
+        self._button_lock = threading.Lock()
         self._event = threading.Event()
         self._success = threading.Event()
         self._failure = threading.Event()
@@ -217,7 +221,19 @@ class OculusInterface(TeleopInterface):
     # ------------------------------------------------------------------
 
     def setup(self, robot_controller) -> None:
-        """Teleop starts from the home pose; nothing to do."""
+        """Validate controller assignments before starting either follower loop."""
+        self._validate_hands(robot_controller)
+
+    def _validate_hands(self, robot_controller) -> None:
+        if (
+            robot_controller.follower_l is not None
+            and robot_controller.follower_r is not None
+            and self._hand["left"] == self._hand["right"]
+        ):
+            raise ValueError(
+                "Bimanual Oculus control requires a distinct hand for each follower; "
+                "use --oculus-hand l for left=l/right=r, or explicitly map both hands"
+            )
 
     def start(self, robot_controller) -> None:
         self._begin(robot_controller, phase=None)
@@ -229,6 +245,7 @@ class OculusInterface(TeleopInterface):
         return True
 
     def _begin(self, robot_controller, phase: Optional[str]) -> None:
+        self._validate_hands(robot_controller)
         self._reset_state()
         self._phase = phase
         arms = (
@@ -245,10 +262,25 @@ class OculusInterface(TeleopInterface):
         robot_controller.stop_cartesian_teleop()
 
     def set_active_recording(self, robot_controller=None) -> None:
-        super().set_active_recording(robot_controller)
-        self._phase = "recording" if robot_controller is not None else "verdict"
-        # A press from the previous phase must not stop this recording or decide its verdict.
-        self._clear_events()
+        with self._button_lock:
+            super().set_active_recording(robot_controller)
+            self._phase = "recording" if robot_controller is not None else "verdict"
+            # Both arm loops must agree which held buttons belong to the old phase.
+            # Otherwise one hand can stop recording before the other hand's first
+            # tick, whose delayed edge would immediately decide the verdict.
+            self._clear_events()
+            if self._reader is not None:
+                _, buttons = self._reader.get()
+                for hand in self._active_hands:
+                    keys = _KEYS[hand]
+                    stick, face = (
+                        bool(buttons.get(key, False)) for key in keys["calib"]
+                    )
+                    self._prev[hand].update(
+                        btn=bool(buttons.get(keys["btn"], False)),
+                        face=face,
+                        calib=stick or (face and not self.auto_reset),
+                    )
 
     def _clear_events(self) -> None:
         for ev in (self._event, self._success, self._failure):
@@ -302,38 +334,41 @@ class OculusInterface(TeleopInterface):
         if reader is None or reader.age > _STALE_AFTER:
             self._origin[hand] = None
             return None
-        poses, buttons = reader.get()
-        T_raw = poses.get(hand)
-        if T_raw is None:
-            self._origin[hand] = None
-            return None
-        pressed = lambda key: bool(buttons.get(key, False))
-        track = self._tracking.get(hand)  # None until the first OS reading: trusted
+        with self._button_lock:
+            poses, buttons = reader.get()
+            T_raw = poses.get(hand)
+            if T_raw is None:
+                self._origin[hand] = None
+                return None
+            def pressed(key):
+                return bool(buttons.get(key, False))
 
-        # Joystick click / B (rising edge): failure verdict after a recording stops,
-        # otherwise start or cancel calibration.  In sim collection B saves the
-        # episode instead, so only the joystick calibrates.
-        stick, face = (pressed(k) for k in keys["calib"])
-        calib = stick or (face and not self.auto_reset)
-        if calib and not self._prev[hand]["calib"]:
-            self._on_calib_press(hand)
-        self._prev[hand]["calib"] = calib
-        if self.auto_reset and face and not self._prev[hand]["face"]:
-            if self._calib[hand] is None:
-                self._success.set()
-        self._prev[hand]["face"] = face
+            track = self._tracking.get(hand)  # None until the first OS reading: trusted
 
-        btn = pressed(keys["btn"])
-        if self._calib[hand] is not None:
-            self._calibrate(hand, btn, T_raw[:3, 3], track)
+            # Joystick click / B: failure verdict after a recording stops,
+            # otherwise start or cancel calibration.  In sim collection B saves the
+            # episode instead, so only the joystick calibrates.
+            stick, face = (pressed(k) for k in keys["calib"])
+            calib = stick or (face and not self.auto_reset)
+            if calib and not self._prev[hand]["calib"]:
+                self._on_calib_press(hand)
+            self._prev[hand]["calib"] = calib
+            if self.auto_reset and face and not self._prev[hand]["face"]:
+                if self._calib[hand] is None:
+                    self._success.set()
+            self._prev[hand]["face"] = face
+
+            btn = pressed(keys["btn"])
+            if self._calib[hand] is not None:
+                self._calibrate(hand, btn, T_raw[:3, 3], track)
+                self._prev[hand]["btn"] = btn
+                return None  # arm holds still while calibrating
+            if btn and not self._prev[hand]["btn"]:
+                # Sim collection: A discards the episode and resets the scene.
+                (self._failure if self.auto_reset else self._event).set()
             self._prev[hand]["btn"] = btn
-            return None  # arm holds still while calibrating
-        if btn and not self._prev[hand]["btn"]:
-            # Sim collection: A discards the episode and resets the scene.
-            (self._failure if self.auto_reset else self._event).set()
-        self._prev[hand]["btn"] = btn
-        if self._phase == "ready":
-            return None  # every recording starts from home: hold until it starts
+            if self._phase == "ready":
+                return None  # every recording starts from home: hold until it starts
 
         # Gripper (binary, like mesa-env): grip held -> closed (0), else open (1).
         val = buttons.get(keys["grip_val"], (0.0,))
