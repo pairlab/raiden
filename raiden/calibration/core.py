@@ -286,6 +286,9 @@ class CameraCalibrator:
             method=method,
         )
 
+        if not np.isfinite(R_cam2gripper).all() or not np.isfinite(t_cam2gripper).all():
+            return {"success": False, "error": "Hand-eye solve returned nonfinite extrinsics"}
+
         # Convert rotation matrix to rotation vector
         rvec_cam2gripper, _ = cv2.Rodrigues(R_cam2gripper)
 

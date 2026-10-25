@@ -4,14 +4,15 @@ import json
 import sys
 import threading
 import time
+from contextlib import ExitStack, suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import quote
 
-import cv2
 import rerun as rr
+import rerun.blueprint as rrb
 
 from raiden._config import CALIBRATION_POSES_FILE, CAMERA_CONFIG
 from raiden.camera_config import CameraConfig
@@ -81,8 +82,8 @@ class CalibrationPoseRecorder:
         self.calibration_targets: List[str] = []
 
         self.cameras: Dict[str, Camera] = {}
-        self._camera_roles: Dict[str, Optional[str]] = {}
         self._rerun_stop_event = threading.Event()
+        self._rerun_active = False
 
     def initialize_robots(self):
         """Initialize robots based on which wrist cameras are in camera.json."""
@@ -191,65 +192,108 @@ class CalibrationPoseRecorder:
     def _open_cameras(self, warmup_frames: int = 10) -> None:
         """Open all cameras from config for live Rerun visualization."""
         cfg = CameraConfig(self.camera_config_file)
-        for name in cfg.list_camera_names():
-            try:
+        camera_names = cfg.list_camera_names()
+        if not camera_names:
+            raise ValueError(
+                f"No cameras configured in {self.camera_config_file}. "
+                "Configure the calibration cameras before recording poses."
+            )
+
+        try:
+            for name in camera_names:
                 cam = cfg.create_camera(name)
-                cam.open()
+                # Keep partially opened cameras reachable for cleanup as well.
                 self.cameras[name] = cam
-                self._camera_roles[name] = cfg.get_role(name)
-            except Exception as e:
-                print(f"  Warning: could not open camera '{name}': {e}")
-        if self.cameras:
+                cam.open()
             print(f"  Warming up {len(self.cameras)} camera(s)...")
             for _ in range(warmup_frames):
-                for cam in self.cameras.values():
-                    cam.grab()
+                for name, cam in self.cameras.items():
+                    if not cam.grab():
+                        raise RuntimeError(
+                            f"Camera '{name}' did not provide a frame during warmup"
+                        )
+        except BaseException:
+            for cam in self.cameras.values():
+                with suppress(Exception):
+                    cam.close()
+            self.cameras.clear()
+            raise
 
     def _rerun_stream(self) -> None:
-        rr.init("raiden_calibration")
+        frame_idx = 0
+        while not self._rerun_stop_event.is_set():
+            # Show fresh frames at up to 10 Hz while the terminal handles pose commands.
+            for name, cam in self.cameras.items():
+                if self._rerun_stop_event.is_set():
+                    break
+                try:
+                    if cam.grab():
+                        frame = cam.get_frame()
+                        rr.set_time("frame", sequence=frame_idx)
+                        rr.log(
+                            f"cameras/{name}",
+                            rr.Image(frame.color, color_model="BGR").compress(jpeg_quality=85),
+                        )
+                except Exception:
+                    pass
+            frame_idx += 1
+            self._rerun_stop_event.wait(0.1)
+
+    def _start_rerun_stream(self) -> None:
+        if not self.cameras:
+            return
+        panels = [
+            rrb.Spatial2DView(origin=f"/cameras/{name}", name=name)
+            for name in self.cameras
+        ]
+        rr.init(
+            "raiden_calibration",
+            default_blueprint=rrb.Blueprint(
+                rrb.Horizontal(*panels), collapse_panels=True
+            ),
+        )
+        self._rerun_active = True
         grpc_port = 9878
         web_port = 9877
         server_uri = rr.serve_grpc(grpc_port=grpc_port)
-        rr.serve_web_viewer(web_port=web_port, open_browser=False)
+        rr.serve_web_viewer(
+            web_port=web_port, open_browser=True, connect_to=server_uri
+        )
         viewer_url = f"http://localhost:{web_port}?url={quote(server_uri, safe='')}"
         print(f"\nRerun viewer:    {viewer_url}")
         print(
             f"SSH tunnel:      ssh -L {web_port}:localhost:{web_port} -L {grpc_port}:localhost:{grpc_port} <host>"
         )
+        print("Preview opens in your browser; keep this terminal focused for R/D/L/Q.")
         print()
-        frame_idx = 0
-        while not self._rerun_stop_event.is_set():
-            # Drain the camera buffer by grabbing at full rate, but only log once per second.
-            for name, cam in self.cameras.items():
-                try:
-                    if cam.grab():
-                        frame = cam.get_frame()
-                        color = frame.color
-                        if self._camera_roles.get(name) == "right_wrist":
-                            color = cv2.rotate(color, cv2.ROTATE_180)
-                        img_rgb = color[:, :, ::-1]  # BGR → RGB
-                        rr.set_time("frame", sequence=frame_idx)
-                        rr.log(f"cameras/{name}", rr.Image(img_rgb))
-                except Exception:
-                    pass
-            frame_idx += 1
-            self._rerun_stop_event.wait(1.0)
-
-    def _start_rerun_stream(self) -> None:
-        if not self.cameras:
-            return
         self._rerun_stop_event.clear()
-        self._rerun_thread = threading.Thread(target=self._rerun_stream, daemon=True)
-        self._rerun_thread.start()
+        thread = threading.Thread(target=self._rerun_stream, daemon=True)
+        thread.start()
+        self._rerun_thread = thread
         print(f"  ✓ Rerun stream started ({len(self.cameras)} camera(s))")
 
     def _stop_rerun_stream(self) -> None:
         self._rerun_stop_event.set()
         if hasattr(self, "_rerun_thread"):
-            self._rerun_thread.join(timeout=2.0)
+            # Finish any in-flight SDK call before closing its camera handle.
+            self._rerun_thread.join()
         for cam in self.cameras.values():
-            cam.close()
+            with suppress(Exception):
+                cam.close()
         self.cameras.clear()
+        if self._rerun_active:
+            rr.disconnect()
+            self._rerun_active = False
+
+    def _cleanup(self) -> None:
+        """Attempt all teardown without homing or terminating the process."""
+        with ExitStack() as cleanup:
+            if self.robot_controller:
+                cleanup.callback(self.robot_controller.close)
+            cleanup.callback(self._stop_rerun_stream)
+            cleanup.callback(self.interface.close)
+            if self.robot_controller:
+                cleanup.callback(self.robot_controller.stop_teleoperation)
 
     def run_interactive_recording(self, min_poses: int = 5):
         """Run interactive pose recording session"""
@@ -265,11 +309,18 @@ class CalibrationPoseRecorder:
         # Open cameras and start Rerun visualization
         print("\nOpening cameras for live visualization...")
         self._open_cameras()
-        self._start_rerun_stream()
+        try:
+            self._start_rerun_stream()
 
-        # Initialize robots and open interface peripherals (footpedal, etc.)
-        self.initialize_robots()
-        self.interface.open()
+            # Initialize robots and open interface peripherals (footpedal, etc.)
+            self.initialize_robots()
+            self.interface.open()
+        except BaseException as error:
+            try:
+                self._cleanup()
+            except Exception as cleanup_error:
+                error.add_note(f"Pose recorder cleanup also failed: {cleanup_error!r}")
+            raise
 
         # Setup signal handlers for emergency stop (SIGTERM)
         # Note: SIGINT (Ctrl+C) is handled via KeyboardInterrupt for graceful save
@@ -463,11 +514,7 @@ class CalibrationPoseRecorder:
             if self.robot_controller and self.robot_controller.has_robots():
                 self.robot_controller.emergency_stop()
         finally:
-            self.interface.close()
-            self._stop_rerun_stream()
-            # Cleanup robots
-            if self.robot_controller:
-                self.robot_controller.cleanup()
+            self._cleanup()
 
 
 def run_calibration_pose_recording(

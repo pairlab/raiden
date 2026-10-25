@@ -52,6 +52,7 @@ import numpy as np
 from tqdm import tqdm
 
 from raiden._config import CAMERA_CONFIG
+from raiden.calibration_utils import left_from_right
 
 _SEQUENCE_NAME = "0000"
 _IMG_EXT = ".png"
@@ -1350,13 +1351,7 @@ def convert_recording(
         with open(calib_path) as f:
             calib = json.load(f)
 
-    # "right_base_to_left_base" maps left_arm_base → right_arm_base (despite the name).
-    # Invert to get the transform that brings right_arm_base points into left_arm_base.
-    T_left_base_from_right_base: Optional[np.ndarray] = None
-    if calib and "bimanual_transform" in calib:
-        mat = calib["bimanual_transform"].get("right_base_to_left_base")
-        if mat is not None:
-            T_left_base_from_right_base = np.linalg.inv(np.array(mat, dtype=np.float32))
+    T_left_base_from_right_base = left_from_right(calib or {})
     # ── extract frames ────────────────────────────────────────────────────
     frame_counts: Dict[str, int] = {}
     camera_infos: Dict[str, Optional[dict]] = {}

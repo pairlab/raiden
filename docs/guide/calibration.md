@@ -22,24 +22,32 @@ paper prints.
 
 ## Step 2 - Record calibration poses
 
-Move the robot to a series of diverse poses while the board is visible. At
-least **5 poses** are required; 7–10 is recommended for good coverage.
+Move the robot to a series of diverse poses while the board is visible. The
+pose recorder defaults to a minimum target of **5 poses**. For the bimanual rig,
+record **12–16 distinct stationary configurations per wrist**, varying depth,
+position, and rotation about at least two axes. The solver's three valid
+observations per wrist is a numerical minimum, not a quality criterion; the
+runner also requires at least three board detections per target camera.
 
 ```bash
 rd record_calibration_poses
 ```
 
-A live Rerun viewer opens automatically in your browser so you can verify that
-the board is visible from all cameras before recording each pose. The URL and
-an SSH tunnel command are printed to the terminal:
+The recorder stops before robot initialization if the camera configuration is
+empty or any configured camera fails to open or provide warmup frames.
+
+A live Rerun preview opens automatically in your browser, with each configured
+camera shown side by side so you can check that the board is in frame before
+recording each pose. Keep the recorder terminal focused for keyboard commands.
+If the browser does not open (for example, over SSH), open the printed URL;
+the terminal also prints an SSH tunnel command:
 
 ```
 Rerun viewer:    http://localhost:9877?url=...
 SSH tunnel:      ssh -L 9877:localhost:9877 -L 9878:localhost:9878 <host>
 ```
 
-Images are refreshed at **1 Hz**. The right wrist camera image is
-automatically rotated 180° to correct for its upside-down mounting.
+Images are refreshed at up to **10 Hz** in each camera's native orientation.
 
 Keyboard controls:
 
@@ -49,6 +57,94 @@ Keyboard controls:
 - **Q** - quit (saves if enough poses recorded)
 
 Poses are saved to `~/.config/raiden/calibration_poses.json`.
+
+### Bimanual Quest capture with the previous 4×5 board
+
+The previous target was **4×5 squares, 50 mm squares, 37 mm markers,
+`DICT_6X6_250`**. Dimensions below are in metres. Check the actual print scale
+if the board has been reprinted. Secure the board flat and keep it fixed
+throughout pose recording and calibration, including while switching arms.
+
+On the robot host, `camera.json` must assign `left_wrist`, `right_wrist`, and
+`scene` roles to the intended cameras. The wrist roles enable both followers;
+Quest uses the left controller for the left arm and the right controller for
+the right arm. The same driver reads the optional
+`~/.config/raiden/robot.json` CAN mapping:
+
+```json
+{"follower_l": "can_left", "follower_r": "can_right"}
+```
+
+Without this file the historical `can_follower_l` / `can_follower_r` names are
+used. These instructions do not install or change a live robot profile.
+
+From the Raiden checkout, using its installed environment:
+
+```bash
+rd record_calibration_poses \
+    --control oculus \
+    --min-poses 12 \
+    --camera-config-file ~/.config/raiden/camera.json \
+    --output-file ~/.config/raiden/bimanual/calibration_poses.json \
+    --squares-x 4 --squares-y 5 \
+    --square-length 0.05 --marker-length 0.037 \
+    --dictionary DICT_6X6_250
+```
+
+**This command initializes and homes both enabled arms**, signals readiness
+with the grippers, and starts Quest teleoperation. Calibrate each controller's
+headset-to-robot axes if needed (joystick click or B/Y, then the prompted
+A/X-held +x and +y gestures). Hold that hand's trigger to move its arm;
+release it and let the arm settle before saving a pose. A/X or keyboard **R**
+saves the measured joints of **both arms** in one entry. **D** removes the last
+entry, **L** lists entries, and **Q** saves and returns the arms home.
+
+You may position one arm at a time. Give each wrist its own diverse set of
+views; twelve entries with one arm stationary provide no useful diversity for
+that wrist. Both wrists may observe the fixed board at different poses or
+times. Keep the scene camera's view of the board clear as well. The Rerun
+preview preserves native image orientation; calibration uses native pixels
+and matching factory intrinsics.
+
+Pose recording saves joint configurations and board metadata. It does **not**
+save calibration image pairs or solve camera transforms.
+
+Then run the capture and solve separately:
+
+Repeat the board flags: the calibration CLI's board options override the
+metadata stored by the pose recorder, including when its defaults are used.
+
+```bash
+rd calibrate \
+    --camera-config-file ~/.config/raiden/camera.json \
+    --poses-file ~/.config/raiden/bimanual/calibration_poses.json \
+    --output-file ~/.config/raiden/bimanual/calibration_results.candidate.json \
+    --squares-x 4 --squares-y 5 \
+    --square-length 0.05 --marker-length 0.037 \
+    --dictionary DICT_6X6_250
+```
+
+**This command moves both arms automatically**: it homes them, replays the
+saved joint configurations with simultaneous arm moves, waits for settling,
+and captures images and measured joints. Manual teleop paths are not saved,
+so replay interpolates directly between the saved configurations. Choose
+successive configurations with clear paths for both arms.
+
+Native images, intrinsics, stable pose IDs, and both measured joint vectors
+are retained beside the candidate under
+`bimanual/calibration_captures/<timestamp>/captures.json`. Failed detections
+and failed pose estimates are excluded with their corresponding joint poses.
+The solve rejects missing or invalid extrinsics before writing the candidate.
+Inspect reprojection consistency on withheld wrist poses and confirm the
+mount stays rigid before using the result as measured ground truth.
+
+The explicit candidate output leaves the active
+`~/.config/raiden/calibration_results.json` untouched. Loading accepted results
+into Isaac is a separate step: compose each hand–eye with the same YAM
+`grasp_site` frame used by FK, then convert OpenCV optical axes into the
+renderer camera convention. This workflow reads factory intrinsics and
+distortion; it estimates wrist hand–eye transforms, the inter-base transform,
+and scene-camera extrinsics rather than refitting intrinsics.
 
 ## Step 3 - Run calibration
 
@@ -129,10 +225,17 @@ The runner will:
     }
   },
   "bimanual_transform": {
-    "right_base_to_left_base": [[1, 0, 0, -0.612], [0, 1, 0, 0.0], [0, 0, 1, 0.0], [0, 0, 0, 1]],
+    "T_left_from_right": [[1, 0, 0, 0.612], [0, 1, 0, 0.0], [0, 0, 1, 0.0], [0, 0, 0, 1]],
     "computed_from_calibration": true,
-    "description": "Transform from right arm base frame to left arm base frame"
+    "direction": "T_left_from_right maps right_arm_base points into left_arm_base"
   }
 }
 ```
+
+New files also retain the historical `right_base_to_left_base` field for
+compatibility. Despite its name, that legacy field maps **left-base points
+into right-base coordinates**, so it is the inverse of `T_left_from_right`.
+Conversion and serving prefer the explicit canonical field and invert the
+legacy field when reading older artifacts. Scene-only calibration, without a
+calibrated left wrist, reports scene extrinsics in the board frame.
 

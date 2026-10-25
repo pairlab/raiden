@@ -54,6 +54,17 @@ DEVICE_FIELDS = (
 )
 
 
+def color_stream_sensor(device):
+    """Find the sensor that produces color, including D405's depth sensor."""
+    for sensor in device.query_sensors():
+        if any(
+            profile.stream_type() == rs.stream.color
+            for profile in sensor.get_stream_profiles()
+        ):
+            return sensor
+    raise RuntimeError("No RealSense sensor provides a color stream")
+
+
 def device_color_receipt(device) -> dict:
     """Snapshot identity/options using getters only, including missing readbacks.
 
@@ -94,7 +105,7 @@ def device_color_receipt(device) -> dict:
             result["device"][name] = None
             result["readback_errors"][name] = str(error)
     try:
-        sensor = device.first_color_sensor()
+        sensor = color_stream_sensor(device)
     except Exception as error:
         result["readback_errors"]["color_sensor"] = str(error)
         return result

@@ -218,6 +218,24 @@ class RecordCalibrationPosesCommand:
     output_file: str = CALIBRATION_POSES_FILE
     """Path to save calibration poses"""
 
+    camera_config_file: str = CAMERA_CONFIG
+    """Path to camera.json; wrist roles select the follower arms"""
+
+    squares_x: int = 9
+    """Number of squares along the X axis of the ChArUco board"""
+
+    squares_y: int = 9
+    """Number of squares along the Y axis of the ChArUco board"""
+
+    square_length: float = 0.03
+    """Checker square side length in metres"""
+
+    marker_length: float = 0.023
+    """ArUco marker side length in metres"""
+
+    dictionary: str = "DICT_6X6_250"
+    """ArUco dictionary"""
+
     control: Literal["leader", "spacemouse", "oculus"] = "leader"
     """Control mode: leader-follower arms, SpaceMouse EE velocity, or Quest controllers"""
 
@@ -470,6 +488,10 @@ def main():
     if len(sys.argv) > 1:
         subcommand = sys.argv[1]
 
+        if subcommand in ("-h", "--help"):
+            _print_help()
+            return
+
         if subcommand == "teleop":
             sys.argv.pop(1)
             sm = _load_spacemouse_config()
@@ -575,6 +597,8 @@ def main():
                 description="Record robot poses for camera calibration",
             )
             sm = _load_spacemouse_config()
+            from raiden.calibration.recorder import ChArUcoBoardConfig
+
             run_calibration_pose_recording(
                 interface=build_interface(
                     command.control,
@@ -586,7 +610,14 @@ def main():
                 ),
                 min_poses=command.min_poses,
                 output_file=command.output_file,
-                camera_config_file=CAMERA_CONFIG,
+                camera_config_file=command.camera_config_file,
+                charuco_config=ChArUcoBoardConfig(
+                    squares_x=command.squares_x,
+                    squares_y=command.squares_y,
+                    square_length=command.square_length,
+                    marker_length=command.marker_length,
+                    dictionary=command.dictionary,
+                ),
             )
 
         elif subcommand == "calibrate":

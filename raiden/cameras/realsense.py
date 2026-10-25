@@ -55,7 +55,11 @@ import numpy as np
 import pyrealsense2 as rs
 
 from .base import Camera, CameraFrame
-from .realsense_receipt import color_frame_receipt, device_color_receipt
+from .realsense_receipt import (
+    color_frame_receipt,
+    color_stream_sensor,
+    device_color_receipt,
+)
 
 
 def _enable_global_time(device: rs.device) -> None:
@@ -129,12 +133,6 @@ class RealSenseCamera(Camera):
         self._serial = serial_number
         self._fps = fps
         self._depth = depth
-        if color_controls is not None and color_controls["exposure"] > 10_000 / fps:
-            # An exposure longer than the frame period lowers the frame rate.
-            raise ValueError(
-                f"[{camera_name}] exposure {color_controls['exposure']} (100 µs) "
-                f"is longer than a frame at {fps} fps"
-            )
         self._color_controls = dict(color_controls) if color_controls else None
         self._color_applied: Optional[dict] = None
         if resolution is not None:
@@ -198,10 +196,29 @@ class RealSenseCamera(Camera):
         set after every pipeline start, and a camera without controls is set
         to auto explicitly rather than left as another tool set it.
         """
-        sensor = device.first_color_sensor()
+        sensor = color_stream_sensor(device)
         lock = self._color_controls is not None
-        sensor.set_option(rs.option.enable_auto_exposure, 0 if lock else 1)
-        sensor.set_option(rs.option.enable_auto_white_balance, 0 if lock else 1)
+        if lock:
+            unsupported = [
+                key for key in COLOR_CONTROLS
+                if not sensor.supports(getattr(rs.option, key))
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"[{self._name}] color sensor does not support requested controls: "
+                    + ", ".join(unsupported)
+                )
+            # D405 color shares the depth sensor's microsecond exposure control.
+            # Separate D435 RGB sensors retain the historical 100 µs units.
+            exposure_unit_us = 1 if sensor.is_depth_sensor() else 100
+            if self._color_controls["exposure"] * exposure_unit_us > 1_000_000 / self._fps:
+                raise ValueError(
+                    f"[{self._name}] exposure {self._color_controls['exposure']} "
+                    f"({exposure_unit_us} µs) is longer than a frame at {self._fps} fps"
+                )
+        for option in (rs.option.enable_auto_exposure, rs.option.enable_auto_white_balance):
+            if sensor.supports(option):
+                sensor.set_option(option, 0 if lock else 1)
         if not lock:
             self._color_applied = None
             return

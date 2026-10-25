@@ -14,6 +14,9 @@ from raiden.cameras.realsense_receipt import (
 
 
 class Sensor:
+    def get_stream_profiles(self):
+        return [SimpleNamespace(stream_type=lambda: rs.stream.color)]
+
     def supports(self, key):
         return key in (rs.option.exposure, rs.option.gain, rs.option.gamma)
 
@@ -47,8 +50,8 @@ class Device:
             rs.camera_info.serial_number: "test",
         }[key]
 
-    def first_color_sensor(self):
-        return Sensor()
+    def query_sensors(self):
+        return [Sensor()]
 
 
 class ReceiptTest(unittest.TestCase):
@@ -75,7 +78,7 @@ class ReceiptTest(unittest.TestCase):
 
     def test_readback_failure_remains_visible(self):
         device = Device()
-        device.first_color_sensor = lambda: (_ for _ in ()).throw(
+        device.query_sensors = lambda: (_ for _ in ()).throw(
             RuntimeError("sensor unavailable")
         )
         self.assertIn(

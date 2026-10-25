@@ -22,6 +22,7 @@ from raiden.calibration.core import (
     save_calibration_results,
 )
 from raiden.camera_config import CameraConfig
+from raiden.calibration_utils import validate_transform
 from raiden.cameras.base import Camera
 from raiden.robot.controller import RobotController, smooth_move_joints
 
@@ -37,13 +38,11 @@ def compute_bimanual_base_transform_from_calibration(
     left_hand_eye_result: Dict,
     right_hand_eye_result: Dict,
 ) -> np.ndarray:
-    """Compute transform from right arm base to left arm base after hand-eye calibrations
+    """Compute the legacy left-base to right-base transform after hand–eye calibration.
 
-    Uses hand-eye calibration results for both arms:
-    1. For each pose, compute board position from left arm: left_base -> left_ee -> left_cam -> board
-    2. For each pose, compute board position from right arm: right_base -> right_ee -> right_cam -> board
-    3. Since board is fixed, both should point to same location in world
-    4. Compute offset between bases and average across poses
+    The board must remain fixed, but each arm may observe it at different times.
+    Each robot pose must correspond to its own board observation. Average the
+    board pose in each base independently, then relate the two base frames.
 
     Args:
         left_arm_poses: List of T_left_base_to_left_ee transforms
@@ -54,7 +53,8 @@ def compute_bimanual_base_transform_from_calibration(
         right_hand_eye_result: Hand-eye calibration result for right wrist (T_right_cam_to_right_ee)
 
     Returns:
-        T_right_base_to_left_base: 4x4 transformation matrix
+        Historical serialized transform, mapping LEFT-base points into RIGHT-base
+        coordinates, despite the legacy ``right_base_to_left_base`` name.
     """
     if len(left_arm_poses) < 1 or len(right_arm_poses) < 1:
         raise ValueError("Need at least 1 pose from both arms")
@@ -64,14 +64,11 @@ def compute_bimanual_base_transform_from_calibration(
 
     from scipy.spatial.transform import Rotation
 
-    num_poses = min(
-        len(left_arm_poses),
-        len(right_arm_poses),
-        len(left_board_poses),
-        len(right_board_poses),
-    )
+    if len(left_arm_poses) != len(left_board_poses) or len(right_arm_poses) != len(right_board_poses):
+        raise ValueError("Each arm's robot poses and board observations must correspond")
     print(
-        f"    Using hand-eye calibrations to compute bimanual base transform ({num_poses} poses)..."
+        "    Computing bimanual base transform from "
+        f"{len(left_arm_poses)} left / {len(right_arm_poses)} right observations..."
     )
 
     # Extract hand-eye transforms (camera to end-effector)
@@ -94,63 +91,22 @@ def compute_bimanual_base_transform_from_calibration(
             f"    Warning: Rotation matrices are not orthogonal (det_left={det_left:.4f}, det_right={det_right:.4f})"
         )
 
-    # For each pose, compute board position from each base frame
-    transforms = []
+    def mean_board_pose(robot_poses, board_poses, hand_eye):
+        transforms = []
+        for robot_pose, (rvec, tvec) in zip(robot_poses, board_poses):
+            board_to_camera = np.eye(4)
+            board_to_camera[:3, :3] = cv2.Rodrigues(rvec)[0]
+            board_to_camera[:3, 3] = np.asarray(tvec).reshape(3)
+            transforms.append(robot_pose @ hand_eye @ board_to_camera)
+        mean = np.eye(4)
+        mean[:3, :3] = Rotation.from_matrix([T[:3, :3] for T in transforms]).mean().as_matrix()
+        mean[:3, 3] = np.mean([T[:3, 3] for T in transforms], axis=0)
+        return mean
 
-    for i in range(num_poses):
-        # Get robot FK poses
-        T_left_base_to_left_ee = left_arm_poses[i]
-        T_right_base_to_right_ee = right_arm_poses[i]
-
-        # Get board observations (board-to-camera)
-        rvec_l, tvec_l = left_board_poses[i]
-        R_l, _ = cv2.Rodrigues(rvec_l)
-        T_board_to_left_cam = np.eye(4)
-        T_board_to_left_cam[:3, :3] = R_l
-        T_board_to_left_cam[:3, 3] = tvec_l.flatten()
-
-        rvec_r, tvec_r = right_board_poses[i]
-        R_r, _ = cv2.Rodrigues(rvec_r)
-        T_board_to_right_cam = np.eye(4)
-        T_board_to_right_cam[:3, :3] = R_r
-        T_board_to_right_cam[:3, 3] = tvec_r.flatten()
-
-        # Correct chain: T^base_board = T^base_ee @ T^ee_cam @ T^cam_board
-        # = FK @ hand_eye_result @ ChArUco_result
-        # No inversions needed:
-        #   - T_left_base_to_left_ee  = FK               = T^base_ee  (transforms ee->base)
-        #   - T_left_cam_to_left_ee   = hand-eye output  = T^ee_cam   (transforms cam->ee)
-        #   - T_board_to_left_cam     = ChArUco output   = T^cam_board (transforms board->cam)
-
-        T_left_base_to_board = (
-            T_left_base_to_left_ee @ T_left_cam_to_left_ee @ T_board_to_left_cam
-        )
-
-        T_right_base_to_board = (
-            T_right_base_to_right_ee @ T_right_cam_to_right_ee @ T_board_to_right_cam
-        )
-
-        # Since board is fixed: T_left_base_to_board = T_left_base_to_right_base @ T_right_base_to_board
-        # Therefore: T_left_base_to_right_base = T_left_base_to_board @ inv(T_right_base_to_board)
-        T_left_base_to_right_base = T_left_base_to_board @ np.linalg.inv(
-            T_right_base_to_board
-        )
-
-        # We want T_right_base_to_left_base = inv(T_left_base_to_right_base)
-        T_right_base_to_left_base = np.linalg.inv(T_left_base_to_right_base)
-
-        transforms.append(T_right_base_to_left_base)
-
-    # Average the transforms across all poses
-    rotations = [Rotation.from_matrix(T[:3, :3]) for T in transforms]
-    translations = [T[:3, 3] for T in transforms]
-
-    avg_rotation = Rotation.concatenate(rotations).mean()
-    avg_translation = np.mean(translations, axis=0)
-
-    T_right_base_to_left_base = np.eye(4)
-    T_right_base_to_left_base[:3, :3] = avg_rotation.as_matrix()
-    T_right_base_to_left_base[:3, 3] = avg_translation
+    T_left_board = mean_board_pose(left_arm_poses, left_board_poses, T_left_cam_to_left_ee)
+    T_right_board = mean_board_pose(right_arm_poses, right_board_poses, T_right_cam_to_right_ee)
+    # Preserve the historical numeric contract for existing readers.
+    T_right_base_to_left_base = T_right_board @ np.linalg.inv(T_left_board)
 
     print(
         f"    Bimanual transform (T_right_base_to_left_base) translation: {T_right_base_to_left_base[:3, 3]}"
@@ -232,6 +188,7 @@ class CalibrationRunner:
 
         self.robot_controller: Optional[RobotController] = None
         self.cameras: Dict[str, Camera] = {}
+        self._wrist_arms: Dict[str, str] = {}
         self._move_stop_event = threading.Event()
         self._captures: List[Dict] = []
 
@@ -294,15 +251,16 @@ class CalibrationRunner:
 
             print(f"  - Initializing {name} ({cam_type}, serial: {serial})...")
             camera = self.camera_config.create_camera(name)
-            camera.open()
             self.cameras[name] = camera
+            camera.open()
 
         # Warm up all cameras together after all are open, so each one has had
         # time to stabilize regardless of how many cameras are connected.
         print(f"  Warming up cameras ({warmup_frames} frames)...")
         for _ in range(warmup_frames):
-            for camera in self.cameras.values():
-                camera.grab()
+            for name, camera in self.cameras.items():
+                if not camera.grab():
+                    raise RuntimeError(f"Camera warmup failed for {name}")
 
         print("✓ Cameras initialized")
 
@@ -363,37 +321,29 @@ class CalibrationRunner:
         )
 
         # Step 2: Estimate board poses from both cameras
-        left_board_poses = self._estimate_board_poses(
+        left_robot_poses, left_board_poses = self._valid_wrist_observations(
             left_data,
             left_cam_matrix.tolist(),
             left_dist_coeffs.tolist(),
         )
-        right_board_poses = self._estimate_board_poses(
+        right_robot_poses, right_board_poses = self._valid_wrist_observations(
             right_data,
             right_cam_matrix.tolist(),
             right_dist_coeffs.tolist(),
         )
 
-        # Match valid poses
-        valid_poses = self._match_valid_poses(
-            left_data["robot_poses"],
-            right_data["robot_poses"],
-            left_board_poses,
-            right_board_poses,
-        )
-
-        if not valid_poses:
-            print("  ✗ No valid pose pairs found")
+        if len(left_robot_poses) < 3 or len(right_robot_poses) < 3:
+            print("  ✗ Need at least 3 valid observations per arm")
             return False
 
         print(
-            f"  Step 2: Computing hand-eye calibrations ({len(valid_poses['left_robot'])} pose pairs)..."
+            "  Step 2: Computing hand-eye calibrations..."
         )
 
         # Step 3: Compute left hand-eye calibration (in left arm base frame)
         print("    Computing left wrist hand-eye calibration...")
         left_hand_eye_result = self.calibrator.calibrate_hand_eye(
-            valid_poses["left_robot"], valid_poses["left_board"]
+            left_robot_poses, left_board_poses
         )
 
         if not left_hand_eye_result["success"]:
@@ -409,7 +359,7 @@ class CalibrationRunner:
         # Step 4: Compute right hand-eye calibration (in right arm base frame)
         print("    Computing right wrist hand-eye calibration...")
         right_hand_eye_result = self.calibrator.calibrate_hand_eye(
-            valid_poses["right_robot"], valid_poses["right_board"]
+            right_robot_poses, right_board_poses
         )
 
         if not right_hand_eye_result["success"]:
@@ -426,16 +376,16 @@ class CalibrationRunner:
         print("  Step 3: Computing bimanual base transform from hand-eye results...")
 
         T_RIGHT_BASE_TO_LEFT_BASE = compute_bimanual_base_transform_from_calibration(
-            valid_poses["left_robot"],
-            valid_poses["right_robot"],
-            valid_poses["left_board"],
-            valid_poses["right_board"],
+            left_robot_poses,
+            right_robot_poses,
+            left_board_poses,
+            right_board_poses,
             left_hand_eye_result,
             right_hand_eye_result,
         )
 
         print(
-            f"    ✓ Bimanual transform computed from {len(valid_poses['left_robot'])} pose pair(s)"
+            "    ✓ Bimanual transform computed from both arms"
         )
 
         # Step 6: Transform right arm poses to left base frame
@@ -460,47 +410,46 @@ class CalibrationRunner:
             rvec, tvec = self.calibrator.detector.estimate_pose(
                 corners, ids, camera_matrix_np, dist_coeffs_np
             )
-            if rvec is not None:
-                board_poses.append((rvec, tvec))
+            board_poses.append((rvec, tvec) if rvec is not None else None)
 
         return board_poses
 
-    def _match_valid_poses(
-        self,
-        left_robot_poses: List,
-        right_robot_poses: List,
-        left_board_poses: List,
-        right_board_poses: List,
-    ) -> Optional[Dict]:
-        """Match valid pose pairs from both arms"""
-        valid_left_robot = []
-        valid_right_robot = []
-        valid_left_board = []
-        valid_right_board = []
+    def _valid_wrist_observations(self, data: Dict, camera_matrix, distortion_coeffs):
+        """Filter FK and PnP together so a failed observation never shifts a pair."""
+        boards = self._estimate_board_poses(data, camera_matrix, distortion_coeffs)
+        if len(boards) != len(data["robot_poses"]):
+            raise ValueError("Robot and board observation counts do not match")
+        pairs = [
+            (robot, board)
+            for robot, board in zip(data["robot_poses"], boards)
+            if robot is not None and board is not None
+        ]
+        return [robot for robot, _ in pairs], [board for _, board in pairs]
 
-        min_len = min(
-            len(left_robot_poses),
-            len(right_robot_poses),
-            len(left_board_poses),
-            len(right_board_poses),
-        )
-
-        for i in range(min_len):
-            if left_robot_poses[i] is not None and right_robot_poses[i] is not None:
-                valid_left_robot.append(left_robot_poses[i])
-                valid_right_robot.append(right_robot_poses[i])
-                valid_left_board.append(left_board_poses[i])
-                valid_right_board.append(right_board_poses[i])
-
-        if not valid_left_robot:
-            return None
-
-        return {
-            "left_robot": valid_left_robot,
-            "right_robot": valid_right_robot,
-            "left_board": valid_left_board,
-            "right_board": valid_right_board,
-        }
+    @staticmethod
+    def _validate_results(results: Dict, target_cameras: List[str], bimanual_required: bool):
+        """Reject incomplete or invalid solves before replacing the result file."""
+        if not target_cameras:
+            raise ValueError("No calibration cameras selected")
+        if bimanual_required and not results.get("bimanual_transform"):
+            raise ValueError("Bimanual base calibration failed")
+        for name in target_cameras:
+            camera = results["cameras"].get(name, {})
+            key = "hand_eye_calibration" if camera.get("type") == "hand_eye" else "extrinsics"
+            extrinsics = camera.get(key, {})
+            if not extrinsics.get("success"):
+                raise ValueError(f"Missing successful {key} for {name}")
+            transform = np.eye(4)
+            try:
+                transform[:3, :3] = np.asarray(extrinsics["rotation_matrix"], dtype=float).reshape(3, 3)
+                transform[:3, 3] = np.asarray(extrinsics["translation_vector"], dtype=float).reshape(3)
+            except (KeyError, ValueError, TypeError) as exc:
+                raise ValueError(f"Invalid extrinsics for {name}") from exc
+            validate_transform(transform, name)
+            if key == "extrinsics" and extrinsics.get("reference_frame") != results["coordinate_frame"]:
+                raise ValueError(f"{name} extrinsics are not in {results['coordinate_frame']}")
+        if bimanual_required:
+            validate_transform(results["bimanual_transform"]["T_left_from_right"], "T_left_from_right")
 
     def _save_captures(self) -> Path:
         """Write each pose's images, measured joints and the camera intrinsics to disk.
@@ -533,11 +482,14 @@ class CalibrationRunner:
             files = {}
             for name, image in capture["images"].items():
                 files[name] = f"{i:02d}_{name}.png"
-                cv2.imwrite(str(out_dir / files[name]), image)
+                if not cv2.imwrite(str(out_dir / files[name]), image):
+                    raise OSError(f"Could not save calibration image: {out_dir / files[name]}")
             poses.append(
                 {
+                    "id": capture["id"],
                     "pose": capture["pose"],
                     "joints_l": capture["joints_l"],
+                    "joints_r": capture["joints_r"],
                     "images": files,
                 }
             )
@@ -575,10 +527,10 @@ class CalibrationRunner:
                 "corners": [],
                 "ids": [],
                 "robot_poses": [],
-                "joint_positions": [],  # Store joint positions for bimanual transform computation
-                "arm_type": "left"
-                if "left" in name
-                else ("right" if "right" in name else None),
+                "observation_ids": [],
+                "arm_type": self._wrist_arms.get(name) or {
+                    "left_wrist": "left", "right_wrist": "right"
+                }.get(self.camera_config.get_role(name)),
             }
             for name in self.cameras.keys()
         }
@@ -592,13 +544,21 @@ class CalibrationRunner:
             # Move robots to pose (only if we have robots)
             if self.robot_controller:
                 threads = []
+                move_errors = []
+
+                def move(robot, target):
+                    try:
+                        smooth_move_joints(robot, target, stop_event=self._move_stop_event)
+                    except BaseException as exc:
+                        move_errors.append(exc)
+                        self._move_stop_event.set()
+
                 if self.robot_controller.follower_r and "follower_r" in pose:
                     target_r = np.array(pose["follower_r"])
                     threads.append(
                         threading.Thread(
-                            target=smooth_move_joints,
+                            target=move,
                             args=(self.robot_controller.follower_r, target_r),
-                            kwargs={"stop_event": self._move_stop_event},
                             daemon=True,
                         )
                     )
@@ -606,9 +566,8 @@ class CalibrationRunner:
                     target_l = np.array(pose["follower_l"])
                     threads.append(
                         threading.Thread(
-                            target=smooth_move_joints,
+                            target=move,
                             args=(self.robot_controller.follower_l, target_l),
-                            kwargs={"stop_event": self._move_stop_event},
                             daemon=True,
                         )
                     )
@@ -617,10 +576,19 @@ class CalibrationRunner:
                     print(
                         f"  Moving {'both arms' if len(threads) > 1 else 'arm'} simultaneously..."
                     )
-                    for t in threads:
-                        t.start()
-                    for t in threads:
-                        t.join()
+                    try:
+                        for t in threads:
+                            t.start()
+                        for t in threads:
+                            t.join()
+                    except BaseException:
+                        self._move_stop_event.set()
+                        for t in threads:
+                            if t.ident is not None:
+                                t.join()
+                        raise
+                    if move_errors:
+                        raise RuntimeError("Calibration pose movement failed") from move_errors[0]
 
                 # Wait for stabilization
                 print("  Waiting for stabilization...")
@@ -632,6 +600,14 @@ class CalibrationRunner:
             # Capture images and detect board
             print("  Capturing images...")
             pose_images: Dict[str, np.ndarray] = {}
+            capture = {
+                "id": i,
+                "pose": pose["name"],
+                "images": pose_images,
+                "joints_l": None,
+                "joints_r": None,
+            }
+            self._captures.append(capture)
             for camera_name, camera in self.cameras.items():
                 try:
                     # Capture frame
@@ -645,83 +621,63 @@ class CalibrationRunner:
                     camera_data[camera_name]["images"].append(image)
                     pose_images[camera_name] = image
 
+                    # Retain the same measured joints used for this image's FK,
+                    # including images where board detection subsequently fails.
+                    arm_type = camera_data[camera_name]["arm_type"]
+                    actual_joint_pos = None
+                    if arm_type is not None and self.robot_controller:
+                        side = "r" if arm_type == "right" else "l"
+                        robot = getattr(self.robot_controller, f"follower_{side}", None)
+                        if robot is not None:
+                            try:
+                                measured = np.asarray(robot.get_joint_pos(), dtype=float).reshape(-1)
+                                if measured.size < 6 or not np.isfinite(measured).all():
+                                    raise ValueError("Invalid measured joints")
+                                actual_joint_pos = measured
+                                capture[f"joints_{side}"] = measured.tolist()
+                            except Exception as e:
+                                print(f"    Warning: Failed to read {arm_type} joints: {e}")
+
                     # Detect ChArUco board
                     corners, ids = self.calibrator.detector.detect(image)
 
                     if corners is not None and len(corners) > 0:
                         camera_data[camera_name]["corners"].append(corners)
                         camera_data[camera_name]["ids"].append(ids)
+                        camera_data[camera_name]["observation_ids"].append(i)
                         print(
                             f"    ✓ {camera_name}: ChArUco board detected ({len(corners)} corners)"
                         )
 
-                        # For wrist cameras, store robot pose for hand-eye calibration
-                        if "wrist" in camera_name and self.robot_controller:
-                            # Get corresponding robot and actual joint positions
-                            robot = None
-                            if (
-                                "right" in camera_name
-                                and self.robot_controller.follower_r
-                            ):
-                                robot = self.robot_controller.follower_r
-                            elif (
-                                "left" in camera_name
-                                and self.robot_controller.follower_l
-                            ):
-                                robot = self.robot_controller.follower_l
-                            else:
-                                continue
-
-                            # Read actual joint positions from the robot
+                        # Keep one FK slot per detection so failed reads cannot
+                        # shift the robot/board correspondence at later poses.
+                        if arm_type is not None:
+                            robot_pose = None
                             try:
-                                actual_joint_pos = robot.get_joint_pos()
-
-                                # Store actual joint positions for later use
-                                camera_data[camera_name]["joint_positions"].append(
-                                    actual_joint_pos
-                                )
-
                                 # Compute forward kinematics from actual joint positions
                                 # For initial data collection, compute FK in local frames
                                 # (we'll recompute after getting bimanual transform)
-                                global _kinematics_cache
-                                if _kinematics_cache is None:
-                                    _kinematics_cache = Kinematics(
-                                        _get_combined_xml_path(),
-                                        site_name="grasp_site",
-                                    )
+                                if actual_joint_pos is not None:
+                                    global _kinematics_cache
+                                    if _kinematics_cache is None:
+                                        _kinematics_cache = Kinematics(
+                                            _get_combined_xml_path(),
+                                            site_name="grasp_site",
+                                        )
 
-                                q = np.zeros(8)
-                                q[:6] = actual_joint_pos[:6]
-                                robot_pose = _kinematics_cache.fk(q)
-                                camera_data[camera_name]["robot_poses"].append(
-                                    robot_pose
-                                )
+                                    q = np.zeros(8)
+                                    q[:6] = actual_joint_pos[:6]
+                                    robot_pose = _kinematics_cache.fk(q)
                             except Exception as e:
                                 print(
                                     f"    Warning: Failed to get actual robot pose: {e}"
                                 )
-                                # Store None as placeholder
-                                camera_data[camera_name]["robot_poses"].append(None)
+                            camera_data[camera_name]["robot_poses"].append(robot_pose)
                     else:
                         print(f"    ✗ {camera_name}: Board not detected")
 
                 except Exception as e:
                     print(f"    ✗ {camera_name}: Error - {e}")
-
-            joints_l = None
-            if self.robot_controller and self.robot_controller.follower_l:
-                try:
-                    joints_l = np.asarray(
-                        self.robot_controller.follower_l.get_joint_pos(), dtype=float
-                    ).tolist()
-                except Exception as e:
-                    print(
-                        f"    Warning: could not read left joints for the capture log: {e}"
-                    )
-            self._captures.append(
-                {"pose": pose["name"], "joints_l": joints_l, "images": pose_images}
-            )
 
         print("\n" + "=" * 70)
         print("Data collection complete!")
@@ -743,6 +699,10 @@ class CalibrationRunner:
         Returns:
             Calibration results dictionary
         """
+        failure = None
+        captures_saved = False
+        self._captures = []
+        self._move_stop_event.clear()
         try:
             # Load configuration
             self.load_configuration()
@@ -752,6 +712,11 @@ class CalibrationRunner:
             calibrate_left = left_wrist_camera_id is not None
             calibrate_right = right_wrist_camera_id is not None
             calibrate_scene = bool(scene_camera_ids)
+            self._wrist_arms = {
+                name: side for name, side in (
+                    (left_wrist_camera_id, "left"), (right_wrist_camera_id, "right")
+                ) if name is not None
+            }
 
             if calibrate_right:
                 target_cameras.append(right_wrist_camera_id)
@@ -762,6 +727,10 @@ class CalibrationRunner:
 
             # Check bimanual transform requirements
             global T_RIGHT_BASE_TO_LEFT_BASE
+            if calibrate_left and calibrate_right:
+                # Every two-arm run measures the current rig, including retries
+                # made in the same Python process.
+                T_RIGHT_BASE_TO_LEFT_BASE = None
             if (
                 calibrate_right
                 and not calibrate_left
@@ -790,6 +759,7 @@ class CalibrationRunner:
             # Collect data
             camera_data = self.collect_calibration_data()
             self._save_captures()
+            captures_saved = True
 
             # Compute bimanual transform if both arms are calibrated
             bimanual_transform_computed = False
@@ -807,7 +777,7 @@ class CalibrationRunner:
             results = {
                 "version": "1.0",
                 "timestamp": datetime.now().isoformat(),
-                "coordinate_frame": "left_arm_base",  # All transforms relative to left arm base
+                "coordinate_frame": "left_arm_base" if calibrate_left or calibrate_right else "board",
                 "charuco_config": self.board_config.__dict__,
                 "cameras": {},
                 "quality_metrics": {},
@@ -817,12 +787,16 @@ class CalibrationRunner:
             if bimanual_transform_computed and T_RIGHT_BASE_TO_LEFT_BASE is not None:
                 results["bimanual_transform"] = {
                     "right_base_to_left_base": T_RIGHT_BASE_TO_LEFT_BASE.tolist(),
+                    "T_left_from_right": np.linalg.inv(T_RIGHT_BASE_TO_LEFT_BASE).tolist(),
+                    "direction": "T_left_from_right maps right_arm_base points into left_arm_base",
                     "computed_from_calibration": True,
-                    "description": "Transform from right arm base frame to left arm base frame",
+                    "description": "right_base_to_left_base is the legacy inverse (left to right)",
                 }
             elif T_RIGHT_BASE_TO_LEFT_BASE is not None:
                 results["bimanual_transform"] = {
                     "right_base_to_left_base": T_RIGHT_BASE_TO_LEFT_BASE.tolist(),
+                    "T_left_from_right": np.linalg.inv(T_RIGHT_BASE_TO_LEFT_BASE).tolist(),
+                    "direction": "T_left_from_right maps right_arm_base points into left_arm_base",
                     "computed_from_calibration": False,
                     "description": "Transform from right arm base frame to left arm base frame (from config)",
                 }
@@ -869,7 +843,7 @@ class CalibrationRunner:
 
                 # Store intrinsics
                 camera_result = {
-                    "type": "hand_eye" if "wrist" in camera_name else "scene",
+                    "type": "hand_eye" if camera_name in (left_wrist_camera_id, right_wrist_camera_id) else "scene",
                     "serial_number": self.camera_config.get_serial_by_name(camera_name),
                     "intrinsics": {
                         "camera_matrix": intrinsics_result["camera_matrix"],
@@ -881,12 +855,12 @@ class CalibrationRunner:
                 }
 
                 # Perform extrinsics calibration
-                if "wrist" in camera_name:
+                if camera_name in (left_wrist_camera_id, right_wrist_camera_id):
                     # Hand-eye calibration
                     print("  Computing hand-eye calibration...")
 
                     # Check if we have robot poses
-                    if not data["robot_poses"] or data["robot_poses"][0] is None:
+                    if not data["robot_poses"]:
                         print(
                             "  ✗ Forward kinematics not implemented - skipping hand-eye calibration"
                         )
@@ -894,18 +868,14 @@ class CalibrationRunner:
                         # Estimate camera poses (board-to-camera)
                         camera_matrix = np.array(intrinsics_result["camera_matrix"])
                         dist_coeffs = np.array(intrinsics_result["distortion_coeffs"])
-                        camera_poses = []
-
-                        for corners, ids in zip(data["corners"], data["ids"]):
-                            rvec, tvec = self.calibrator.detector.estimate_pose(
-                                corners, ids, camera_matrix, dist_coeffs
-                            )
-                            if rvec is not None:
-                                camera_poses.append((rvec, tvec))
+                        robot_poses, camera_poses = self._valid_wrist_observations(
+                            data, camera_matrix, dist_coeffs
+                        )
+                        camera_result["num_poses_used"] = len(camera_poses)
 
                         # Run hand-eye calibration
                         hand_eye_result = self.calibrator.calibrate_hand_eye(
-                            data["robot_poses"], camera_poses
+                            robot_poses, camera_poses
                         )
 
                         if hand_eye_result["success"]:
@@ -936,10 +906,11 @@ class CalibrationRunner:
 
                     # Calibrate scene camera relative to board frame first
                     scene_result = self.calibrator.calibrate_scene_camera(camera_poses)
+                    camera_result["num_poses_used"] = len(camera_poses)
 
                     if scene_result["success"]:
                         # Now convert to left arm base frame if we have left wrist camera data
-                        # T_scene_cam_to_left_base = T_scene_cam_to_board @ T_board_to_left_base
+                        # T_scene_cam_to_left_base = T_board_to_left_base @ T_scene_cam_to_board
                         # We can get T_board_to_left_base from the left wrist camera observations
 
                         if calibrate_left and left_wrist_camera_id:
@@ -970,29 +941,17 @@ class CalibrationRunner:
                                 )
 
                                 # Estimate board poses from left camera
-                                left_board_poses = []
-                                for corners, ids in zip(
-                                    left_data["corners"], left_data["ids"]
-                                ):
-                                    rvec, tvec = self.calibrator.detector.estimate_pose(
-                                        corners, ids, left_cam_matrix, left_dist_coeffs
-                                    )
-                                    if rvec is not None:
-                                        left_board_poses.append((rvec, tvec))
+                                left_robot_poses, left_board_poses = self._valid_wrist_observations(
+                                    left_data, left_cam_matrix, left_dist_coeffs
+                                )
 
-                                if left_board_poses and left_data["robot_poses"]:
+                                if left_board_poses:
                                     # Compute average T_board_to_left_base from left wrist observations
                                     print(
                                         f"      Computing T_board_to_left_base from {len(left_board_poses)} left wrist observations..."
                                     )
                                     board_to_left_base_transforms = []
-                                    for i, (rvec, tvec) in enumerate(left_board_poses):
-                                        if (
-                                            i >= len(left_data["robot_poses"])
-                                            or left_data["robot_poses"][i] is None
-                                        ):
-                                            continue
-
+                                    for robot_pose, (rvec, tvec) in zip(left_robot_poses, left_board_poses):
                                         # T_board_to_left_cam
                                         R, _ = cv2.Rodrigues(rvec)
                                         T_board_to_left_cam = np.eye(4)
@@ -1000,9 +959,7 @@ class CalibrationRunner:
                                         T_board_to_left_cam[:3, 3] = tvec.flatten()
 
                                         # Correct chain: T^base_board = FK @ hand_eye @ ChArUco
-                                        T_left_base_to_left_ee = left_data[
-                                            "robot_poses"
-                                        ][i]
+                                        T_left_base_to_left_ee = robot_pose
 
                                         T_board_to_left_base = (
                                             T_left_base_to_left_ee
@@ -1109,13 +1066,16 @@ class CalibrationRunner:
             )
 
             results["quality_metrics"] = {
-                "overall_success": len(results["cameras"]) > 0,
+                "overall_success": False,
                 "poses_collected": total_poses,
                 "poses_with_detections": poses_with_detections,
                 "detection_rate": poses_with_detections / total_poses
                 if total_poses > 0
                 else 0,
             }
+
+            self._validate_results(results, target_cameras, calibrate_left and calibrate_right)
+            results["quality_metrics"]["overall_success"] = True
 
             print("\n" + "=" * 70)
             print("Calibration complete!")
@@ -1143,54 +1103,58 @@ class CalibrationRunner:
             except Exception as _db_err:
                 print(f"  Warning: could not record calibration in DB: {_db_err}")
 
-            # Cleanup
-            print("\nCleaning up...")
-
             if self.robot_controller:
-                # Move the arms to the home positions.
                 self.robot_controller.move_to_home_positions(simultaneous=True)
-
-                # Stop control threads without moving to home
-                # (Robots will stay in their current position - user can move them manually)
-                print("  Stopping robot control threads...")
-                self.robot_controller.stop_teleoperation()
-
-                # Give threads time to fully terminate
-                time.sleep(0.5)
-
-                # Cleanup robot resources
-                self.robot_controller.cleanup()
-
-                # Give robot cleanup time to complete before exit
-                time.sleep(0.5)
-                print("  ✓ Robot controller cleaned up")
-                print(
-                    "  Note: Arms remain in current position - manually move to home if needed"
-                )
-
-            # Close cameras first (quick and safe)
-            for camera in self.cameras.values():
-                camera.close()
-            print("  ✓ Cameras closed")
-
-            print("\n✓ Cleanup complete")
 
             return results
 
-        except KeyboardInterrupt:
-            print("\n\nCalibration interrupted by user")
+        except KeyboardInterrupt as error:
+            failure = error
             self._move_stop_event.set()
-            if self.robot_controller and self.robot_controller.has_robots():
-                self.robot_controller.emergency_stop()
+            print("\n\nCalibration interrupted by user")
             raise
 
         except Exception as e:
+            failure = e
+            self._move_stop_event.set()
             print(f"\nError during calibration: {e}")
             import traceback
 
             traceback.print_exc()
-
-            self._move_stop_event.set()
-            if self.robot_controller and self.robot_controller.has_robots():
-                self.robot_controller.emergency_stop()
             raise
+
+        finally:
+            self._move_stop_event.set()
+            cleanup_errors = []
+            # Replay threads have stopped before collection raises. Keep their
+            # completed images and measured joints available for offline diagnosis.
+            if self._captures and not captures_saved:
+                try:
+                    self._save_captures()
+                except BaseException as error:
+                    cleanup_errors.append(("capture artifacts", error))
+            for name, camera in self.cameras.items():
+                try:
+                    camera.close()
+                except BaseException as error:
+                    cleanup_errors.append((f"camera {name}", error))
+            self.cameras.clear()
+            if self.robot_controller:
+                try:
+                    if failure is not None and self.robot_controller.has_robots():
+                        # The existing emergency stop exits the process, so
+                        # cameras and capture artifacts must be handled first.
+                        self.robot_controller.emergency_stop()
+                except BaseException as error:
+                    cleanup_errors.append(("emergency stop", error))
+                for name in ("stop_teleoperation", "close"):
+                    try:
+                        getattr(self.robot_controller, name)()
+                    except BaseException as error:
+                        cleanup_errors.append((name, error))
+            if cleanup_errors:
+                primary = failure if failure is not None else cleanup_errors[0][1]
+                for name, error in cleanup_errors:
+                    primary.add_note(f"Calibration cleanup ({name}) failed: {error!r}")
+                if failure is None:
+                    raise primary

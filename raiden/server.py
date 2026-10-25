@@ -52,6 +52,7 @@ import numpy as np
 from chiral.types import CameraInfo, Observation
 
 from raiden.camera_config import CameraConfig as RaidenCameraConfig
+from raiden.calibration_utils import left_from_right
 from raiden.robot.controller import (
     _GRIPPER_MIN_OPENING,
     RobotController,
@@ -381,15 +382,8 @@ class RaidenPolicyServer(chiral.PolicyServer):
         # The calibration file nests per-camera data under a top-level "cameras" key.
         calib_cameras: dict = self._calibration.get("cameras", {})
 
-        # "right_base_to_left_base" maps left_arm_base → right_arm_base (despite the name).
-        # Invert to bring right_arm_base points into left_arm_base.
-        bimanual = self._calibration.get("bimanual_transform", {})
-        mat = bimanual.get("right_base_to_left_base")
-        if mat is not None:
-            self._T_left_base_from_right_base = np.linalg.inv(
-                np.array(mat, dtype=np.float64)
-            )
-        else:
+        self._T_left_base_from_right_base = left_from_right(self._calibration)
+        if self._T_left_base_from_right_base is None:
             print(
                 "Note: bimanual_transform not found in calibration; "
                 "right wrist extrinsics will be in right-arm base frame."
