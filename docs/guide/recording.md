@@ -133,9 +133,18 @@ this bimanual CLI mapping; `--oculus-hand r` would assign both followers to the
 right controller and is rejected. For a single left-labelled follower,
 `--arms single --oculus-hand r` still selects the right controller.
 
-Calibrate at the READY prompt before recording. Hold each controller's trigger
-to move its arm relative to the clutch pose; hold its grip to close that arm's
-gripper and release to open it. Either active hand can start or stop an episode.
+Calibrate **both controllers separately** at READY before recording: each
+joystick click or B/Y starts that controller's +x/+y motion calibration, measured
+along its own arm base axes. The rotation fit supports a securely mounted
+headset facing outward at your neck/chest, including a fixed tilt. Poses remain
+relative to the headset: **release both triggers before moving your torso or
+adjusting the mount**, and recalibrate if the headset orientation changes.
+There is no room-fixed torso compensation. This motion-axis calibration is
+independent of camera calibration; see [Quest setup and calibration](oculus_teleop.md).
+
+Hold each controller's trigger to move its arm relative to the clutch pose;
+hold its grip to close that arm's gripper and release to open it. Either active
+hand can start or stop an episode.
 
 | Phase | Real recording buttons |
 |---|---|

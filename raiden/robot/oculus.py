@@ -8,7 +8,8 @@ installs/starts the app and parses that stream.
 One-time setup: enable Developer Mode on the headset, ``sudo apt install
 android-tools-adb``, plug in USB and accept the debugging prompt.  The headset
 need not be worn: ``keep_awake()`` tells it the proximity sensor is covered so
-tracking stays on while it sits on the desk facing the operator.
+tracking stays on with a desk or chest mount. The APK sends controller poses
+relative to the headset, so headset motion changes the reported poses.
 """
 
 import os
@@ -150,7 +151,7 @@ class OculusReader:
             )
 
     def keep_awake(self, enable: bool = True) -> None:
-        """Make the Quest behave as if worn so tracking stays on while on the desk."""
+        """Make the Quest behave as if worn so tracking stays on with either mount."""
         action = "prox_close" if enable else "prox_open"
         self.device.shell(f"am broadcast -a com.oculus.vrpowermanager.{action}")
         if enable:

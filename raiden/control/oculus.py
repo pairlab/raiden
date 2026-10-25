@@ -1,12 +1,14 @@
 """Meta Quest controller teleoperation (clutched Cartesian control).
 
-The headset rests on the desk with its cameras facing the operator; only the
-hand controllers are used.  Button layout follows pairlab/mesa-env:
+The headset can rest on a desk or be secured at the chest with its cameras
+facing the controllers. Poses are relative to the headset: release both triggers
+before moving the headset or torso, and recalibrate after changing its orientation.
+Button layout follows pairlab/mesa-env:
 
 * joystick click / B (Y) .. calibrate headset->robot axes: hold A (X), move
                             ~20 cm along robot +x, release; repeat along robot +y.
                             Press it again to cancel.  The result is saved and
-                            reused; redo it only when the headset moves.
+                            reused; redo it when the headset orientation changes.
 * hold trigger ............ clutch: the end-effector follows the controller
                             relative to where the trigger was pressed.
 * hold grip ............... gripper closed; release to open.
@@ -69,6 +71,7 @@ _KEYS = {
 }
 _GRIP_THRESHOLD = 0.2  # analog grip above this counts as pressed (mesa-env)
 _MIN_CALIB_MOVE = 0.08  # m; shorter calibration moves are rejected
+_MAX_CALIB_AXIS_DOT = 0.5  # +x/+y moves must be between 60 and 120 degrees apart
 _STALE_AFTER = 0.5  # s without controller data -> hold the arm
 _STALL_WARN = 2.0  # s without controller data -> tell the operator
 _SMOOTHING_TAU = 0.05  # s low-pass on the controller pose
@@ -170,7 +173,7 @@ class OculusInterface(TeleopInterface):
             print("  ✓ Quest controllers streaming")
         if self._saved_R:
             print(
-                f"  ✓ Using saved calibration ({_CALIB_FILE}); redo it ({self._calib_buttons}) only if the headset moved"
+                f"  ✓ Using saved calibration ({_CALIB_FILE}); redo it ({self._calib_buttons}) if the headset orientation changed"
             )
         # Tracking state is session-level: one poller for the whole session, not per episode.
         self._stop.clear()
@@ -327,18 +330,26 @@ class OculusInterface(TeleopInterface):
     # Control law (runs on the controller's per-arm control thread)
     # ------------------------------------------------------------------
 
+    def _lose_pose(self, hand: str) -> None:
+        """Discard the clutch/filter reference and invalidate a calibration move."""
+        self._origin[hand] = None
+        self._smooth[hand] = None
+        calibration = self._calib[hand]
+        if calibration is not None and calibration["start"] is not None:
+            calibration["lost"] = True
+
     def _target_fn(self, side: str, T_current: np.ndarray, gripper_actual: float):
         hand = self._hand[side]
         keys = _KEYS[hand]
         reader = self._reader
         if reader is None or reader.age > _STALE_AFTER:
-            self._origin[hand] = None
+            self._lose_pose(hand)
             return None
         with self._button_lock:
             poses, buttons = reader.get()
             T_raw = poses.get(hand)
-            if T_raw is None:
-                self._origin[hand] = None
+            if T_raw is None or not np.all(np.isfinite(T_raw)):
+                self._lose_pose(hand)
                 return None
             def pressed(key):
                 return bool(buttons.get(key, False))
@@ -389,8 +400,7 @@ class OculusInterface(TeleopInterface):
         # controller; orientation-only means the position is gyro drift.
         if track is not None and track != "POSITION":
             self._warn(hand, f"tracking is {track}: {_help(track)}")
-            self._origin[hand] = None
-            self._smooth[hand] = None
+            self._lose_pose(hand)
             return hold
 
         T_vr = self._smoothed(hand, self._to_robot(hand, T_raw))
@@ -439,6 +449,7 @@ class OculusInterface(TeleopInterface):
         else:
             self._calib[hand] = {"stage": "x", "start": None}
             self._origin[hand] = None
+            self._smooth[hand] = None
             print(
                 f"\n  [Oculus {H}] CALIBRATION 1/2: hold {_KEYS[hand]['btn']} and move ~20 cm along the "
                 f"ROBOT's +x (straight out from its base), then release. Press {self._calib_buttons} "
@@ -449,13 +460,13 @@ class OculusInterface(TeleopInterface):
     def _calibrate(
         self, hand: str, btn: bool, pos: np.ndarray, track: Optional[str]
     ) -> None:
-        """mesa-env's calibrate_controller as a non-blocking state machine.
+        """Fit a headset-to-base rotation from two controller translations.
 
         Stage x: hold the button, move along robot +x, release.  Stage y: same
-        for +y.  The dominant headset axis of each move (with sign) becomes that
-        robot axis; z = x cross y.  Only the headset frame is used, so how the
-        controller is held does not matter.  A move counts only if the headset
-        tracked the controller (6-DoF) from press to release.
+        for +y. Use the full motion vectors, allowing arbitrary headset yaw,
+        pitch and roll, and fit their nearest right-handed orthonormal basis.
+        Controller orientation does not matter. Keep the headset still; a move
+        counts only with uninterrupted controller data and 6-DoF tracking.
         """
         c = self._calib[hand]
         H = hand.upper()
@@ -483,29 +494,41 @@ class OculusInterface(TeleopInterface):
                 flush=True,
             )
             return
-        if np.linalg.norm(delta) < _MIN_CALIB_MOVE:
+        if not np.all(np.isfinite(delta)):
             print(
-                f"  [Oculus {H}] moved only {np.linalg.norm(delta) * 100:.0f} cm; hold {name} and move further."
+                f"  [Oculus {H}] invalid controller pose; hold {name} and redo it.",
+                flush=True,
             )
             return
-        k = int(np.argmax(np.abs(delta)))
-        axis = np.zeros(3)
-        axis[k] = np.sign(delta[k])
+        distance = np.linalg.norm(delta)
+        if distance < _MIN_CALIB_MOVE:
+            print(
+                f"  [Oculus {H}] moved only {distance * 100:.0f} cm; hold {name} and move further."
+            )
+            return
+        axis = delta / distance
         if c["stage"] == "x":
-            c.update(stage="y", x=axis, kx=k)
+            c.update(stage="y", x=axis)
             print(
                 f"  [Oculus {H}] CALIBRATION 2/2: hold {name} and move ~20 cm along the ROBOT's +y "
                 "(its left), then release.",
                 flush=True,
             )
-        elif k == c["kx"]:
+        elif abs(float(c["x"] @ axis)) > _MAX_CALIB_AXIS_DOT:
             print(
-                f"  [Oculus {H}] same headset axis as +x; redo the +y move.",
+                f"  [Oculus {H}] +x/+y moves must be roughly perpendicular; redo the +y move.",
                 flush=True,
             )
         else:
-            self._R[hand] = np.array([c["x"], axis, np.cross(c["x"], axis)])
+            z = np.cross(c["x"], axis)
+            measured = np.array([c["x"], axis, z / np.linalg.norm(z)])
+            # The polar factor shares angular measurement error equally between
+            # +x and +y instead of snapping either move to a headset axis.
+            u, _, vt = np.linalg.svd(measured)
+            self._R[hand] = u @ np.diag([1.0, 1.0, np.linalg.det(u @ vt)]) @ vt
             self._calib[hand] = None
+            self._origin[hand] = None
+            self._smooth[hand] = None
             self._save_calibration(hand)
             print(
                 f"  [Oculus {H}] calibrated. Hold the trigger to move the arm.",
@@ -516,11 +539,25 @@ class OculusInterface(TeleopInterface):
     def _load_calibration() -> Dict[str, np.ndarray]:
         try:
             with open(_CALIB_FILE) as f:
-                return {
-                    h: np.array(R, dtype=np.float64) for h, R in json.load(f).items()
-                }
+                saved = json.load(f)
         except (OSError, ValueError):
             return {}
+        if not isinstance(saved, dict):
+            return {}
+        rotations = {}
+        for hand in ("l", "r"):
+            try:
+                rotation = np.asarray(saved[hand], dtype=np.float64)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                rotation.shape == (3, 3)
+                and np.all(np.isfinite(rotation))
+                and np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6)
+                and np.isclose(np.linalg.det(rotation), 1.0, atol=1e-6)
+            ):
+                rotations[hand] = rotation
+        return rotations
 
     def _save_calibration(self, hand: str) -> None:
         self._saved_R[hand] = self._R[hand]
@@ -604,7 +641,7 @@ class OculusInterface(TeleopInterface):
     def ready_hint(self) -> str:
         lines = [
             f"  Quest: A/X also starts and stops. Calibrate with {self._calib_buttons},"
-            " only if the headset moved."
+            " if uncalibrated or headset orientation changed. Release triggers before moving your torso."
         ]
         for hand in sorted(self._active_hands):
             state = self._tracking.get(hand)
@@ -628,10 +665,11 @@ class OculusInterface(TeleopInterface):
             "\n" + "=" * 60 + "\n"
             "  OCULUS TELEOPERATION ACTIVE\n" + "=" * 60 + "\n\n"
             "  1. Wait for 'tracking locked'\n"
-            "  2. Only if the headset moved (the calibration is saved): press the joystick\n"
+            "  2. If uncalibrated or headset orientation changed: press the joystick\n"
             "     (or B/Y); hold A/X, move along robot +x, release; hold A/X, move along\n"
             "     robot +y, release\n"
             "  3. HOLD TRIGGER to move the arm; HOLD GRIP to close the gripper\n"
+            "     Headset-relative control: release both triggers before moving your torso\n"
             "  A/X stops the recording; then A/X = success, joystick/B/Y = failure\n"
             "  Press Ctrl+C for EMERGENCY STOP (hold 5 s, then go home)\n\n"
             + "=" * 60
