@@ -151,7 +151,6 @@ class RealSenseCamera(Camera):
         self._pipeline: Optional[rs.pipeline] = None
         self._config: Optional[rs.config] = None
         self._profile: Optional[rs.pipeline_profile] = None
-        self._depth_scale: float = 0.001  # metres per raw unit (D405 default)
         self._latest_frames = None
         # Actual negotiated color resolution (set after pipeline.start()).
         self._color_w: int = self._COLOR_W
@@ -315,8 +314,6 @@ class RealSenseCamera(Camera):
             f"BGR8 {self._color_w}×{self._color_h} @ {self._fps}fps"
             + ("" if self._depth else " (no depth)")
         )
-        depth_sensor = self._profile.get_device().first_depth_sensor()
-        self._depth_scale = depth_sensor.get_depth_scale()
 
     def close(self) -> None:
         if self._pipeline:
@@ -441,7 +438,13 @@ class RealSenseCamera(Camera):
         depth = None
         if depth_frame:
             depth_raw = np.asanyarray(depth_frame.get_data())  # uint16 raw units
-            depth = (depth_raw * self._depth_scale).astype(np.float32)
+            # Playback can report the D435's 1 mm sensor default for a D405
+            # recording whose frames retain their correct 0.1 mm units.
+            # Read the scale from the actual frame, including after alignment.
+            depth_units = depth_frame.get_units()
+            if not np.isfinite(depth_units) or depth_units <= 0:
+                raise RuntimeError(f"[{self._name}] invalid depth frame units: {depth_units}")
+            depth = depth_raw.astype(np.float32) * np.float32(depth_units)
         if self._crop is not None:
             x, y, w, h = self._crop
             color = color[y : y + h, x : x + w]
@@ -514,13 +517,15 @@ class RealSenseCamera(Camera):
         cam._serial = ""
         cam._fps = 30
         cam._crop = tuple(int(v) for v in crop) if crop is not None else None
-        cam._depth_scale = 0.001
         cam._latest_frames = None
         cam._color_controls = None
         cam._color_applied = None
         cam._recording_format = recording_format
 
-        cam._pipeline = rs.pipeline()
+        # A file-only context also keeps offline conversion independent of
+        # physical camera discovery and its udev monitor.
+        cam._playback_context = rs.context({"device-mask": int(rs.product_line.sw_only)})
+        cam._pipeline = rs.pipeline(cam._playback_context)
         cam._config = rs.config()
         rs.config.enable_device_from_file(
             cam._config, str(bag_path), repeat_playback=False
@@ -530,12 +535,6 @@ class RealSenseCamera(Camera):
         # Non-realtime playback so we don't drop frames
         playback = cam._profile.get_device().as_playback()
         playback.set_real_time(False)
-
-        try:
-            ds = cam._profile.get_device().first_depth_sensor()
-            cam._depth_scale = ds.get_depth_scale()
-        except Exception:
-            pass
 
         # Align depth to color so they share the same pixel grid; a color-only bag has none.
         cam._depth = any(

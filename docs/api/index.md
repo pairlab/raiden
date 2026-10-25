@@ -85,4 +85,4 @@ estimation for scene cameras. Writes `~/.config/raiden/calibration_results.json`
 | Depth | `uint16`, millimetres |
 | Joint layout | `[r_joint×6, r_grip×1, l_joint×6, l_grip×1]` |
 | Action | `pos(3) + rot_mat_flat(9) + gripper(1)` per arm |
-| Right wrist camera | Mounted upside-down; images rotated 180° at capture time |
+| Camera orientation | Native sensor orientation for all cameras; no rotation inferred from camera name |

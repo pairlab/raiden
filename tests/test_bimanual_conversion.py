@@ -59,7 +59,6 @@ def build(root, data, times=None, cameras=None, **kwargs):
             kwargs.pop("calib", None),
             data,
             {},
-            set(),
             kwargs.pop("transform", None),
             {name: _ORIGIN + np.asarray(times, dtype=np.int64) for name in cameras},
             **kwargs,

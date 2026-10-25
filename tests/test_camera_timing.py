@@ -65,7 +65,7 @@ def hand_eye():
     return result
 
 
-def build(root, data, camera_times, wrist_keys=None, flip=()):
+def build(root, data, camera_times, wrist_keys=None):
     transform = np.eye(4)
     transform[:3, :3] = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
     transform[:3, 3] = [0.6, 0, 0]
@@ -77,7 +77,7 @@ def build(root, data, camera_times, wrist_keys=None, flip=()):
     with patch("raiden.converter._get_kinematics", return_value=MovingWrist()):
         schema = _build_lowdim(
             root, list(camera_times), len(next(iter(camera_times.values()))), {}, calib,
-            data, {}, set(flip), transform,
+            data, {}, transform,
             {name: ORIGIN + np.asarray(times, dtype=np.int64) for name, times in camera_times.items()},
             wrist_camera_joint_keys=wrist_keys,
         )
@@ -93,14 +93,13 @@ class CameraTimingTest(unittest.TestCase):
             frames, schema, base = build(
                 Path(directory), data, camera_times,
                 {"left": "follower_l_joint_pos", "right": "follower_r_joint_pos"},
-                flip=("right",),
             )
             for i, frame in enumerate(frames):
                 for name, offset in (("left", 0), ("right", 1)):
                     q = sample_joints([camera_times[name][i] / 200], offset)[0]
                     expected = MovingWrist().fk(q) @ hand_eye()
                     if name == "right":
-                        expected = base @ expected @ np.diag([-1, -1, 1, 1])
+                        expected = base @ expected
                     np.testing.assert_allclose(frame["extrinsics"][name], expected, atol=2e-7)
                 # Shared state and actions still use the reference camera grid.
                 self.assertAlmostEqual(frame["joints"][0], camera_times["scene"][i] / 200)

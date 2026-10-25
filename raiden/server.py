@@ -32,10 +32,9 @@ convention used by the converter).
 
 Image orientation
 -----------------
-Cameras in ``_FLIP_CAMERAS`` (e.g. ``right_wrist_camera``) are physically
-mounted upside-down.  The capture loop rotates their images by 180° to match
-the right-side-up orientation used by the training dataset.  The principal
-point in the intrinsics and the ``T_cam→ee`` rotation are corrected accordingly.
+Images and depth retain the sensor's native orientation, matching calibration
+and dataset conversion. Camera names do not imply an image rotation; the SDK
+intrinsics and measured hand–eye transforms describe the native optical frame.
 """
 
 import asyncio
@@ -62,29 +61,11 @@ from raiden.robot.controller import (
 # Constants
 # ---------------------------------------------------------------------------
 
-# Cameras mounted upside-down: images are rotated 180° and extrinsics/
-# intrinsics are corrected to match the right-side-up frame.
-_FLIP_CAMERAS = {"right_wrist_camera"}
-
 # Maps wrist camera name → which follower arm drives its extrinsics.
 _WRIST_CAMERA_ARM: dict[str, str] = {
     "left_wrist_camera": "left",
     "right_wrist_camera": "right",
 }
-
-# 4×4 homogeneous 180° rotation around the Z (optical) axis.
-# Right-multiplying T_cam→ee by this converts from the physical (upside-down)
-# camera frame used during calibration to the standard (right-side-up) frame
-# that matches the rotated images served by the policy server.
-_R_FLIP_180 = np.array(
-    [
-        [-1.0, 0.0, 0.0, 0.0],
-        [0.0, -1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ],
-    dtype=np.float64,
-)
 
 DOF = 7  # joints per arm (6 revolute + 1 gripper)
 
@@ -259,9 +240,9 @@ class RaidenPolicyServer(chiral.PolicyServer):
         # Per-camera data populated across _open_cameras() and
         # _prepare_camera_transforms():
         #   _cam_handles     : hardware handles keyed by camera name
-        #   _cam_intrinsics  : 3×3 float64 camera matrix (from SDK, flip-corrected)
+        #   _cam_intrinsics  : 3×3 float64 camera matrix (from SDK, resized)
         #   _cam_extrinsics  : 4×4 float64 static extrinsics (scene cameras only)
-        #   _T_cam2ee        : 4×4 float64 T_cam→ee (wrist cameras, flip-corrected)
+        #   _T_cam2ee        : 4×4 float64 T_cam→ee (native wrist optical frame)
         self._cam_handles: dict = {}
         self._cam_intrinsics: dict[str, np.ndarray] = {}
         self._cam_extrinsics: dict[str, np.ndarray] = {}
@@ -391,16 +372,10 @@ class RaidenPolicyServer(chiral.PolicyServer):
 
         for name in self._raiden_cam_cfg.list_camera_names():
             handle = self._cam_handles.get(name)
-            flip = name in _FLIP_CAMERAS
 
             # ── intrinsics (from SDK, already at serving resolution) ──────
             if handle is not None:
                 K = handle["intrinsics"].copy()
-                if flip:
-                    # Reflect the principal point for the 180°-rotated image.
-                    w, h = handle["w"], handle["h"]
-                    K[0, 2] = (w - 1) - K[0, 2]
-                    K[1, 2] = (h - 1) - K[1, 2]
                 if self._resize is not None:
                     h_out, w_out = self._resize
                     h_src, w_src = handle["h"], handle["w"]
@@ -423,11 +398,6 @@ class RaidenPolicyServer(chiral.PolicyServer):
                     T = np.eye(4, dtype=np.float64)
                     T[:3, :3] = np.array(he["rotation_matrix"])
                     T[:3, 3] = np.array(he["translation_vector"]).flatten()
-                    if flip:
-                        # Calibration was done with raw (upside-down) images.
-                        # Right-multiplying by _R_FLIP_180 converts T_cam→ee
-                        # to the right-side-up camera frame used for serving.
-                        T = T @ _R_FLIP_180
                     self._T_cam2ee[name] = T
                 else:
                     print(
@@ -1132,13 +1102,12 @@ class RaidenPolicyServer(chiral.PolicyServer):
         handle = self._cam_handles.get(name)
         if handle is None:
             return
-        flip = name in _FLIP_CAMERAS
         if handle["type"] == "zed":
-            self._zed_capture_loop(name, handle, flip)
+            self._zed_capture_loop(name, handle)
         else:
-            self._realsense_capture_loop(name, handle, flip)
+            self._realsense_capture_loop(name, handle)
 
-    def _zed_capture_loop(self, name: str, handle: dict, flip: bool) -> None:
+    def _zed_capture_loop(self, name: str, handle: dict) -> None:
         import pyzed.sl as sl
 
         cam = handle["camera"]
@@ -1160,9 +1129,6 @@ class RaidenPolicyServer(chiral.PolicyServer):
                     cam.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
                     raw = depth_mat.get_data().copy()
                     depth = np.where(np.isfinite(raw), raw, 0.0).astype(np.float32)
-                    if flip:
-                        color_bgr = cv2.rotate(color_bgr, cv2.ROTATE_180)
-                        depth = cv2.rotate(depth, cv2.ROTATE_180)
                     if self._resize is not None:
                         h_out, w_out = self._resize
                         depth = cv2.resize(
@@ -1170,10 +1136,6 @@ class RaidenPolicyServer(chiral.PolicyServer):
                         )
                     if name in self.depths:
                         self.update_depth(name, depth)
-                else:
-                    if flip:
-                        color_bgr = cv2.rotate(color_bgr, cv2.ROTATE_180)
-
                 # Resize and serve RGB to the policy.
                 if self._resize is not None:
                     h_out, w_out = self._resize
@@ -1184,7 +1146,7 @@ class RaidenPolicyServer(chiral.PolicyServer):
                 with self._cam_ts_locks[name]:
                     self._cam_capture_ts_ns[name] = frame_ts_ns
 
-    def _realsense_capture_loop(self, name: str, handle: dict, flip: bool) -> None:
+    def _realsense_capture_loop(self, name: str, handle: dict) -> None:
         camera = handle["camera"]
         while self._running:
             try:
@@ -1203,10 +1165,6 @@ class RaidenPolicyServer(chiral.PolicyServer):
                     frame_ts_ns = time.time_ns()
                 color_bgr = frame.color
                 depth = frame.depth
-                if flip:
-                    color_bgr = cv2.rotate(color_bgr, cv2.ROTATE_180)
-                    if depth is not None:
-                        depth = cv2.rotate(depth, cv2.ROTATE_180)
                 if self._resize is not None:
                     h_out, w_out = self._resize
                     color_bgr = cv2.resize(

@@ -28,8 +28,10 @@ ZED Mini cameras are mounted on the follower arm wrist links via 3D-printed moun
   <img src="https://tri-ml.github.io/raiden/assets/zed_mount.jpg" style="width: 50%; object-fit: cover;">
 </div>
 
-!!! note "Right wrist ZED Mini orientation"
-    The ZED Mini on the **right wrist** must be mounted **upside down**.
+!!! note "Camera orientation"
+    Collection, calibration, conversion, and serving use the sensor's native
+    optical frame. Mount cameras for the desired view; a right-wrist role does
+    not imply a 180° image rotation.
 
 !!! note "RealSense bag file size"
     RealSense cameras record to `.bag` files at 640×480 BGR8. The file size is

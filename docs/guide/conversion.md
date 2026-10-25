@@ -81,14 +81,16 @@ so every camera directory contains exactly the same number of frames.
 
 ## File formats
 
-**`rgb/<camera>/<frame:010d>.jpg`**
-: BGR JPEG at quality ≥ 90. For cameras physically mounted upside-down
-  (`right_wrist_camera`) the image is rotated 180° so the stored image is
-  always right-side-up.
+**`rgb/<camera>/<frame:010d>.png`**
+: Lossless color PNG in the sensor's native orientation. OpenCV reads it as
+  BGR; convert to RGB for policy input. Conversion and serving apply no
+  camera-name-based rotations to images, depth, or calibration.
 
 **`depth/<camera>/<frame:010d>.npz`**
 : Compressed NumPy archive with a single key `"depth"` holding a uint16
-  array (height × width) in **millimetres**. Zero means no-data.
+  array (height × width) in **millimetres**. Zero means no-data. RealSense
+  scaling uses each depth frame's recorded units, including the D405's
+  0.1 mm units, rather than a playback sensor's default scale.
 
 **`rgb/<camera>/timestamps.npy`**
 : `int64` NumPy array of length *N*. Each value is the wall-clock capture
@@ -103,7 +105,7 @@ so every camera directory contains exactly the same number of frames.
 
 | Key | Shape | Description |
 |---|---|---|
-| `intrinsics` | `dict[str → (3, 3) float32]` | `{camera_name: K}` — pinhole camera matrix `[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]`. Principal point adjusted for upside-down cameras. |
+| `intrinsics` | `dict[str → (3, 3) float32]` | `{camera_name: K}` — pinhole camera matrix `[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]` in the native optical frame, adjusted for any recorded crop. |
 | `extrinsics` | `dict[str → (4, 4) float32]` | `{camera_name: T_cam2world}` in the **left\_arm\_base** frame for this frame. Sim cameras: read from the model and state that rendered the frame. Scene cameras: static calibrated extrinsics. Wrist cameras: computed from forward kinematics + hand-eye calibration. |
 | `joints` | `(14,)` float32 | Follower **actual** joint positions at this frame: `[left_arm(6), left_gripper(1), right_arm(6), right_gripper(1)]`. |
 | `action` | `(26,)` float32 | FK EE poses computed from **commanded** joint positions (`follower_*_joint_cmd`): `[l_pos(3), l_rot9(9), l_gripper(1), r_pos(3), r_rot9(9), r_gripper(1)]`. Left arm pose is in the **left\_arm\_base** frame; right arm pose is in the **right\_arm\_base** frame. Rotation is the 3×3 matrix flattened row-major. |
@@ -155,11 +157,15 @@ T_left_base→cam[i] = [T_left_base←right_base @] FK(q[i]) @ T_cam→ee
 
 - `FK(q[i])` - MuJoCo forward kinematics for the YAM arm evaluated at the
   follower joint positions interpolated to frame *i*'s timestamp.
-- `T_cam→ee` - hand-eye calibration result (camera-to-end-effector). The
-  calibration was performed with the raw (upside-down) camera image, so for
-  `right_wrist_camera` a 180° Z-axis rotation correction is folded in.
+- `T_cam→ee` - hand-eye calibration result (camera-to-end-effector) in the
+  native optical frame, applied without an additional image rotation.
 - `T_left_base←right_base` - applied only for `right_wrist_camera` to
   bring the result from right-arm base into the common left-arm base frame.
+
+Reconvert older processed episodes before mixing them with this convention:
+legacy conversion rotated the right wrist by 180° and could export D405
+depth at ten times its metric value. Native recordings and calibration files
+do not need modification.
 
 ## Timestamp-based interpolation
 

@@ -61,9 +61,6 @@ _IMG_EXT = ".png"
 # follow the frames through timestamp selection and trimming.
 _POSES_FILE = "camera_poses.npy"
 
-# Cameras whose images are physically mounted upside-down and need a 180° correction.
-_FLIP_CAMERAS = {"right_wrist_camera"}
-
 # Camera role → robot_data joint key.
 _ROLE_TO_JOINT_KEY: Dict[str, str] = {
     "left_wrist": "follower_l_joint_pos",
@@ -224,19 +221,6 @@ def _get_kinematics() -> Any:
     return _kinematics
 
 
-# 4x4 homogeneous matrix for 180° rotation around the optical (Z) axis.
-# Corrects both extrinsics and principal point when a camera is mounted upside-down.
-_R_FLIP_180 = np.array(
-    [
-        [-1.0, 0.0, 0.0, 0.0],
-        [0.0, -1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ],
-    dtype=np.float32,
-)
-
-
 # ---------------------------------------------------------------------------
 # Pose helpers
 # ---------------------------------------------------------------------------
@@ -264,7 +248,6 @@ def _extract_svo2_synchronized(
     names: List[str],
     rgb_dirs: List[Path],
     depth_dirs: List[Path],
-    flips: List[bool],
     max_frames: Optional[int] = None,
     sync_threshold_ns: int = 16_666_667,  # half a frame at 30 fps
 ) -> Dict[str, Tuple[np.ndarray, Optional[dict]]]:
@@ -299,7 +282,6 @@ def _extract_svo2_synchronized(
 
     rgb_dir_map = dict(zip(names, rgb_dirs))
     depth_dir_map = dict(zip(names, depth_dirs))
-    flip_map = dict(zip(names, flips))
 
     timestamps: Dict[str, List[int]] = {name: [] for name in names}
     frame_idx = 0
@@ -352,14 +334,9 @@ def _extract_svo2_synchronized(
         # All cameras are within threshold — save this synchronized frame.
         for name, cam in cams.items():
             frame = cam.get_frame()
-            flip = flip_map[name]
+            cv2.imwrite(str(rgb_dir_map[name] / f"{frame_idx:010d}{_IMG_EXT}"), frame.color)
 
-            color = cv2.rotate(frame.color, cv2.ROTATE_180) if flip else frame.color
-            cv2.imwrite(str(rgb_dir_map[name] / f"{frame_idx:010d}{_IMG_EXT}"), color)
-
-            depth_mm = (frame.depth * 1000.0).clip(0, 65535).astype(np.uint16)
-            if flip:
-                depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_180)
+            depth_mm = np.rint(frame.depth * 1000.0).clip(0, 65535).astype(np.uint16)
             np.savez_compressed(
                 str(depth_dir_map[name] / f"{frame_idx:010d}.npz"), depth=depth_mm
             )
@@ -397,7 +374,6 @@ def _extract_bag(
     bag_path: Path,
     rgb_dir: Path,
     depth_dir: Path,
-    flip: bool = False,
     max_frames: Optional[int] = None,
     crop: tuple[int, int, int, int] | None = None,
 ) -> Tuple[np.ndarray, Optional[dict]]:
@@ -429,13 +405,10 @@ def _extract_bag(
             break
         frame = camera.get_frame()
 
-        color = cv2.rotate(frame.color, cv2.ROTATE_180) if flip else frame.color
-        cv2.imwrite(str(rgb_dir / f"{idx:010d}{_IMG_EXT}"), color)
+        cv2.imwrite(str(rgb_dir / f"{idx:010d}{_IMG_EXT}"), frame.color)
 
         if frame.depth is not None:  # bags recorded with depth off have none
-            depth_mm = (frame.depth * 1000.0).clip(0, 65535).astype(np.uint16)
-            if flip:
-                depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_180)
+            depth_mm = np.rint(frame.depth * 1000.0).clip(0, 65535).astype(np.uint16)
             depth_dir.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(str(depth_dir / f"{idx:010d}.npz"), depth=depth_mm)
 
@@ -853,7 +826,6 @@ def _build_lowdim(
     calib: Optional[dict],
     robot_data: Optional[Dict[str, np.ndarray]],
     rec_meta: dict,
-    flip_cameras: set,
     right_base_to_left_base: Optional[np.ndarray],
     cam_timestamps: Dict[str, Optional[np.ndarray]],
     wrist_camera_joint_keys: Optional[Dict[str, str]] = None,
@@ -999,11 +971,7 @@ def _build_lowdim(
         info = camera_infos.get(name)
         if not info:
             continue
-        flip = name in flip_cameras
         cx, cy = info["cx"], info["cy"]
-        if flip:
-            cx = (info["width"] - 1) - cx
-            cy = (info["height"] - 1) - cy
         intrinsics[name] = np.array(
             [[info["fx"], 0.0, cx], [0.0, info["fy"], cy], [0.0, 0.0, 1.0]],
             dtype=np.float32,
@@ -1024,7 +992,6 @@ def _build_lowdim(
             extrinsics[name] = poses
             continue
 
-        flip = name in flip_cameras
         static_ext = np.eye(4, dtype=np.float32)
         he = None
         if calib and "cameras" in calib and name in calib["cameras"]:
@@ -1060,8 +1027,6 @@ def _build_lowdim(
             T_cam2ee[:3, 3] = np.array(
                 he["translation_vector"], dtype=np.float32
             ).flatten()
-            if flip:
-                T_cam2ee = T_cam2ee @ _R_FLIP_180
 
             # The selected wrist image can lead or lag the common reference
             # grid. Its FK belongs to its own capture time, including a held image.
@@ -1556,7 +1521,6 @@ def convert_recording(
             names=svo2_names,
             rgb_dirs=[seq_dir / "rgb" / n for n in svo2_names],
             depth_dirs=[seq_dir / "depth" / n for n in svo2_names],
-            flips=[n in _FLIP_CAMERAS for n in svo2_names],
             max_frames=max_frames_svo2,
         )
         for name, (ts_arr, info) in sync_results.items():
@@ -1588,10 +1552,9 @@ def convert_recording(
                 cam_timestamps[name] = None
             continue
 
-        flip = name in _FLIP_CAMERAS
-        print(f"  Extracting {bag_path.name}" + (" (flipped)" if flip else ""))
+        print(f"  Extracting {bag_path.name}")
         ts_arr, info = _extract_bag(
-            bag_path, rgb_dir, depth_dir, flip=flip, max_frames=bag_max,
+            bag_path, rgb_dir, depth_dir, max_frames=bag_max,
             crop=_recording_camera_crop(camera_settings, name),
         )
         frame_counts[name] = len(ts_arr)
@@ -1709,7 +1672,6 @@ def convert_recording(
         calib=calib,
         robot_data=robot_data,
         rec_meta=rec_meta,
-        flip_cameras=_FLIP_CAMERAS,
         right_base_to_left_base=T_left_base_from_right_base,
         cam_timestamps=cam_timestamps,
         wrist_camera_joint_keys=wrist_camera_joint_keys,
