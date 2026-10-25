@@ -44,6 +44,7 @@ docs = [
   "mkdocstrings[python]>=0.24",
 ]
 lerobot = ["lerobot>=0.4"]
+hdf5 = ["h5py>=3.8", "rosbags>=0.10,<0.12"]
 
 [project.scripts]
 rd = "raiden.cli:main"

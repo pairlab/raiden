@@ -60,6 +60,7 @@ nav:
     - "7. Conversion": guide/conversion.md
     - "8. Shardify": guide/shardify.md
     - LeRobot Export: guide/lerobot.md
+    - Native HDF5 Export: guide/native_hdf5.md
     - "9. Evaluation": guide/serve.md
     - "10. Replay": guide/replay.md
     - "11. Visualization": guide/visualization.md
