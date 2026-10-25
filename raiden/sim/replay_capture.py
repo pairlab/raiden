@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
+from raiden.realsense_files import REALSENSE_RECORDING_FORMATS
 from raiden.sim.hardware_session import write_json
 
 CAMERAS = ("scene_camera", "left_wrist_camera")
@@ -30,6 +31,8 @@ def validate_camera_config(config):
         width, height = entry.get("resolution", [640, 480])
         if width <= 0 or height <= 0 or entry.get("fps", 30) <= 0:
             raise ValueError(f"invalid camera dimensions/fps: {name}")
+        if entry.get("recording_format", "bag") not in REALSENSE_RECORDING_FORMATS:
+            raise ValueError(f"invalid RealSense recording_format: {name}")
     return entries
 
 
@@ -155,12 +158,13 @@ class DualCameraCapture:
         # These optional/device modules are deliberately absent from offline preflight.
         pipeline, writer, started = None, None, False
         folder = self.destination / name
+        native_filename = f"color.{entry.get('recording_format', 'bag')}"
         record = {
             "camera": name,
             "sdk_serial": str(entry["serial"]),
             "frames": 0,
             "camera_settings_written": False,
-            "native_bag": "color.bag",
+            "native_bag": native_filename,
             "preview": "preview.mp4",
             "policy_crop": entry.get("crop"),
             "depth_recorded": False,
@@ -183,7 +187,7 @@ class DualCameraCapture:
             fps = entry.get("fps", 30)
             cfg.enable_device(str(entry["serial"]))
             cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-            cfg.enable_record_to_file(str(folder / "color.bag"))
+            cfg.enable_record_to_file(str(folder / native_filename))
             profile = pipeline.start(cfg)
             started = True
             record["before"] = device_color_receipt(profile.get_device())

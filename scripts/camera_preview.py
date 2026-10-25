@@ -28,6 +28,7 @@ import cv2
 from raiden._config import CAMERA_CONFIG
 from raiden.camera_config import CameraConfig
 from raiden.monitor import LiveMonitor
+from raiden.realsense_files import find_realsense_recording
 
 
 def _draw_grid(img):
@@ -43,8 +44,8 @@ def _reference_frame(episode: Path, name: str, crop, frame: int = 5):
     """The camera's frame *frame* of a recorded episode (arm at home), cropped as recorded."""
     from raiden.cameras.realsense import RealSenseCamera
 
-    bag = episode / "cameras" / f"{name}.bag"
-    if not bag.exists():
+    bag = find_realsense_recording(episode / "cameras", name)
+    if bag is None:
         return None
     cam = RealSenseCamera.from_bag(name, bag, crop=crop)
     img = None
@@ -147,7 +148,7 @@ def main() -> None:
         for name in names:
             img = _reference_frame(Path(args.reference), name, cfg.get_crop(name))
             if img is None:
-                print(f"  no {name}.bag in {args.reference}, no reference for it")
+                print(f"  no {name}.bag/.db3 in {args.reference}, no reference for it")
                 continue
             references[f"{name} reference"] = _draw_grid(img) if args.grid else img
             print(f"  ✓ {name} reference from {args.reference}")

@@ -34,6 +34,7 @@ from raiden._config import CAMERA_CONFIG
 from raiden.camera_config import CameraConfig
 from raiden.converter import _extract_bag
 from raiden.recorder import load_cameras_from_config
+from raiden.realsense_files import REALSENSE_RECORDING_SUFFIXES, list_realsense_recordings
 
 OUT = Path("/var/tmp/raiden_depth_check")
 
@@ -164,11 +165,13 @@ def main() -> int:
             cam.close()
 
     ok = True
+    native_files = {path.stem: path for path in list_realsense_recordings(OUT / "cameras")}
     for cam in cameras:
         bag = OUT / "cameras" / f"{cam.name}.{cam.recording_extension}"
-        if bag.suffix != ".bag":
+        if bag.suffix not in REALSENSE_RECORDING_SUFFIXES:
             print(f"\n  {cam.name}: not a RealSense bag, skipping")
             continue
+        bag = native_files.get(cam.name, bag)
         ok &= check(cam.name, bag, OUT, elapsed)
 
     total = sum(p.stat().st_size for p in (OUT / "cameras").glob("*")) / 1e6

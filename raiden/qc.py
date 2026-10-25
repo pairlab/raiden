@@ -32,6 +32,7 @@ import pyrealsense2 as rs
 
 from raiden.camera_config import CameraConfig
 from raiden.cameras.realsense import RealSenseCamera
+from raiden.realsense_files import find_realsense_recording
 
 IN = 0.0254
 COM_MARGIN = 0.004  # the task JSON's croissant region is this much inside the centre-of-mass box
@@ -360,7 +361,9 @@ def check(ep: Path, task: str, geo: Geometry, cfg: CameraConfig, st: QCSettings,
         want, got = cfg.get_color_controls(name), cc.get(name)
         if not isinstance(got, dict) or want is None or any(abs(got.get(k, -1) - v) > 0.5 for k, v in want.items()):
             r["reasons"].append(f"{name} color_controls {got!r} (camera.json {want})")
-    w = first_frame(ep / "cameras/left_wrist_camera.bag", "left_wrist_camera", cfg.get_crop("left_wrist_camera"))
+    wrist_file = find_realsense_recording(ep / "cameras", "left_wrist_camera") or ep / "cameras/left_wrist_camera.bag"
+    scene_file = find_realsense_recording(ep / "cameras", "scene_camera") or ep / "cameras/scene_camera.bag"
+    w = first_frame(wrist_file, "left_wrist_camera", cfg.get_crop("left_wrist_camera"))
     if w is None:
         r["reasons"].append("wrist bag unreadable")
     else:
@@ -370,7 +373,7 @@ def check(ep: Path, task: str, geo: Geometry, cfg: CameraConfig, st: QCSettings,
         r["reasons"] += tip_reasons(tips, st)
         if r["wrist_mean"] < st.min_wrist_mean:
             r["reasons"].append(f"wrist brightness {r['wrist_mean']:.0f} < {st.min_wrist_mean:.0f} (camera slipped?)")
-    s = first_frame(ep / "cameras/scene_camera.bag", "scene_camera", cfg.get_crop("scene_camera"))
+    s = first_frame(scene_file, "scene_camera", cfg.get_crop("scene_camera"))
     if s is None:
         r["reasons"].append("scene bag unreadable")
     else:
@@ -401,7 +404,7 @@ def check(ep: Path, task: str, geo: Geometry, cfg: CameraConfig, st: QCSettings,
                 r["reasons"].append(f"oven y {oy:+.3f} outside the sim's ±{geo.oven_region[3]:.3f}")
             if not o_white:
                 r["reasons"].append(f"oven ({ox:.3f}, {oy:+.3f}) crosses the white box")
-        a, b, seen, dur = oven_start_end(ep / "cameras/scene_camera.bag", geo, cfg.get_crop("scene_camera"))
+        a, b, seen, dur = oven_start_end(scene_file, geo, cfg.get_crop("scene_camera"))
         if a and b:
             dx, dy = b[0] - a[0], b[1] - a[1]
             r["oven_moved"] = [round(dx, 3), round(dy, 3)]

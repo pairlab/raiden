@@ -3,6 +3,7 @@
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pyrealsense2 as rs
 
@@ -11,6 +12,7 @@ from raiden.cameras.realsense_receipt import (
     color_frame_receipt,
     device_color_receipt,
 )
+from raiden.cameras.realsense import RealSenseCamera
 
 
 class Sensor:
@@ -99,6 +101,72 @@ class ReceiptTest(unittest.TestCase):
         receipt = color_frame_receipt(frame)
         self.assertEqual(receipt["native_metadata"], {"actual_exposure": 250})
         self.assertIn("gamma", receipt["unavailable_fields"])
+
+    def test_clock_mapping_records_receipt_provenance_without_exposure_claim(self):
+        frame = SimpleNamespace(get_timestamp=lambda: 12.5,
+                                get_frame_timestamp_domain=lambda: "hardware_clock")
+        camera = RealSenseCamera.__new__(RealSenseCamera)
+        camera._pipeline = SimpleNamespace(wait_for_frames=lambda timeout_ms:
+                                          SimpleNamespace(get_color_frame=lambda: frame))
+        with patch("raiden.cameras.realsense.time.time_ns", side_effect=[19_000_000, 20_000_000]):
+            camera._measure_clock_offset()
+        receipt = camera._clock_mapping_receipt
+        self.assertEqual(camera._clock_offset_ns, 7_500_000)
+        self.assertEqual(receipt["offset_ns"], 7_500_000)
+        self.assertEqual(receipt["frame_timestamp_domain"], "hardware_clock")
+        self.assertEqual(receipt["host_wait_start_ns"], 19_000_000)
+        self.assertEqual(receipt["host_receive_ns"], 20_000_000)
+        self.assertIn("unknown transport/queue delay", receipt["interpretation"])
+
+    def test_failed_clock_measurement_cannot_reuse_previous_episode_offset(self):
+        camera = RealSenseCamera.__new__(RealSenseCamera)
+        camera._clock_offset_ns = 123
+        camera._pipeline = SimpleNamespace(wait_for_frames=lambda timeout_ms:
+                                          (_ for _ in ()).throw(RuntimeError("saved failure")))
+        camera._measure_clock_offset()
+        self.assertIsNone(camera._clock_offset_ns)
+        self.assertIn("saved failure", camera._clock_mapping_receipt["error"])
+
+    def test_native_recording_format_is_explicit_and_validated_without_hardware(self):
+        with patch("raiden.cameras.realsense.rs.pipeline") as pipeline:
+            self.assertEqual(RealSenseCamera("view", "synthetic").recording_extension, "bag")
+            self.assertEqual(RealSenseCamera("view", "synthetic", recording_format="db3").recording_extension, "db3")
+            for value in ("svo2", "", None, ".db3"):
+                with self.subTest(value=value), self.assertRaisesRegex(ValueError, "recording_format"):
+                    RealSenseCamera("view", "synthetic", recording_format=value)
+            pipeline.assert_not_called()
+
+    def test_contradicting_output_path_fails_before_stopping_or_writing(self):
+        from pathlib import Path
+
+        camera = RealSenseCamera("view", "synthetic", recording_format="db3")
+        camera._pipeline = SimpleNamespace(stop=lambda: self.fail("must not stop a stream"))
+        with self.assertRaisesRegex(ValueError, "requires a .db3 output path"):
+            camera.start_recording(Path("view.bag"))
+
+    def test_playback_rejects_unrelated_suffix_before_creating_a_pipeline(self):
+        from pathlib import Path
+
+        with patch("raiden.cameras.realsense.rs.pipeline") as pipeline:
+            with self.assertRaisesRegex(ValueError, ".bag or .db3"):
+                RealSenseCamera.from_bag("view", Path("view.mp4"))
+            pipeline.assert_not_called()
+
+    def test_playback_keeps_both_native_formats_without_changing_sdk_settings(self):
+        from pathlib import Path
+
+        for suffix in ("bag", "db3"):
+            with self.subTest(suffix=suffix), patch("raiden.cameras.realsense.rs.pipeline") as pipeline, \
+                    patch("raiden.cameras.realsense.rs.config") as config:
+                profile = pipeline.return_value.start.return_value
+                profile.get_streams.return_value = []
+                camera = RealSenseCamera.from_bag("view", Path(f"view.{suffix}"))
+                self.assertEqual(camera.recording_extension, suffix)
+                config.enable_device_from_file.assert_called_once_with(
+                    config.return_value, f"view.{suffix}", repeat_playback=False)
+                profile.get_device.return_value.as_playback.return_value.set_real_time.assert_called_once_with(False)
+                camera.close()
+                pipeline.return_value.stop.assert_called_once_with()
 
 
 if __name__ == "__main__":

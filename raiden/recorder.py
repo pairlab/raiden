@@ -53,6 +53,24 @@ from raiden.db.database import get_db
 from raiden.robot.controller import RobotController, _binary_gripper
 from raiden.utils import fzf_select
 
+_STATE_TIMING_DEFAULTS = {
+    "state_timestamp_ns": -1,
+    "state_timestamp_valid": False,
+    "state_timestamp_source": "unavailable",
+    "read_start_ns": -1,
+    "read_end_ns": -1,
+    "read_start_monotonic_ns": -1,
+    "read_end_monotonic_ns": -1,
+}
+_COMMAND_TIMING_DEFAULTS = {
+    "command_timestamp_ns": -1,
+    "command_timestamp_valid": False,
+    "command_timestamp_source": "unavailable",
+    "command_end_ns": -1,
+    "command_start_monotonic_ns": -1,
+    "command_end_monotonic_ns": -1,
+}
+
 # ---------------------------------------------------------------------------
 # Metadata
 # ---------------------------------------------------------------------------
@@ -129,6 +147,32 @@ class DemonstrationRecorder:
         config["robot"] = robot_controller.recording_config()
         self.extra_metadata["recording_config"] = config
         self._required_followers = config["robot"]["active_followers"]
+        self.extra_metadata["robot_timing"] = {
+            "schema_version": 1,
+            "wall_clock": "Unix epoch nanoseconds from host time.time_ns()",
+            "monotonic_clock": "host time.monotonic_ns(); differences only, not epoch time",
+            "timestamps": "Legacy reference-camera clock label before sequential robot reads",
+            "readout_timestamp_ns/readout_end_ns": (
+                "Host wall-clock row start/completion brackets around all observations and command snapshots"
+            ),
+            "state_timestamp_ns": (
+                "Per-arm cached state timestamp, valid only with state_timestamp_valid. "
+                "host_cached_feedback_read labels a host read of cached CAN feedback; "
+                "derived from driver float seconds, not motor acquisition or feedback receipt time."
+            ),
+            "read_start_ns/read_end_ns": "Per-arm observation call brackets, including snapshot copy",
+            "command_timestamp_ns/command_end_ns": (
+                "Host teleop command API issue/return brackets, atomic with joint_cmd intent; "
+                "not CAN delivery or motor execution. Pause hold calls are included. "
+                "Home/reset calls outside teleop are not command events."
+            ),
+            "unknown": "-1 timestamp, False validity, unavailable source; no acquisition time inferred",
+            "command_sampling": (
+                "Latest completed teleop API call at each recorder read; intermediate commands "
+                "may be unsampled. Initial measured-pose fallback has unknown command timing."
+            ),
+            "joint_cmd_api": "Per-arm teleop API input target; NaN when unknown; joint_cmd retains gripper intent",
+        }
 
     # ------------------------------------------------------------------
     # Public API
@@ -412,16 +456,10 @@ class DemonstrationRecorder:
     def _robot_loop(self, stop_event: threading.Event, ref_camera) -> None:
         """Read joint observations at ~100 Hz and buffer them.
 
-        Timestamps are recorded via ``ref_camera.get_current_timestamp_ns()``.
-
-        - ZED cameras override this to return the ZED SDK hardware clock, which
-          is on the same clock as the frame timestamps in the SVO2 file.
-          Direct interpolation at conversion time requires no correction.
-        - RealSense cameras fall back to ``time.time_ns()`` (system wall clock),
-          while frame timestamps use the RealSense hardware clock.  The offset
-          between the two clocks is measured once per session and stored in
-          ``metadata.json`` as ``realsense_clock_offsets``, then applied at
-          conversion time.
+        Legacy row timestamps retain the reference camera's current clock
+        (host wall time for RealSense). Separate host labels, per-arm read
+        brackets, cached state times and command API times preserve their
+        actual provenance; none claims simultaneous motor acquisition.
         """
         target_dt = 0.01  # 100 Hz
         while not stop_event.is_set():
@@ -429,12 +467,34 @@ class DemonstrationRecorder:
 
             try:
                 ts_ns = ref_camera.get_current_timestamp_ns()
-                obs = self.robot_controller.get_all_observations()
-                cmd = self.robot_controller.get_last_commanded_positions()
+                readout_ns = time.time_ns()
+                readout_monotonic_ns = time.monotonic_ns()
+                timed_observations = getattr(self.robot_controller, "get_all_timed_observations", None)
+                if callable(timed_observations):
+                    obs, obs_timing = timed_observations()
+                else:
+                    obs = self.robot_controller.get_all_observations()
+                    obs_timing = {}
+                command_snapshots = getattr(self.robot_controller, "get_last_commanded_snapshots", None)
+                if callable(command_snapshots):
+                    cmd_timing = command_snapshots()
+                    cmd = {name: snapshot["positions"] for name, snapshot in cmd_timing.items()}
+                else:
+                    cmd = self.robot_controller.get_last_commanded_positions()
+                    cmd_timing = {}
+                readout_end_ns = time.time_ns()
+                readout_end_monotonic_ns = time.monotonic_ns()
                 self._validate_robot_frame(obs, cmd)
                 if stop_event.is_set():
                     return
-                self._robot_frames.append({"t": ts_ns, "obs": obs, "cmd": cmd})
+                self._robot_frames.append({
+                    "t": ts_ns, "obs": obs, "cmd": cmd,
+                    "readout_timestamp_ns": readout_ns,
+                    "readout_monotonic_ns": readout_monotonic_ns,
+                    "readout_end_ns": readout_end_ns,
+                    "readout_end_monotonic_ns": readout_end_monotonic_ns,
+                    "obs_timing": obs_timing, "cmd_timing": cmd_timing,
+                })
                 if self.monitor is not None:
                     # Parks the array for the grasp guides; FK happens on the monitor thread.
                     for arm in ("follower_l", "follower_r"):
@@ -484,6 +544,9 @@ class DemonstrationRecorder:
         data["timestamps"] = np.array(
             [f["t"] for f in self._robot_frames], dtype=np.int64
         )
+        for key in ("readout_timestamp_ns", "readout_monotonic_ns",
+                    "readout_end_ns", "readout_end_monotonic_ns"):
+            data[key] = np.array([f.get(key, -1) for f in self._robot_frames], dtype=np.int64)
 
         # Collect all robot names present in the first frame
         robot_names = list(self._robot_frames[0]["obs"].keys())
@@ -493,6 +556,25 @@ class DemonstrationRecorder:
             for key in obs_keys:
                 arr = np.stack([f["obs"][robot_name][key] for f in self._robot_frames])
                 data[f"{robot_name}_{key}"] = arr
+            timing_sources = [("obs_timing", _STATE_TIMING_DEFAULTS)]
+            if robot_name in ("follower_l", "follower_r"):
+                timing_sources.append(("cmd_timing", _COMMAND_TIMING_DEFAULTS))
+                data[f"{robot_name}_joint_cmd_api"] = np.array([
+                    frame.get("cmd_timing", {}).get(robot_name, {}).get("api_positions", np.full(7, np.nan))
+                    for frame in self._robot_frames
+                ], dtype=np.float32)
+            for source, defaults in timing_sources:
+                for key, default in defaults.items():
+                    if isinstance(default, bool):
+                        dtype = np.bool_
+                    elif isinstance(default, str):
+                        dtype = np.str_
+                    else:
+                        dtype = np.int64
+                    data[f"{robot_name}_{key}"] = np.array([
+                        frame.get(source, {}).get(robot_name, {}).get(key, default)
+                        for frame in self._robot_frames
+                    ], dtype=dtype)
 
         # Retain measured streams even if a required arm or its command stream
         # fails the checks below. A failed attempt remains useful for diagnosis.
@@ -663,14 +745,17 @@ def load_cameras_from_config(
 
 def _camera_recording_config(cfg: CameraConfig, names: List[str]) -> Dict:
     """Portable semantic associations; native camera receipts retain capture details."""
-    return {
-        name: {
+    result = {}
+    for name in names:
+        result[name] = {
             "role": cfg.get_role(name),
             "type": cfg.get_camera_type(name),
             "policy_crop": list(cfg.get_crop(name)) if cfg.get_crop(name) else None,
         }
-        for name in names
-    }
+        recording_format = cfg.get_recording_format(name)
+        if recording_format is not None:
+            result[name]["recording_format"] = recording_format
+    return result
 
 
 # ---------------------------------------------------------------------------

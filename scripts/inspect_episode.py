@@ -22,6 +22,8 @@ from pathlib import Path
 
 import numpy as np
 
+from raiden.realsense_files import list_realsense_recordings
+
 DB_PATH = Path.home() / ".config" / "raiden" / "db" / "demonstrations.json"
 
 # 0.9 x the constant, which is what the control loop actually applies.
@@ -79,13 +81,13 @@ def report(ep: Path, brief: bool) -> list:
         warn.append("duplicate DB rows for this path — statuses conflict")
 
     # ── cameras ──────────────────────────────────────────────────────────
-    cams = sorted((ep / "cameras").glob("*.bag")) if (ep / "cameras").is_dir() else []
+    cams = list_realsense_recordings(ep / "cameras")
     print(f"\n  cameras      {len(cams)}")
     for c in cams:
         print(f"    {c.name:26s} {c.stat().st_size / 1e9:6.2f} GB")
     for name in meta.get("cameras", []):
         if not any(c.stem == name for c in cams):
-            warn.append(f"metadata lists camera {name!r} but no {name}.bag on disk")
+            warn.append(f"metadata lists camera {name!r} but no {name}.bag/.db3 on disk")
 
     npz = ep / "robot_data.npz"
     if not npz.exists():

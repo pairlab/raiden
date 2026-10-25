@@ -436,13 +436,9 @@ class RobotController:
         # Optional footpedal — attached in setup_for_teleop_recording()
         self._footpedal: Optional["FootPedal"] = None
 
-        # Last 7-DOF position commanded to each follower (arm joints + gripper).
-        # Updated by both the leader-follower and SpaceMouse teleop loops so the
-        # recorder can capture the commanded pose alongside the observed pose.
-        self._last_commanded_pos: Dict[str, Optional[np.ndarray]] = {
-            "right": None,
-            "left": None,
-        }
+        # A command's intent and host API timing are one per-arm snapshot.
+        self._command_snapshot_locks = {side: threading.Lock() for side in ("right", "left")}
+        self._last_commanded = {"right": None, "left": None}
 
     def _enabled_robot_names(self) -> list[str]:
         return [
@@ -752,6 +748,45 @@ class RobotController:
 
         return obs
 
+    def get_all_timed_observations(self) -> tuple[dict, dict]:
+        """Return per-arm snapshots with host read brackets and optional cache times.
+
+        Drivers without the public timed accessor retain unknown acquisition
+        timing. Read brackets only describe this process's observation call.
+        """
+        observations, timings = {}, {}
+        robots = {
+            "leader_r": self.leader_r._robot if self.leader_r else None,
+            "leader_l": self.leader_l._robot if self.leader_l else None,
+            "follower_r": self.follower_r,
+            "follower_l": self.follower_l,
+        }
+        for name, robot in robots.items():
+            if robot is None:
+                continue
+            read_start_ns = time.time_ns()
+            read_start_monotonic_ns = time.monotonic_ns()
+            getter = getattr(robot, "get_timed_observations", None)
+            if callable(getter):
+                observation, timing = getter()
+                timing = dict(timing)
+            else:
+                observation = robot.get_observations()
+                timing = {
+                    "state_timestamp_ns": -1,
+                    "state_timestamp_valid": False,
+                    "state_timestamp_source": "unavailable",
+                }
+            observations[name] = {key: np.asarray(value).copy() for key, value in observation.items()}
+            timing.update(
+                read_start_ns=read_start_ns,
+                read_end_ns=time.time_ns(),
+                read_start_monotonic_ns=read_start_monotonic_ns,
+                read_end_monotonic_ns=time.monotonic_ns(),
+            )
+            timings[name] = timing
+        return observations, timings
+
     def get_last_commanded_positions(self) -> Dict[str, Optional[np.ndarray]]:
         """Return the last 7-DOF position commanded to each follower arm.
 
@@ -759,14 +794,48 @@ class RobotController:
         mapping to a ``(7,)`` float32 array or ``None`` if no command has been
         issued yet (e.g. at the start of an episode before the first teleop step).
         """
-        return {
-            "follower_r": self._last_commanded_pos["right"].copy()
-            if self._last_commanded_pos["right"] is not None
-            else None,
-            "follower_l": self._last_commanded_pos["left"].copy()
-            if self._last_commanded_pos["left"] is not None
-            else None,
-        }
+        return {name: snapshot["positions"] for name, snapshot in self.get_last_commanded_snapshots().items()}
+
+    def get_last_commanded_snapshots(self) -> dict[str, dict]:
+        """Copy each latest teleop command and its host API issue/return times.
+
+        These label the local command API call, not CAN delivery or execution.
+        Snapshot locks prevent pairing a position with another command's time.
+        """
+        result = {}
+        for side, name in (("right", "follower_r"), ("left", "follower_l")):
+            with self._command_snapshot_locks[side]:
+                snapshot = self._last_commanded[side]
+                result[name] = (
+                    {**snapshot, "positions": snapshot["positions"].copy(),
+                     "api_positions": snapshot["api_positions"].copy()}
+                    if snapshot is not None else {"positions": None}
+                )
+        return result
+
+    def _command_follower(self, side: str, positions: np.ndarray, intent: np.ndarray | None = None) -> None:
+        """Issue a teleop command and publish its intent and API bracket together."""
+        follower = self.follower_r if side == "right" else self.follower_l
+        with self._command_snapshot_locks[side]:
+            if intent is None:
+                previous = self._last_commanded[side]
+                grip = previous["positions"][6] if previous else _binary_gripper(positions[6])
+                intent = np.append(positions[:6], grip)
+            recorded = np.asarray(intent).copy()
+            api_positions = np.asarray(positions).copy()
+            start_ns = time.time_ns()
+            start_monotonic_ns = time.monotonic_ns()
+            follower.command_joint_pos(positions)
+            self._last_commanded[side] = {
+                "positions": recorded,
+                "api_positions": api_positions,
+                "command_timestamp_ns": start_ns,
+                "command_timestamp_valid": True,
+                "command_timestamp_source": "host_command_api_issue",
+                "command_end_ns": time.time_ns(),
+                "command_start_monotonic_ns": start_monotonic_ns,
+                "command_end_monotonic_ns": time.monotonic_ns(),
+            }
 
     def get_joint_positions(self) -> Dict[str, np.ndarray]:
         """Get current joint positions of all robots
@@ -972,7 +1041,7 @@ class RobotController:
                         was_paused = True
 
                     leader.command_joint_pos(hold_leader_pos)
-                    follower.command_joint_pos(hold_follower_pos)
+                    self._command_follower(side, hold_follower_pos)
                     time.sleep(0.01)
                     continue
 
@@ -991,10 +1060,10 @@ class RobotController:
                 )
                 follower_cmd = np.append(leader_pos[:6], follower_gripper_cmd)
 
-                follower.command_joint_pos(follower_cmd)
                 # Record the operator's intent; the clamp above stays motor-side.
-                self._last_commanded_pos[side] = np.append(
-                    leader_pos[:6], _binary_gripper(leader_pos[6])
+                self._command_follower(
+                    side, follower_cmd,
+                    np.append(leader_pos[:6], _binary_gripper(leader_pos[6])),
                 )
                 time.sleep(0.01)  # 100 Hz — matches inference command rate
 
@@ -1158,7 +1227,7 @@ class RobotController:
                     if not was_paused:
                         hold_pos = follower.get_joint_pos().copy()
                         was_paused = True
-                    follower.command_joint_pos(hold_pos)
+                    self._command_follower(side, hold_pos)
                     time.sleep(dt)
                     continue
                 if self._session_estop_event.is_set():
@@ -1180,9 +1249,8 @@ class RobotController:
                         q_arm,
                         float(np.clip(gripper, _GRIPPER_MIN_OPENING, 1.0)),
                     )
-                follower.command_joint_pos(cmd)
                 # Record the operator's intent; the clamp above stays motor-side.
-                self._last_commanded_pos[side] = np.append(cmd[:6], gripper_intent)
+                self._command_follower(side, cmd, np.append(cmd[:6], gripper_intent))
 
                 remaining = dt - (time.monotonic() - loop_start)
                 if remaining > 0:
@@ -1415,7 +1483,7 @@ class RobotController:
                     if not was_paused:
                         hold_pos = follower.get_joint_pos().copy()
                         was_paused = True
-                    follower.command_joint_pos(hold_pos)
+                    self._command_follower(side, hold_pos)
                     time.sleep(dt)
                     continue
 
@@ -1459,9 +1527,8 @@ class RobotController:
                     q_arm[::-1],  # pyroki→MuJoCo
                     max(_GRIPPER_MIN_OPENING, gripper_intent),
                 )
-                follower.command_joint_pos(cmd)
                 # Record the operator's intent; the clamp above stays motor-side.
-                self._last_commanded_pos[side] = np.append(cmd[:6], gripper_intent)
+                self._command_follower(side, cmd, np.append(cmd[:6], gripper_intent))
 
                 # --- pace to dt ---
                 elapsed = time.monotonic() - loop_start
@@ -1636,7 +1703,9 @@ class RobotController:
             raise RuntimeError("reset_sim_episode needs the simulator")
         self.stop_teleoperation()
         self.move_to_home_positions()
-        self._last_commanded_pos = {"right": None, "left": None}
+        for side in ("right", "left"):
+            with self._command_snapshot_locks[side]:
+                self._last_commanded[side] = None
         time.sleep(_SIM_SETTLE_S)
 
     def shutdown(self):

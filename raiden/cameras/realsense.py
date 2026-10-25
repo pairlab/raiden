@@ -1,7 +1,7 @@
 """Intel RealSense camera implementation (e.g. D405).
 
-Recording mode opens by serial number and records to .bag via the SDK recorder.
-Playback mode opens a .bag file and reads color (+ depth, if recorded) frames;
+Recording mode opens by serial number and records to .bag/.db3 via the SDK recorder.
+Playback mode opens a native recording and reads color (+ depth, if recorded) frames;
 use ``RealSenseCamera.from_bag()`` to create a playback instance.
 
 .. warning:: **For dynamic tasks, prefer ZED cameras over RealSense.**
@@ -54,6 +54,8 @@ from typing import Optional, Tuple
 import numpy as np
 import pyrealsense2 as rs
 
+from raiden.realsense_files import REALSENSE_RECORDING_FORMATS
+
 from .base import Camera, CameraFrame
 from .realsense_receipt import (
     color_frame_receipt,
@@ -86,7 +88,7 @@ def _wait_for_device(serial: str, timeout_s: float = 20.0) -> bool:
 
 
 class RealSenseCamera(Camera):
-    """Intel RealSense D4xx camera – records to .bag"""
+    """Intel RealSense D4xx camera – records in the configured SDK format."""
 
     _COLOR_W, _COLOR_H = 640, 480
     _DEPTH_W, _DEPTH_H = 640, 480
@@ -112,6 +114,7 @@ class RealSenseCamera(Camera):
         crop: Optional[Tuple[int, int, int, int]] = None,
         depth: bool = True,
         color_controls: Optional[dict] = None,
+        recording_format: str = "bag",
     ):
         """
         Args:
@@ -128,11 +131,17 @@ class RealSenseCamera(Camera):
                 the color sensor to on every pipeline start (measured by
                 ``scripts/lock_color.py``), or None for auto exposure and auto
                 white balance.
+            recording_format: ``"bag"`` (legacy SDK/builds, the default) or
+                ``"db3"`` (SDK builds with ROS2 recording support). Explicit
+                because the native writer depends on SDK build options.
         """
+        if recording_format not in REALSENSE_RECORDING_FORMATS:
+            raise ValueError("RealSense recording_format must be 'bag' or 'db3'")
         self._name = camera_name
         self._serial = serial_number
         self._fps = fps
         self._depth = depth
+        self._recording_format = recording_format
         self._color_controls = dict(color_controls) if color_controls else None
         self._color_applied: Optional[dict] = None
         if resolution is not None:
@@ -152,6 +161,7 @@ class RealSenseCamera(Camera):
         # Measured once at start_recording() by comparing the first frame
         # timestamp to time.time_ns().  None until start_recording() is called.
         self._clock_offset_ns: Optional[int] = None
+        self._clock_mapping_receipt: Optional[dict] = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -167,7 +177,7 @@ class RealSenseCamera(Camera):
 
     @property
     def recording_extension(self) -> str:
-        return "bag"
+        return self._recording_format
 
     @property
     def color_controls(self) -> Optional[dict]:
@@ -315,7 +325,13 @@ class RealSenseCamera(Camera):
             self._profile = None
 
     def start_recording(self, path: Path) -> None:
-        """Restart pipeline with bag recorder attached."""
+        """Restart pipeline with the configured native recorder attached."""
+        path = Path(path)
+        if path.suffix != f".{self._recording_format}":
+            raise ValueError(
+                f"[{self._name}] recording_format={self._recording_format!r} requires "
+                f"a .{self._recording_format} output path, got {path.name!r}"
+            )
         if self._pipeline:
             self._pipeline.stop()
 
@@ -341,10 +357,24 @@ class RealSenseCamera(Camera):
 
         This works whether or not global_time_enabled is supported by the
         device: if it is supported the stored timestamps are already wall-clock
-        and the offset will be ~0; if not, the offset captures the difference
-        between the RealSense hardware clock and the system clock at the
-        moment recording begins, which is stable enough over a 10-60 s episode.
+        and the offset contains host reception delay; if not, it approximates
+        the difference between the RealSense hardware clock and the system
+        clock at recording start. Transport/queue delay and clock drift remain
+        unmeasured, so this is not an exposure synchronization guarantee.
         """
+        # This is a host-receipt measurement, not an exposure-time measurement.
+        # Keep its provenance in the existing camera receipt; native per-frame
+        # timestamps, domains and counters are already retained by the bag.
+        self._clock_offset_ns = None
+        self._clock_mapping_receipt = {
+            "method": "single_host_receipt_offset",
+            "host_wait_start_ns": time.time_ns(),
+            "interpretation": (
+                "One received color frame mapped to host wall time; includes "
+                "unknown transport/queue delay and does not measure clock error "
+                "or synchronize exposures."
+            ),
+        }
         try:
             frames = self._pipeline.wait_for_frames(timeout_ms=2000)
             wall_ns = time.time_ns()
@@ -352,8 +382,16 @@ class RealSenseCamera(Camera):
             if color_frame:
                 rs_ns = int(color_frame.get_timestamp() * 1_000_000)
                 self._clock_offset_ns = wall_ns - rs_ns
-        except Exception:
-            self._clock_offset_ns = None
+                self._clock_mapping_receipt.update({
+                    "host_receive_ns": wall_ns,
+                    "sdk_timestamp_ms": float(color_frame.get_timestamp()),
+                    "frame_timestamp_domain": str(color_frame.get_frame_timestamp_domain()),
+                    "offset_ns": self._clock_offset_ns,
+                })
+            else:
+                self._clock_mapping_receipt["error"] = "No color frame received"
+        except Exception as error:
+            self._clock_mapping_receipt["error"] = str(error)
 
     def stop_recording(self) -> None:
         """Restart pipeline without recorder to finalize the bag file."""
@@ -463,11 +501,14 @@ class RealSenseCamera(Camera):
         bag_path: Path,
         crop: Optional[Tuple[int, int, int, int]] = None,
     ) -> "RealSenseCamera":
-        """Open a .bag file for frame-by-frame extraction.
+        """Open a native .bag or .db3 file for frame-by-frame extraction.
 
         The bag holds the full stream; *crop* (same meaning as in
         ``__init__``) is applied to the frames read back from it.
         """
+        recording_format = Path(bag_path).suffix.removeprefix(".")
+        if recording_format not in REALSENSE_RECORDING_FORMATS:
+            raise ValueError("RealSense playback requires a .bag or .db3 file")
         cam = cls.__new__(cls)
         cam._name = camera_name
         cam._serial = ""
@@ -477,6 +518,7 @@ class RealSenseCamera(Camera):
         cam._latest_frames = None
         cam._color_controls = None
         cam._color_applied = None
+        cam._recording_format = recording_format
 
         cam._pipeline = rs.pipeline()
         cam._config = rs.config()
@@ -520,6 +562,7 @@ class RealSenseCamera(Camera):
         return {
             "serial_number": device_info.get("serial_number") or self._serial,
             "model": device_info.get("name") or "RealSense",
+            "recording_format": self._recording_format,
             "native_width": intr.width,
             "native_height": intr.height,
             "stream_format": str(color_stream.format()),
@@ -527,6 +570,7 @@ class RealSenseCamera(Camera):
             "policy_crop": list(self._crop) if self._crop is not None else None,
             "color_receipt": receipt,
             "last_color_frame_receipt": color_frame_receipt(frame) if frame else None,
+            "clock_mapping_receipt": getattr(self, "_clock_mapping_receipt", None),
             "fps": self._fps,
             "width": width,
             "height": height,

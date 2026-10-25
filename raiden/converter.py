@@ -35,7 +35,7 @@ Output layout::
                     ...
                 right_wrist_camera/
                     ...
-        cameras/                      # raw SVO2/bag files kept
+        cameras/                      # raw SVO2/bag/db3 files kept
         metadata.json                 # original recording metadata (updated: converted=true)
         robot_data.npz
 """
@@ -53,6 +53,7 @@ from tqdm import tqdm
 
 from raiden._config import CAMERA_CONFIG
 from raiden.calibration_utils import left_from_right
+from raiden.realsense_files import list_realsense_recordings
 
 _SEQUENCE_NAME = "0000"
 _IMG_EXT = ".png"
@@ -83,6 +84,74 @@ _DROP_WARN_FRACTION = 0.02
 
 class ConversionError(RuntimeError):
     """Raised when a recording cannot be converted into a consistent episode."""
+
+
+def _checked_timestamps(values: np.ndarray, label: str) -> np.ndarray:
+    """Validate integer nanoseconds before arithmetic or conversion to floats."""
+    values = np.asarray(values)
+    if values.ndim != 1 or values.dtype.kind not in "iu":
+        raise ConversionError(f"{label} must be a one-dimensional integer nanosecond array")
+    if not len(values) or np.any(values < 0) or np.any(values > np.iinfo(np.int64).max):
+        raise ConversionError(f"{label} has empty or invalid timestamps")
+    values = values.astype(np.int64)
+    if np.any(values[1:] < values[:-1]):
+        raise ConversionError(f"{label} has non-monotonic timestamps")
+    return values
+
+
+def _robot_field_timing(
+    robot_data: Dict[str, np.ndarray], key: str
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Return sample times and rows, using native arm timing when it is known.
+
+    Older backends have no timed state/command API. A wholly unknown stream
+    retains its recorded row timestamps; partially known streams use only the
+    known samples rather than inventing times for the other rows.
+    """
+    row_ts = _checked_timestamps(robot_data["timestamps"], "robot timestamps")
+    count = len(robot_data[key])
+    if count != len(row_ts):
+        raise ConversionError(
+            f"robot field {key} has {count} rows for {len(row_ts)} timestamps"
+        )
+    mask = np.ones(count, dtype=bool)
+    arm, _, field = key.rpartition("_joint_")
+    timing_kind = "command" if field == "cmd" else "state"
+    timing_key = f"{arm}_{timing_kind}_timestamp_ns"
+    if timing_key not in robot_data:
+        return row_ts, mask, False
+    times = np.asarray(robot_data[timing_key])
+    valid = np.asarray(robot_data.get(f"{arm}_{timing_kind}_timestamp_valid"))
+    if (times.shape != (count,) or times.dtype.kind not in "iu"
+            or valid.shape != (count,) or valid.dtype.kind != "b"):
+        raise ConversionError(f"{timing_key} requires one integer timestamp and validity flag per row")
+    if not np.any(valid):
+        return row_ts, mask, False
+    times = _checked_timestamps(times[valid], timing_key)
+    if (int(times[0]) > _WALL_CLOCK_MIN_NS) != (int(row_ts[0]) > _WALL_CLOCK_MIN_NS):
+        raise ConversionError(f"{timing_key} and robot timestamps use different clock domains")
+    return times, valid, True
+
+
+def _robot_timing_coverage(robot_data: Dict[str, np.ndarray]) -> np.ndarray:
+    """Intersect measured state coverage and the observed command lifetime."""
+    row_ts = _checked_timestamps(robot_data["timestamps"], "robot timestamps")
+    start, end = int(row_ts[0]), int(row_ts[-1])
+    for side in ("l", "r"):
+        for field in ("pos", "pos_7d", "cmd"):
+            key = f"follower_{side}_joint_{field}"
+            if key not in robot_data:
+                continue
+            times, _, native = _robot_field_timing(robot_data, key)
+            if native:
+                start = max(start, int(times[0]))
+                # An issued command stays active through later recorded rows.
+                # Measured state needs samples bracketing every image instead.
+                if field != "cmd":
+                    end = min(end, int(times[-1]))
+    if start > end:
+        raise ConversionError("robot state and command timestamp ranges do not overlap")
+    return np.asarray([start, end], dtype=np.int64)
 
 
 def _recording_camera_settings(rec_meta: dict) -> dict[str, dict]:
@@ -332,7 +401,7 @@ def _extract_bag(
     max_frames: Optional[int] = None,
     crop: tuple[int, int, int, int] | None = None,
 ) -> Tuple[np.ndarray, Optional[dict]]:
-    """Extract color (and depth, if recorded) frames from a RealSense .bag file.
+    """Extract color (and depth, if recorded) from a native RealSense .bag/.db3 file.
 
     Returns (timestamps_ns, camera_info).  timestamps_ns is an int64 array of
     per-frame wall-clock timestamps (nanoseconds since Unix epoch) saved by the
@@ -554,10 +623,13 @@ def _align_cameras_by_timestamp(
     """Resample cameras onto one timestamp grid inside the telemetry window.
 
     The first camera is the reference clock. Every other camera is mapped to
-    its nearest frame rather than paired by array index, and holds its previous
-    frame over a slot it dropped. When robot timestamps are available, the
-    reference grid is intersected with their range so robot values are never
-    extrapolated into a trailing camera-only interval.
+    its nearest frame, with earlier frames winning ties. Reused frames keep
+    their capture times. When robot timestamps are available, both the grid
+    and eligible image captures are bounded by telemetry coverage.
+
+    camera_alignment.json records selections and signed residuals. The gap and
+    residual limits detect gross capture discontinuities; they do not certify
+    physical synchronization accuracy.
     """
     if not frame_counts:
         return cam_timestamps, frame_counts
@@ -569,16 +641,12 @@ def _align_cameras_by_timestamp(
         if timestamps is None or len(timestamps) != count:
             missing.append(name)
         else:
-            raw_ts[name] = np.asarray(timestamps, dtype=np.int64)
+            raw_ts[name] = _checked_timestamps(timestamps, f"{name} timestamps")
     if missing:
         raise ConversionError(
             "cannot align cameras without one timestamp per frame: "
             + ", ".join(missing)
         )
-
-    for name, ts in raw_ts.items():
-        if len(ts) == 0 or np.any(np.diff(ts) < 0):
-            raise ConversionError(f"{name} has empty or non-monotonic timestamps")
 
     wall_clock = {name: int(ts[0]) > _WALL_CLOCK_MIN_NS for name, ts in raw_ts.items()}
     if all(wall_clock.values()):
@@ -610,9 +678,7 @@ def _align_cameras_by_timestamp(
     t_start = max(int(ts[0]) for ts in aligned_ts.values())
     t_end = min(int(ts[-1]) for ts in aligned_ts.values())
     if robot_timestamps is not None and len(robot_timestamps) > 0:
-        robot_ts = np.asarray(robot_timestamps, dtype=np.int64)
-        if np.any(np.diff(robot_ts) < 0):
-            raise ConversionError("robot timestamps are non-monotonic")
+        robot_ts = _checked_timestamps(robot_timestamps, "robot timestamps")
         robot_is_wall = int(robot_ts[0]) > _WALL_CLOCK_MIN_NS
         if clock_is_wall != robot_is_wall:
             raise ConversionError(
@@ -631,9 +697,26 @@ def _align_cameras_by_timestamp(
         raise ConversionError("no reference-camera frames overlap robot telemetry")
     grid = ref_ts[ref_indices]
 
+    if not np.isfinite(camera_fps) or camera_fps <= 0:
+        raise ConversionError("camera_fps must be positive and finite")
     period_ns = 1e9 / camera_fps
     selections: Dict[str, np.ndarray] = {}
     max_allowed_ns = int(round((_MAX_DROP_RUN + 1) * period_ns))
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "reference_camera": reference,
+        "clock_domain": "host_wall_clock" if clock_is_wall else "relative_camera_start",
+        "grid_timestamps_ns": grid.tolist(),
+        "selection_window_ns": [t_start, t_end],
+        "nominal_camera_fps": camera_fps,
+        "drop_count_method": "rounded_nominal_periods",
+        "max_drop_run": _MAX_DROP_RUN,
+        "continuity_sanity_limit_ns": max_allowed_ns,
+        "physical_sync_tolerance_ns": None,
+        "physical_sync_verified": False,
+        "clock_mapping_scope": "alignment_input_timestamps",
+        "streams": {},
+    }
     for name, ts in aligned_ts.items():
         eligible = np.flatnonzero((ts >= t_start) & (ts <= t_end))
         if len(eligible) == 0:
@@ -649,33 +732,67 @@ def _align_cameras_by_timestamp(
             indices = ref_indices
         else:
             candidate_ts = ts[eligible]
-            after = np.searchsorted(
-                candidate_ts, grid + int(period_ns / 2), side="right"
+            after = np.minimum(np.searchsorted(candidate_ts, grid), len(candidate_ts) - 1)
+            before = np.maximum(after - 1, 0)
+            nearest = np.where(
+                np.abs(candidate_ts[before] - grid) <= np.abs(candidate_ts[after] - grid),
+                before,
+                after,
             )
-            indices = eligible[np.maximum(after - 1, 0)]
+            indices = eligible[nearest]
 
-        residual_ns = np.abs(ts[indices] - grid)
+        signed_residual_ns = ts[indices] - grid
+        residual_ns = np.abs(signed_residual_ns)
         max_residual_ns = int(np.max(residual_ns))
         median_ms = float(np.median(residual_ns)) / 1e6
         max_ms = max_residual_ns / 1e6
         print(
-            f"  Timestamp sync {name}: median {median_ms:.2f} ms, max {max_ms:.2f} ms, "
+            f"  Timestamp selection {name}: median {median_ms:.2f} ms, max {max_ms:.2f} ms, "
             f"{n_dropped} dropped"
         )
         if max_residual_ns > max_allowed_ns:
             raise ConversionError(
-                f"{name} residual timestamp error {max_ms:.2f} ms exceeds "
-                f"{_MAX_DROP_RUN + 1} frames"
+                f"{name} residual timestamp error {max_ms:.2f} ms exceeds the "
+                f"{_MAX_DROP_RUN + 1}-frame continuity sanity limit"
             )
         if n_dropped > _DROP_WARN_FRACTION * len(grid):
             print(f"  WARNING: {name} dropped {n_dropped} of {len(grid)} frames")
         selections[name] = indices
+        mapping = (
+            "none" if wall_clock[name] else
+            "recorded_camera_start" if clock_is_wall else "first_frame_relative"
+        )
+        report["streams"][name] = {
+            "source_frame_count": len(ts),
+            "selected_source_indices": indices.tolist(),
+            "selected_timestamps_ns": ts[indices].tolist(),
+            "residual_ns": signed_residual_ns.tolist(),
+            "dropped_frames": n_dropped,
+            "held_slots": int(np.count_nonzero(np.diff(indices) == 0)),
+            "unused_source_frames": len(ts) - len(np.unique(indices)),
+            "max_capture_gap_ns": int(np.diff(ts[eligible]).max()) if len(eligible) > 1 else 0,
+            "median_residual_ns": float(np.median(signed_residual_ns)),
+            "median_abs_residual_ns": float(np.median(residual_ns)),
+            "p95_abs_residual_ns": float(np.percentile(residual_ns, 95)),
+            "min_residual_ns": int(signed_residual_ns.min()),
+            "max_residual_ns": int(signed_residual_ns.max()),
+            "max_abs_residual_ns": max_residual_ns,
+            "clock_mapping": {
+                "source_clock_domain": "wall_clock" if wall_clock[name] else "hardware_relative",
+                "mapping": mapping,
+                "camera_start_time_ns": (
+                    int(camera_start_times_ns[name]) if mapping == "recorded_camera_start" else None
+                ),
+            },
+        }
 
     selected: Dict[str, np.ndarray] = {}
     for name, indices in selections.items():
         ts = aligned_ts[name]
         _apply_camera_selection(seq_dir, name, indices, ts[indices])
         selected[name] = ts[indices]
+
+    (seq_dir / "camera_alignment.json").write_text(json.dumps(report, indent=2) + "\n")
 
     print(
         f"  Timestamp grid: {reference}, {len(grid)} frames over "
@@ -777,70 +894,94 @@ def _build_lowdim(
     for name in cameras:
         ts = cam_timestamps.get(name)
         if ts is not None and len(ts) == n_frames and int(ts[0]) > _WALL_CLOCK_MIN_NS:
-            ref_ts = ts.astype(np.int64)
+            ref_ts = _checked_timestamps(ts, f"{name} timestamps")
             break
     if ref_ts is None:
         for name in cameras:
             ts = cam_timestamps.get(name)
             if ts is not None and len(ts) == n_frames:
-                ref_ts = ts.astype(np.int64)
+                ref_ts = _checked_timestamps(ts, f"{name} timestamps")
                 break
 
     sim_ref_ts = ref_ts.copy() if ref_ts is not None else None
+    reference_ts_ns = ref_ts
 
     robot_ts: Optional[np.ndarray] = None
     if robot_data is not None and n_frames > 0:
         robot_ts_raw = robot_data.get("timestamps")
-        if ref_ts is not None and robot_ts_raw is not None:
-            robot_ts_i64 = np.asarray(robot_ts_raw, dtype=np.int64)
-            ref_ts_i64 = np.asarray(ref_ts, dtype=np.int64)
-            if ref_ts_i64[0] < robot_ts_i64[0] or ref_ts_i64[-1] > robot_ts_i64[-1]:
+        if robot_ts_raw is not None:
+            robot_ts = _checked_timestamps(robot_ts_raw, "robot timestamps")
+            if ref_ts is None:
+                # Legacy recordings without camera timing retain their uniform grid.
+                duration = int(robot_ts[-1]) - int(robot_ts[0])
+                ref_ts = np.rint(np.linspace(0, duration, n_frames)).astype(np.int64) + int(robot_ts[0])
+            if (int(ref_ts[0]) > _WALL_CLOCK_MIN_NS) != (int(robot_ts[0]) > _WALL_CLOCK_MIN_NS):
+                raise ConversionError("camera and robot timestamps use different clock domains")
+            if ref_ts[0] < robot_ts[0] or ref_ts[-1] > robot_ts[-1]:
                 raise ConversionError(
                     "camera timestamp grid extends beyond robot telemetry; refusing to extrapolate"
                 )
-            # Subtract a shared origin before float conversion. This preserves
-            # sub-millisecond precision for Unix-epoch nanosecond timestamps.
-            origin = int(robot_ts_i64[0])
-            robot_ts = (robot_ts_i64 - origin).astype(np.float64)
-            ref_ts = (ref_ts_i64 - origin).astype(np.float64)
-        else:
-            # Legacy: uniform linspace over the recording duration.
-            if robot_ts_raw is not None:
-                robot_ts_i64 = np.asarray(robot_ts_raw, dtype=np.int64)
-                robot_ts = (robot_ts_i64 - int(robot_ts_i64[0])).astype(np.float64)
-                duration = float(robot_ts[-1])
-            else:
-                duration = float(rec_meta.get("duration_s", 1.0)) * 1e9
-            ref_ts = np.linspace(0.0, duration, n_frames, endpoint=True)
+            reference_ts_ns = ref_ts
 
-    def interp_to_cam(key: str) -> Optional[np.ndarray]:
+    sample_timing: dict[str, tuple[np.ndarray, np.ndarray, bool]] = {}
+
+    def timing_for(key: str) -> tuple[np.ndarray, np.ndarray, bool]:
+        if key not in sample_timing:
+            sample_timing[key] = _robot_field_timing(robot_data, key)
+        return sample_timing[key]
+
+    def interp_to_cam(
+        key: str, query_timestamps: Optional[np.ndarray] = None
+    ) -> Optional[np.ndarray]:
         if robot_data is None or robot_ts is None or ref_ts is None:
             return None
         arr = robot_data.get(key)
         if arr is None:
             return None
-        if len(arr) != len(robot_ts):
+        source_ts, rows, native = timing_for(key)
+        query_ts = reference_ts_ns if query_timestamps is None else _checked_timestamps(
+            query_timestamps, f"{key} camera timestamps"
+        )
+        if query_ts is None or len(query_ts) != n_frames:
+            raise ConversionError(f"{key} requires one camera timestamp per output frame")
+        if (int(query_ts[0]) > _WALL_CLOCK_MIN_NS) != (int(source_ts[0]) > _WALL_CLOCK_MIN_NS):
+            raise ConversionError(f"{key} camera and robot timestamps use different clock domains")
+        # A known issued command remains active through the last recorder row.
+        # Measured state must bracket the query; never clamp wrist FK at an edge.
+        end = int(robot_ts[-1]) if native and key.endswith("_joint_cmd") else int(source_ts[-1])
+        if int(query_ts[0]) < int(source_ts[0]) or int(query_ts[-1]) > end:
             raise ConversionError(
-                f"robot field {key} has {len(arr)} rows for {len(robot_ts)} timestamps"
+                f"{key} camera timestamps extend beyond robot telemetry; refusing to extrapolate"
             )
+        arr = np.asarray(arr)[rows]
         if arr.ndim == 1:
             arr = arr[:, None]
+        if arr.ndim != 2 or not np.isfinite(arr).all():
+            raise ConversionError(f"robot field {key} must contain finite sample rows")
+        if native and key.endswith("_joint_cmd"):
+            held = np.searchsorted(source_ts, query_ts, side="right") - 1
+            return arr[held].astype(np.float32)
+        # Subtract the same integer origin before floating-point interpolation.
+        origin = int(source_ts[0])
+        source = (source_ts - origin).astype(np.float64)
+        query = (query_ts - origin).astype(np.float64)
         return np.stack(
-            [np.interp(ref_ts, robot_ts, arr[:, d]) for d in range(arr.shape[1])],
+            [np.interp(query, source, arr[:, d]) for d in range(arr.shape[1])],
             axis=1,
         ).astype(np.float32)
 
     def cmd_to_cam(key: str) -> Optional[np.ndarray]:
         """A commanded 7-DOF array on the camera grid, gripper still binary.
 
-        Arm joints interpolate linearly. Binary gripper intent holds the latest
-        command at or before the frame, including exact edges and the last sample.
+        Native issue times hold the full target until the next issued command.
+        Legacy row times retain linear arm interpolation. Binary gripper intent
+        always holds the latest command at or before the frame.
         """
         arr = interp_to_cam(key)
         if arr is not None:
-            held = np.searchsorted(robot_ts, ref_ts, side="right") - 1
-            held = np.clip(held, 0, len(robot_ts) - 1)
-            arr[:, 6] = (robot_data[key][held, 6] >= 0.5).astype(np.float32)
+            source_ts, rows, _ = timing_for(key)
+            held = np.searchsorted(source_ts, reference_ts_ns, side="right") - 1
+            arr[:, 6] = (robot_data[key][rows][held, 6] >= 0.5).astype(np.float32)
         return arr
 
     def _fk(kin: Any, q: np.ndarray) -> np.ndarray:
@@ -922,15 +1063,10 @@ def _build_lowdim(
             if flip:
                 T_cam2ee = T_cam2ee @ _R_FLIP_180
 
-            arm_joints_raw = robot_data.get(joint_key)
-            if arm_joints_raw is not None:
-                arm_joints = np.stack(
-                    [
-                        np.interp(ref_ts, robot_ts, arm_joints_raw[:, d])
-                        for d in range(arm_joints_raw.shape[1])
-                    ],
-                    axis=1,
-                ).astype(np.float32)
+            # The selected wrist image can lead or lag the common reference
+            # grid. Its FK belongs to its own capture time, including a held image.
+            arm_joints = interp_to_cam(joint_key, cam_timestamps.get(name))
+            if arm_joints is not None:
                 is_right = joint_key.startswith("follower_r")
                 if is_right and right_base_to_left_base is None:
                     raise ConversionError(
@@ -1156,6 +1292,22 @@ def _build_lowdim(
             "dims": joints.shape[1], "arm_order": measured_arms,
             "gripper": {"open": 1, "closed": 0, "resampling": "linear"},
         }
+    metadata["timing"] = {
+        "shared_state_grid": "reference_camera_capture",
+        "wrist_extrinsics_grid": "selected_camera_capture",
+        "robot_fields": {
+            key: {
+                "timestamp_field": (
+                    f"{key.partition('_joint_')[0]}_"
+                    f"{'command' if key.endswith('_cmd') else 'state'}_timestamp_ns"
+                    if native else "timestamps"
+                ),
+                "resampling": "zero_order_hold" if native and key.endswith("_cmd") else "linear",
+                "unknown_rows_omitted": int(np.count_nonzero(~rows)),
+            }
+            for key, (_, rows, native) in sample_timing.items()
+        },
+    }
     return metadata
 
 
@@ -1218,6 +1370,8 @@ def _build_sequence_metadata(
         meta["camera_settings"] = {
             name: camera_settings[name] for name in cameras if name in camera_settings
         }
+    if (seq_dir / "camera_alignment.json").exists():
+        meta.setdefault("timing", {})["camera_alignment_report"] = "camera_alignment.json"
 
     with open(seq_dir / "metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
@@ -1308,11 +1462,14 @@ def convert_recording(
         sys.exit(1)
 
     svo2_files = sorted(cameras_path.glob("*.svo2"))
-    bag_files = sorted(cameras_path.glob("*.bag"))
+    try:
+        realsense_files = list_realsense_recordings(cameras_path)
+    except ValueError as error:
+        raise ConversionError(str(error)) from error
     simrec_dirs = sorted(p for p in cameras_path.glob("*.simrec") if p.is_dir())
 
-    if not svo2_files and not bag_files and not simrec_dirs:
-        print("No .svo2 / .bag files or .simrec directories found in cameras/")
+    if not svo2_files and not realsense_files and not simrec_dirs:
+        print("No .svo2 / .bag / .db3 files or .simrec directories found in cameras/")
         sys.exit(1)
 
     seq_dir = Path(episode_dir) if episode_dir else rec_path / _SEQUENCE_NAME
@@ -1327,7 +1484,7 @@ def convert_recording(
 
     print(f"\nConverting to UnifiedDataset: {rec_path.name}")
     print(
-        f"  Found {len(svo2_files)} SVO2 file(s), {len(bag_files)} bag file(s), "
+        f"  Found {len(svo2_files)} SVO2 file(s), {len(realsense_files)} RealSense file(s), "
         f"{len(simrec_dirs)} sim recording(s)\n"
     )
 
@@ -1408,10 +1565,10 @@ def convert_recording(
             cam_timestamps[name] = ts_arr
             print(f"  ✓ {name}: {len(ts_arr)} frames")
 
-    # Bag files are extracted independently then aligned to ZED by timestamp.
+    # Native RealSense files are extracted independently, then aligned by timestamp.
     bag_max = min(frame_counts.values()) if frame_counts else None
     rs_offsets = rec_meta.get("realsense_clock_offsets", {})
-    for bag_path in bag_files:
+    for bag_path in realsense_files:
         name = bag_path.stem
         rgb_dir = seq_dir / "rgb" / name
         depth_dir = seq_dir / "depth" / name
@@ -1484,7 +1641,8 @@ def convert_recording(
         camera_start_times_ns=rec_meta.get("camera_start_times_ns"),
         camera_fps=float(rec_meta.get("camera_fps", 30)),
         robot_timestamps=(
-            robot_data.get("timestamps") if robot_data is not None else None
+            _robot_timing_coverage(robot_data)
+            if robot_data is not None and "timestamps" in robot_data else None
         ),
     )
 

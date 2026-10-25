@@ -60,6 +60,8 @@ class CameraConfig:
             with open(self.config_file) as f:
                 self.cameras: Dict[str, Any] = json.load(f)
             self._warn_invalid_roles()
+            for name in self.cameras:
+                self.get_recording_format(name)
         else:
             self.cameras = {}
             self._save()
@@ -163,6 +165,20 @@ class CameraConfig:
             )
         return {key: float(controls[key]) for key in COLOR_CONTROLS}
 
+    def get_recording_format(self, name: str) -> str | None:
+        """Return an explicit RealSense native format, or None for the legacy default."""
+        entry = self.cameras.get(name)
+        if not isinstance(entry, dict) or "recording_format" not in entry:
+            return None
+        if self.get_camera_type(name) != "realsense":
+            raise ValueError(f"Camera '{name}': recording_format is supported only for RealSense cameras")
+        recording_format = entry["recording_format"]
+        if recording_format not in ("bag", "db3"):
+            raise ValueError(
+                f"Camera '{name}': recording_format must be 'bag' or 'db3', got {recording_format!r}"
+            )
+        return recording_format
+
     def get_camera_by_role(self, role: str) -> Optional[str]:
         """Return the name of the unique camera with the given role, or None.
 
@@ -253,9 +269,11 @@ class CameraConfig:
             return ZedCamera(name, int(serial), fps=fps)
 
         if cam_type == "realsense":
+            recording_format = self.get_recording_format(name)
             from raiden.cameras.realsense import RealSenseCamera
 
             resolution = entry.get("resolution") if isinstance(entry, dict) else None
+            recording_options = {"recording_format": recording_format} if recording_format is not None else {}
             return RealSenseCamera(
                 name,
                 str(serial),
@@ -264,6 +282,7 @@ class CameraConfig:
                 crop=self.get_crop(name),
                 depth=entry.get("depth", True) if isinstance(entry, dict) else True,
                 color_controls=self.get_color_controls(name),
+                **recording_options,
             )
 
         raise ValueError(

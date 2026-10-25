@@ -5,7 +5,7 @@
 The `rd record` command records a full teleoperation demonstration:
 
 - **Camera data** at 30 fps - ZED cameras write `.svo2` files; RealSense
-  cameras write `.bag` files. Both formats store the raw sensor stream
+  cameras write `.bag` or `.db3` files. Native formats store the raw sensor stream
   (stereo pair + depth) and are converted to a structured dataset afterwards
   with `rd convert`.
 - **Robot joint data** at ~100 Hz - leader and follower joint positions and
@@ -13,17 +13,32 @@ The `rd record` command records a full teleoperation demonstration:
   samples the first camera's `get_current_timestamp_ns()`:
   - **ZED** returns current host time through `sl.TIME_REFERENCE.CURRENT`, on
     the same clock as its SVO2 frame timestamps.
-  - **RealSense** uses `time.time_ns()` for robot rows. Its frames use host
-    wall-clock time when `global_time_enabled` is supported. For device-relative
-    frame timestamps, the measured `realsense_clock_offsets` in `metadata.json`
-    lets conversion map them onto the host clock.
+  - **RealSense** uses `time.time_ns()` for robot rows. A frame's SDK timestamp
+    domain identifies whether it uses global/system time or a device-relative
+    hardware clock. For device-relative timestamps, the recorded
+    `realsense_clock_offsets` in `metadata.json` provides an approximate host
+    mapping from one received frame. Transport delay and clock drift remain
+    unmeasured; enabling `global_time_enabled` alone does not prove exposure
+    synchronization.
 
 Arm observations and command snapshots are read sequentially after that
 timestamp. A row shares one time label; it does not establish simultaneous
 left/right measurements or hardware synchronization with a camera exposure.
+New recordings also retain each arm's own host read bracket, available cached
+feedback timestamp, and latest completed command API issue/return times.
 
 All data for one recording episode lands in a single timestamped directory
 under the output folder.
+
+RealSense camera settings accept `"recording_format": "bag"` (the compatibility
+default) or `"recording_format": "db3"`. Choose the format supported by the
+installed SDK build: ROS2-enabled builds write `.db3`, while legacy builds write
+`.bag`. This depends on build options, so Raiden does not guess from a version
+number or retry with a different filename. A path that contradicts the configured
+format is rejected before restarting a stream. Both formats remain readable
+when supported by the playback SDK. The SDK's
+[writer factory](https://github.com/realsenseai/librealsense/blob/v2.58.1/src/media/ros_factory.cpp)
+documents this build-dependent choice.
 
 ## Single-arm vs bimanual
 
@@ -66,7 +81,9 @@ Each robot arm contributes keys of the form `<arm>_<field>`, e.g.:
 
 | Key | Shape | Description |
 |---|---|---|
-| `timestamps` | `(N,)` int64 | Host-clock nanoseconds sampled through the reference camera before each robot row. Converted camera timestamps use the same clock after any required RealSense offset correction. |
+| `timestamps` | `(N,)` int64 | Legacy reference-camera clock label sampled before each sequential robot row; retained for compatibility. |
+| `readout_timestamp_ns`, `readout_monotonic_ns` | `(N,)` int64 | Host wall-clock and monotonic labels sampled before the row's sequential reads. Monotonic values support elapsed-time comparisons only. |
+| `readout_end_ns`, `readout_end_monotonic_ns` | `(N,)` int64 | Host labels sampled after all observation and command snapshots return; command age is measured at this capture completion. |
 | `leader_r_joint_pos` | `(N, 6)` float32 | Leader-right joint positions (rad) |
 | `leader_r_joint_vel` | `(N, 6)` float32 | Leader-right joint velocities (rad/s) |
 | `follower_r_joint_pos` | `(N, 6)` float32 | Follower-right arm joint positions (rad) |
@@ -74,10 +91,90 @@ Each robot arm contributes keys of the form `<arm>_<field>`, e.g.:
 | `follower_l_joint_pos` | `(N, 6)` float32 | Follower-left arm joint positions (rad) |
 | `follower_{l,r}_joint_pos_7d` | `(N, 7)` float32 | Six measured arm joints followed by normalized measured gripper aperture (0 closed, 1 open) |
 | `follower_{l,r}_joint_cmd` | `(N, 7)` float32 | Six commanded arm joints followed by binary operator gripper intent (0 closed, 1 open) |
+| `<arm>_joint_cmd_api` | `(N, 7)` float32 | Exact latest teleop API input target, including physical gripper target; NaN when no API command is known. This is distinct from binary gripper intent and the driver's later motor command. |
+| `<arm>_state_timestamp_ns` | `(N,)` int64 | Available cached state timestamp. Source `host_cached_feedback_read` labels a host read of cached CAN feedback, derived from driver float seconds; it is not motor acquisition or CAN receipt time. |
+| `<arm>_state_timestamp_valid`, `<arm>_state_timestamp_source` | `(N,)` bool / string | Whether the state timestamp is known and what it measures. |
+| `<arm>_read_start_ns`, `<arm>_read_end_ns` | `(N,)` int64 | Host wall-clock bracket around this arm's observation call and snapshot copy. |
+| `<arm>_read_start_monotonic_ns`, `<arm>_read_end_monotonic_ns` | `(N,)` int64 | The corresponding monotonic bracket; use its difference for call duration. |
+| `<arm>_command_timestamp_ns`, `<arm>_command_end_ns` | `(N,)` int64 | Host teleop command API issue/return times, saved atomically with the latest completed command snapshot; these do not measure CAN delivery or motor execution. |
+| `<arm>_command_timestamp_valid`, `<arm>_command_timestamp_source` | `(N,)` bool / string | Whether the command issue time is known; current native source is `host_command_api_issue`. |
+| `<arm>_command_start_monotonic_ns`, `<arm>_command_end_monotonic_ns` | `(N,)` int64 | Monotonic bracket around the same command API call. |
 
 Only enabled arms contribute streams. Episode `metadata.json` stores the
 resolved robot channels, gripper settings, vector ordering, and camera roles
 and settings in `recording_config` for later conversion.
+Timing semantics are also saved in `metadata.json` under `robot_timing`.
+Unknown timestamps are `-1`, with validity `False` and source `unavailable`.
+The initial measured-pose command fallback has unknown command timing. Only
+the latest completed command at each recorder sample is retained; intermediate
+API calls can be absent. An unchanged target does not prove stale feedback or
+that no new command was issued.
+
+## Auditing a saved episode's timing
+
+Run this read-only command from the directory containing the `raiden` checkout:
+
+```bash
+./raiden/.venv/bin/python -m raiden.timing_audit /path/to/raw/episode \
+  --reference-camera scene_camera \
+  --alignment-report /path/to/converted/sequence/camera_alignment.json \
+  --json-out /tmp/episode-timing.json
+```
+
+Omit `--alignment-report` to find `camera_alignment.json` in the episode or its
+standard converted `0000` subdirectory, and omit `--reference-camera` to
+use the first camera name in sorted order. Console output is the default;
+`--json-out -` prints just JSON. A named JSON output must be a new file. The
+command never changes the saved episode, opens a physical camera, resets a
+device, or changes camera settings. It reads native RealSense metadata with
+non-realtime `.bag`/`.db3` file playback, separately for color and depth, without decoding
+images or aligning depth. The SDK bag format already retains per-frame
+timestamps, timestamp domains, counters, and supported native metadata, so
+recording does not add a second per-frame log. See the SDK's
+[legacy bag format documentation](https://github.com/realsenseai/librealsense/blob/master/doc/record-and-playback-legacy-ros1.md).
+
+The summary includes frame counts, counter gaps and duplicates, timestamp
+coverage and interval percentiles, native metadata availability, nearest
+RGB/depth timestamp skew within each device clock domain, and nearest
+cross-camera timestamp residuals on the mapped host clock. Gaps reveal missing
+recorded frames but cannot identify where they were lost. Comparisons report
+frames outside the other stream's time coverage separately. Unknown domains
+and hardware clocks without recorded host offsets remain explicitly unmapped.
+Domain changes have separate coverage and transition counts; interval summaries
+use adjacent frames in the same domain. An offset measured from a known global
+timestamp is not applied to hardware-relative frames.
+`camera_capture_receipts.<camera>.clock_mapping_receipt` records the one-frame
+host-receipt mapping provenance in new recordings; its wait bracket is not a
+bound on exposure time or clock error. Legacy offsets lack that provenance.
+
+Robot metrics include per-arm observation-call duration, the age of the cached
+feedback timestamp at observation-read end, command API duration, and command
+issue age at completed capture of the row's observation and command snapshots.
+Command age requires `readout_end_ns`; older recordings lacking this completion
+label report it as unavailable. Reused command issue
+times and unchanged command vectors are counted separately. Missing timing
+fields in older episodes are reported as unavailable; row labels cannot recover
+feedback freshness or left/right simultaneity.
+
+Conversion saves `camera_alignment.json` with selected source-frame indices,
+actual selected capture timestamps, signed capture-minus-grid residuals,
+held/unused frame counts, and clock mapping provenance. The audit summarizes
+that report without copying its per-frame arrays. In converted data, each wrist
+image's forward-kinematics pose uses that camera's own selected capture time,
+including when an image is held across grid slots. Available per-arm feedback
+timestamps drive state interpolation; available command issue timestamps select
+the latest command at or before the grid time. Legacy recordings retain row-time
+fallbacks. Relative-camera-start alignment and receipt-based host mappings have
+different limits, both visible in the report.
+
+Playback is bounded by `--max-seconds` (120 wall seconds per file) and
+`--max-frames` (1,000,000 combined color/depth frames per file). A limit, corrupt
+metadata, or playback failure produces a labelled partial result and nonzero
+exit status. Timing magnitudes have no automatic pass/fail threshold. Timestamp
+agreement does not establish hardware exposure synchronization, flash-event
+precision, CAN acquisition time, or command-to-motion latency. SVO2 timing is
+available through the conversion report; this native metadata reader handles
+RealSense recordings.
 
 ## Usage
 

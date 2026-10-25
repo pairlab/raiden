@@ -26,6 +26,7 @@ import cv2
 import numpy as np
 
 from raiden.cameras.realsense import RealSenseCamera
+from raiden.realsense_files import list_realsense_recordings
 
 # Scene cameras read better on the left; wrist views go after.
 def _order(bags: list) -> list:
@@ -44,7 +45,7 @@ def _label(img, lines, scale):
 
 def render(ep: Path, out_path: Path, stride: int, scale: float,
            play: bool = False, save: bool = True) -> bool:
-    bags = _order(list((ep / "cameras").glob("*.bag"))) if (ep / "cameras").is_dir() else []
+    bags = _order(list_realsense_recordings(ep / "cameras"))
     if not bags:
         print(f"  {ep}: no camera bags")
         return False, False
