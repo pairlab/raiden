@@ -1,5 +1,8 @@
 # Simulation (MESA digital twin)
 
+For the scene-driven Isaac single-arm/bimanual workflow, see
+[Isaac scenes and Quest control](isaac_scenes.md).
+
 Raiden can drive a MuJoCo twin of the rig instead of the robot. The same teleop,
 recorder, converter and export run unchanged: the left follower and both cameras
 are simulated, and the episodes land in the same schema as real ones.

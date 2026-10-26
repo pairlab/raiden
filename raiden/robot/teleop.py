@@ -31,9 +31,10 @@ def run_bimanual_teleop(
 
     use_right = arms == "bimanual"
     use_left = True
-    if sim and use_right:
-        print("Simulator provides a single left arm; using arms='single'.")
-        use_right = False
+    if sim:
+        from raiden.sim.client import require_arm_mode
+
+        require_arm_mode(sim, arms)
 
     interface: TeleopInterface = build_interface(
         control,

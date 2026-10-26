@@ -49,7 +49,7 @@ def validate_server(conn, episode: Path, *, allow_scene_change=False) -> dict:
     if metadata.get("backend") != "isaac" or live.get("backend") != "isaac":
         raise ValueError("Isaac replay requires an Isaac episode and Isaac server")
     identifiers = (
-        "state_version", "physics_backend", "physics_dt", "versions", "arm_joints",
+        "state_version", "physics_backend", "physics_dt", "versions", "arm_joints", "arms", "action_dim", "asset_input_sha256",
         "twin_input_sha256", "scene", "calibration_sha256", "implementation_sha256",
         "controller", "torque_limits_Nm", "finger_stops_m", "finger_target",
         "joint_limits_rad", "joint_limit_margin_rad", "gravity_implementation",

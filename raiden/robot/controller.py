@@ -395,9 +395,9 @@ class RobotController:
         self.use_right_follower = use_right_follower
         self.use_left_follower = use_left_follower
         self.sim = sim or None
-        if self.sim and (use_right_leader or use_left_leader or use_right_follower):
+        if self.sim and (use_right_leader or use_left_leader):
             raise ValueError(
-                "the simulator provides a single left follower; use arms='single'"
+                "simulator teleoperation requires a controller interface, without physical leader arms"
             )
 
         self.can_channels = load_can_channels(
@@ -498,8 +498,11 @@ class RobotController:
             if self.sim:
                 from raiden.sim import SimFollower
 
-                print(f"  - Connecting to sim follower at {self.sim}...")
-                results["follower_l"] = SimFollower(self.sim)
+                for name, side, enabled in (("follower_l", "left", self.use_left_follower),
+                                            ("follower_r", "right", self.use_right_follower)):
+                    if enabled:
+                        print(f"  - Connecting to {side} sim follower at {self.sim}...")
+                        results[name] = SimFollower(self.sim, arm=side)
             else:
                 # Each arm has its own CAN bus; wait for every started initializer
                 # before inspecting errors or closing the arms that succeeded.
@@ -521,9 +524,10 @@ class RobotController:
                 if name in results:
                     follower = results[name]
                     setattr(self, name, follower)
-                    follower.update_kp_kd(kp=FOLLOWER_KP, kd=FOLLOWER_KD)
-                    self.kp_gains[name] = FOLLOWER_KP.copy()
-                    self.kd_gains[name] = FOLLOWER_KD.copy()
+                    kp, kd = follower.get_kp_kd() if self.sim else (FOLLOWER_KP, FOLLOWER_KD)
+                    follower.update_kp_kd(kp=kp, kd=kd)
+                    self.kp_gains[name] = kp.copy()
+                    self.kd_gains[name] = kd.copy()
 
                 name = f"leader_{side}"
                 if name in results:
@@ -558,8 +562,9 @@ class RobotController:
             raise
 
         print("✓ All robots initialized")
-        print(f"  Follower kp: {FOLLOWER_KP}")
-        print(f"  Follower kd: {FOLLOWER_KD}")
+        for name, kp in self.kp_gains.items():
+            if name.startswith("follower"):
+                print(f"  {name} kp: {kp}; kd: {self.kd_gains[name]}")
 
     def recording_config(self) -> dict:
         """Return portable settings and the meaning of each follower vector."""
@@ -653,8 +658,9 @@ class RobotController:
         ]
         if sim_followers:
             print("\nResetting simulator to home...")
-            for follower in sim_followers:
-                follower.reset_scene()
+            # Reset is scene-wide: both arm handles share this simulator.
+            # Calling it twice would consume two seeded task realizations.
+            sim_followers[0].reset_scene()
             print("✓ Simulator reset (arm at home, objects re-sampled)")
             return
 

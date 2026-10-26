@@ -1113,6 +1113,7 @@ def _run_sim_episodes(
     on_saved: Callable[[Path], None],
     active_ctrl: List[Optional[RobotController]],
     camera_configuration: Optional[Dict] = None,
+    arms: str = "single",
 ) -> Optional[Path]:
     """Sim collection: record from every scene reset; only a success is saved.
 
@@ -1130,7 +1131,7 @@ def _run_sim_episodes(
     robot_controller = RobotController(
         use_right_leader=False,
         use_left_leader=interface.uses_leaders,
-        use_right_follower=False,
+        use_right_follower=arms == "bimanual",
         use_left_follower=True,
         sim=sim,
     )
@@ -1269,6 +1270,11 @@ def run_recording(
     print("\n" + "=" * 60)
     print("  DEMONSTRATION RECORDING")
     print("=" * 60 + "\n")
+
+    if sim:
+        from raiden.sim.client import require_arm_mode
+
+        require_arm_mode(sim, arms)
 
     record_ui = None
     if ui and sim:
@@ -1446,6 +1452,7 @@ def run_recording(
                 on_saved=_save_demo,
                 active_ctrl=_active_ctrl,
                 camera_configuration=camera_configuration,
+                arms=arms,
             )
         finally:
             _close_session()

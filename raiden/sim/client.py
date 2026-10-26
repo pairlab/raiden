@@ -52,3 +52,19 @@ class SimConnection:
             self._conn.close()
         except OSError:
             pass
+
+
+def require_arm_mode(address: str, mode: str) -> dict:
+    """Reject arm-count mismatches before opening a teleoperation interface."""
+    if mode not in ("single", "bimanual"):
+        raise ValueError("arms must be single or bimanual")
+    connection = SimConnection(address)
+    try:
+        rig = connection.call("get_rig")
+    finally:
+        connection.close()
+    expected = ("left",) if mode == "single" else ("left", "right")
+    available = tuple(rig.get("arms", ("left",)))
+    if available != expected:
+        raise ValueError(f"requested {mode} teleop with {expected}, but simulator provides {available}; launch both with the same --arms")
+    return rig

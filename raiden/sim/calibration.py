@@ -95,9 +95,17 @@ def sim_calibration(rig: dict) -> dict:
         "source": rig.get("calibration_source", "mesa digital twin (rig.json)"),
         "backend": rig.get("backend", "mujoco"),
         "cameras": {},
-        "table": rig["table"] if "table" in rig else {"T_base_table": table_pose(rig["layout"]).tolist()},
     }
+    if "table" in rig:
+        out["table"] = rig["table"]
+    elif "layout" in rig:
+        out["table"] = {"T_base_table": table_pose(rig["layout"]).tolist()}
+    if "bimanual_transform" in rig:
+        out["bimanual_transform"] = rig["bimanual_transform"]
     for name, cam in cams.items():
+        if cam.get("dynamic") and cam.get("pose_source") == "native per-frame camera pose":
+            out["cameras"][name] = {"pose_source": "recorded_camera_poses", "reference_frame": "left_arm_base"}
+            continue
         if "T_base_cam" in cam:
             T = np.asarray(cam["T_base_cam"], dtype=np.float64)
             method = "extrinsics"

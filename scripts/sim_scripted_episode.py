@@ -32,6 +32,7 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--sim", default="127.0.0.1:5599")
+    ap.add_argument("--arms", choices=("single", "bimanual"), default="single")
     ap.add_argument(
         "--out",
         default="data_sim_smoke",
@@ -55,6 +56,9 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    from raiden.sim.client import require_arm_mode
+
+    require_arm_mode(args.sim, args.arms)
     task = "sim_smoke"
     rec_dir = Path(args.out) / "raw" / task / "0000"
     if rec_dir.exists():
@@ -63,7 +67,7 @@ def main() -> None:
     rc = RobotController(
         use_right_leader=False,
         use_left_leader=False,
-        use_right_follower=False,
+        use_right_follower=args.arms == "bimanual",
         use_left_follower=True,
         sim=args.sim,
     )
@@ -76,12 +80,13 @@ def main() -> None:
 
     def target_fn(side, T_cur, gripper_actual):
         now = time.monotonic()
-        if "T0" not in state:
-            state["T0"], state["t0"] = T_cur.copy(), now
-        tau = now - state["t0"]
+        if side not in state:
+            state[side] = {"T0": T_cur.copy(), "t0": now}
+        current = state[side]
+        tau = now - current["t0"]
         s = min(tau / 3.0, 1.0)
         s = 0.5 - 0.5 * np.cos(np.pi * s)  # smooth 0..1
-        T = state["T0"].copy()
+        T = current["T0"].copy()
         T[:3, 3] += np.array([0.10 * s, 0.0, 0.10 * s])
         gripper = 0.0 if 3.0 <= tau < 6.0 else 1.0
         return T, gripper
@@ -161,9 +166,9 @@ def main() -> None:
         print(f"  intrinsics[{k}] = {np.round(np.asarray(v).ravel()[[0, 2, 4, 5]], 1)}")
     for k, v in low.get("object_poses", {}).items():
         print(f"  object_poses[{k}] t = {np.round(np.asarray(v)[:3, 3], 3)}")
-    print(
-        f"  table_pose t = {np.round(low['table_pose'][:3, 3], 4)}  subtasks {low.get('subtasks')}"
-    )
+    if "table_pose" in low:
+        print(f"  table_pose t = {np.round(low['table_pose'][:3, 3], 4)}")
+    print(f"  subtasks {low.get('subtasks')}")
 
     if args.export:
         from raiden.lerobot_export import export_task_to_lerobot

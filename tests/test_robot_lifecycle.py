@@ -259,9 +259,10 @@ def test_sim_bypasses_machine_channel_file_and_records_no_physical_channel(
     loader.assert_called_once_with((), overrides={})
     fake = FakeRobot("sim")
     # The simulator intentionally does not implement get_robot_info().
-    sim = SimpleNamespace(update_kp_kd=fake.update_kp_kd, close=fake.close)
+    sim = SimpleNamespace(update_kp_kd=fake.update_kp_kd, close=fake.close,
+                          get_kp_kd=lambda: (np.full(7, 50.), np.full(7, 5.)))
     with patch.dict(
-        sys.modules, {"raiden.sim": SimpleNamespace(SimFollower=lambda _: sim)}
+        sys.modules, {"raiden.sim": SimpleNamespace(SimFollower=lambda _, arm: sim)}
     ):
         assert controller.check_can_interfaces()
         controller.initialize_robots()
@@ -271,3 +272,24 @@ def test_sim_bypasses_machine_channel_file_and_records_no_physical_channel(
     assert config["followers"]["follower_l"]["can_channel"] is None
     assert config["followers"]["follower_l"]["gripper_limits"] is None
     module.get_yam_robot.assert_not_called()
+
+
+def test_bimanual_sim_uses_two_followers_but_resets_shared_scene_once(controller_module):
+    module = controller_module
+    controller = followers(module, sim="fake:1234")
+    handles = {}
+
+    def factory(address, arm):
+        handle = SimpleNamespace(
+            get_kp_kd=lambda: (np.full(7, 50.), np.full(7, 5.)),
+            update_kp_kd=Mock(), close=Mock(), reset_scene=Mock())
+        handles[arm] = handle
+        return handle
+
+    with patch.dict(sys.modules, {"raiden.sim": SimpleNamespace(SimFollower=factory)}):
+        controller.initialize_robots()
+    assert set(handles) == {"left", "right"}
+    for handle in handles.values():
+        np.testing.assert_array_equal(handle.update_kp_kd.call_args.kwargs["kp"], np.full(7, 50.))
+    controller.move_to_home_positions()
+    assert sum(handle.reset_scene.call_count for handle in handles.values()) == 1
