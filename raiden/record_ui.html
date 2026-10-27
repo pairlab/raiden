@@ -38,6 +38,10 @@
   #grid th, #oven_grid th { font-weight:400; color:var(--dim); font-size:10.5px; }
   #oven_grid td { text-align:center; padding:4px 0; border:1px solid #2c3036; font-weight:600; }
   #oven_grid td.live { outline:3px solid var(--ok); outline-offset:-3px; }
+  #grid_wrap { position:relative; }
+  #grid_door { position:absolute; pointer-events:none; overflow:hidden; }
+  #grid_door .keep { fill:rgba(255,0,255,.16); stroke:#ff00ff; stroke-width:2; }
+  #grid_door .door { fill:rgba(255,0,255,.3); stroke:#ff00ff; stroke-width:1; stroke-dasharray:3 2; }
   #eps td { padding:3px 4px; border-bottom:1px solid #2c3036; vertical-align:top; white-space:nowrap; font-size:12px; }
   #eps td.qc { white-space:normal; }
   #eps .reasons { color:var(--dim); font-size:11px; }
@@ -113,6 +117,7 @@
         <h2>Live checks</h2>
         <div class="row"><span>croissant centre in blue box</span><span id="c_blue">—</span></div>
         <div class="row"><span>whole croissant in white box</span><span id="c_white">—</span></div>
+        <div class="row"><span>croissant edge to the open door (aid, margin <span id="d_margin"></span>)</span><span id="c_door" class="dim">—</span></div>
         <div class="row"><span>croissant position (base)</span><span id="c_pos" class="dim">—</span></div>
         <div class="row"><span>oven x at the sim's <span id="o_simx"></span> (±1.5 cm)</span><span id="o_x">—</span></div>
         <div class="row"><span>oven y in the sim's range</span><span id="o_y">—</span></div>
@@ -133,8 +138,8 @@
       </section>
       <section>
         <h2>Croissant starts of successes</h2>
-        <div class="dim" style="font-size:12px;margin-bottom:6px">blue box · top = far from the robot · left = robot's left · outlined = croissant now · <span id="outside"></span></div>
-        <table id="grid"></table>
+        <div class="dim" style="font-size:12px;margin-bottom:6px"><b id="grid_scope"></b> · blue box · top = far from the robot · left = robot's left · outlined = croissant now · magenta = croissant centres within the door margin, oven now (dashed: the open door) · <span id="outside"></span></div>
+        <div id="grid_wrap"><table id="grid"></table><svg id="grid_door" class="hidden" preserveAspectRatio="none"></svg></div>
       </section>
       <section>
         <h2>Oven y of successes</h2>
@@ -212,6 +217,8 @@ function render() {
   // live checks
   $('c_blue').innerHTML = c ? yes(c.in_blue) : '<span class="warn">not seen</span>';
   $('c_white').innerHTML = c ? yes(c.in_white) : '—';
+  $('d_margin').textContent = S.door ? `${Math.round(S.door.margin * 100)} cm` : '';
+  $('c_door').textContent = !c || !S.door ? '—' : typeof c.door_gap === 'number' ? `${Math.round(c.door_gap * 1000)} mm` : 'oven not seen';
   $('c_pos').textContent = c ? `x ${c.x.toFixed(3)}  y ${c.y >= 0 ? '+' : ''}${c.y.toFixed(3)}` : '—';
   const w = (S.live || {}).wrist;
   $('w_tips').innerHTML = w ? `${w.tips.map(t => t ? t[0] : '–').join(' / ')} ${w.ok ? '<span class="ok">ok</span>' : '<span class="bad">CHECK MOUNT</span>'}` : '—';
@@ -221,7 +228,7 @@ function render() {
   const oo = (S.live || {}).oven, parts = [];
   parts.push(c ? (c.in_blue && c.in_white ? '<span class="ok">croissant OK</span>' : '<span class="bad">croissant outside the limits</span>') : '<span class="warn">croissant not seen</span>');
   parts.push(oo ? (oo.x_ok && oo.y_ok && oo.in_white ? '<span class="ok">oven OK</span>' : '<span class="bad">oven off the sim position</span>') : '<span class="warn">oven knobs not seen</span>');
-  $('scene_cap').innerHTML = parts.join(' · ') + ' <span class="dim">· white: whole objects · blue: croissant centre · orange: oven range · green/red: oven now</span>';
+  $('scene_cap').innerHTML = parts.join(' · ') + ' <span class="dim">· white: whole objects · blue: croissant centre · orange: oven range · green/red: oven now · magenta: open door + margin · yellow dots: croissant starts of successes in this oven bin</span>';
   // Quest / teleop
   $('q_calib').innerHTML = S.calibrating ? '<span class="warn">CALIBRATING: follow the yellow prompts in the terminal panel</span>' : '';
   $('q_status').textContent = S.device_status || '—';
@@ -247,16 +254,44 @@ function render() {
       S.oven_coverage.map((n, j) => `<td class="${n ? '' : 'zero'} ${live === j ? 'live' : ''}">${n || '·'}</td>`).join('') + '</tr>';
     $('oven_outside').textContent = `${S.oven_coverage.reduce((a, b) => a + b, 0) + (S.oven_outside || 0)} successes` + (S.oven_outside ? `, ${S.oven_outside} outside` : '');
   }
-  // coverage grid
+  // coverage grid: the successes with the oven in its live bin (all of them while the oven isn't seen in a bin)
   if (S.coverage && S.grid) {
     const live = c && c.cell ? c.cell : null;
+    const ob = o && o.cell !== null && o.cell !== undefined && S.oven_grid ? o.cell : null;
+    let G = S.coverage, out = S.coverage_outside || 0, total = d.success || 0;
+    if (ob !== null) {  // same binning as qc.grid_cell / qc.oven_cell
+      const bin = (v, e) => Math.floor((v - e[0]) / (e[e.length - 1] - e[0]) * (e.length - 1));
+      G = S.coverage.map(r => r.map(() => 0)); out = 0; total = 0;
+      for (const e of S.episodes || []) {
+        if (e.label !== 'success' || !e.croissant || !e.oven || bin(e.oven[1], S.oven_grid) !== ob) continue;
+        total++;
+        const i = bin(e.croissant[0], S.grid.x), j = bin(e.croissant[1], S.grid.y);
+        if (i >= 0 && i < G.length && j >= 0 && j < G[0].length) G[i][j]++; else out++;
+      }
+    }
     let h = '<tr><th></th>' + S.grid.y.slice(0, -1).map((y, j) => `<th>${((y + S.grid.y[j + 1]) / 2).toFixed(2)}</th>`).join('') + '</tr>';
-    for (let i = S.coverage.length - 1; i >= 0; i--) {
-      h += `<tr><th>${S.grid.x[i].toFixed(2)}</th>` + S.coverage[i].map((n, j) =>
+    for (let i = G.length - 1; i >= 0; i--) {
+      h += `<tr><th>${S.grid.x[i].toFixed(2)}</th>` + G[i].map((n, j) =>
         `<td class="${n ? '' : 'zero'} ${live && live[0] === i && live[1] === j ? 'live' : ''}">${n || '·'}</td>`).join('') + '</tr>';
     }
     $('grid').innerHTML = h;
-    $('outside').textContent = `${d.success || 0} successes` + (S.coverage_outside ? `, ${S.coverage_outside} outside` : '');
+    $('outside').textContent = `${total} successes` + (out ? `, ${out} outside` : '');
+    const oy = ob !== null ? (S.oven_grid[ob] + S.oven_grid[ob + 1]) / 2 : 0;
+    $('grid_scope').textContent = ob !== null ? `oven bin ${ob + 1}/${S.oven_grid.length - 1} (y ${oy >= 0 ? '+' : ''}${oy.toFixed(3)})`
+      : o ? 'all ovens (oven outside the bins)' : 'all ovens (oven not seen)';
+    // The open door of the oven now over the cells, in base-frame metres (left = +y, top = far): its footprint, and
+    // where the croissant centre is too close to it (the footprint grown by the margin plus the croissant's radius).
+    const svg = $('grid_door'), D = S.door, tds = $('grid').querySelectorAll('td');
+    if (o && D && tds.length) {
+      const a = tds[0].getBoundingClientRect(), b = tds[tds.length - 1].getBoundingClientRect(), w = $('grid_wrap').getBoundingClientRect();
+      Object.assign(svg.style, { left: `${a.left - w.left}px`, top: `${a.top - w.top}px`, width: `${b.right - a.left}px`, height: `${b.bottom - a.top}px` });
+      const gx = S.grid.x, gy = S.grid.y, X = gx[gx.length - 1];
+      svg.setAttribute('viewBox', `${-gy[0]} ${-X} ${gy[0] - gy[gy.length - 1]} ${X - gx[0]}`);
+      const [x0, x1, y0, y1] = [o.x + D.box[0], o.x + D.box[1], o.y + D.box[2], o.y + D.box[3]];
+      const rect = (r, cls) => `<rect class="${cls}" x="${-y1 - r}" y="${-x1 - r}" width="${y1 - y0 + 2 * r}" height="${x1 - x0 + 2 * r}" rx="${r}" ry="${r}" vector-effect="non-scaling-stroke"/>`;
+      svg.innerHTML = rect(D.margin + D.radius, 'keep') + rect(0, 'door');
+      svg.classList.remove('hidden');
+    } else svg.classList.add('hidden');
   }
   // episodes
   const busy = ['recording', 'verdict', 'saving'].includes(ph);

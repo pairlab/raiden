@@ -45,8 +45,9 @@ PHASE_COMMANDS = {
     "verdict": {"success", "failure", "skip"},
 }
 RENDER_HZ, CHECK_HZ = 10.0, 3.0
-WHITE, BLUE, ORANGE, GREEN, RED, YELLOW, CYAN = (
-    (255, 255, 255), (255, 120, 30), (0, 140, 255), (0, 210, 0), (0, 0, 255), (0, 255, 255), (255, 255, 0))
+WHITE, BLUE, ORANGE, GREEN, RED, YELLOW, CYAN, MAGENTA = (
+    (255, 255, 255), (255, 120, 30), (0, 140, 255), (0, 210, 0), (0, 0, 255), (0, 255, 255), (255, 255, 0),
+    (255, 0, 255))
 
 
 class _Tee:
@@ -367,6 +368,8 @@ class RecordUI:
                 ov = dict(x=round(o[0], 3), y=round(o[1], 3), match=o[2], x_ok=x_ok, y_ok=y_ok, in_white=o_white,
                           cell=qc.oven_cell(o[1], geo))
             live["oven"] = ov
+            if c and ov:
+                c["door_gap"] = round(qc.door_gap(c["x"], c["y"], ov["x"], ov["y"]), 3)
         else:
             ov = self._state.get("live", {}).get("oven")
         if ov:
@@ -376,6 +379,24 @@ class RecordUI:
             uv = qc.box_outline(box, geo.table_z, geo).round().astype(np.int32)
             cv2.polylines(v, [uv], True, (0, 0, 0), 4, cv2.LINE_AA)
             cv2.polylines(v, [uv], True, colour, 2, cv2.LINE_AA)
+            # where the open door lands (shaded) and the margin the croissant keeps from it
+            door = qc.door_box(ov["x"], ov["y"])
+            shade = v.copy()
+            cv2.fillPoly(shade, [qc.box_outline(door, geo.table_z, geo, n=2).round().astype(np.int32)], MAGENTA)
+            cv2.addWeighted(shade, 0.3, v, 0.7, 0, dst=v)
+            uv = qc.round_box_outline(door, qc.DOOR_MARGIN, geo.table_z, geo).round().astype(np.int32)
+            cv2.polylines(v, [uv], True, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.polylines(v, [uv], True, MAGENTA, 2, cv2.LINE_AA)
+        if ov and ov.get("cell") is not None:  # croissant starts of the successes with the oven in this bin
+            with self._lock:
+                past = [r["croissant"] for r in self._results.values()
+                        if r.get("label") == "success" and r.get("croissant") and r.get("oven")
+                        and qc.oven_cell(r["oven"][1], geo) == ov["cell"]]
+            if past:
+                P = np.c_[np.array(past, float), np.full(len(past), geo.table_z + qc.CRO_COM_Z)]
+                for u, w in qc.project(P, geo.T, geo.K).round().astype(int):
+                    cv2.circle(v, (int(u), int(w)), 5, (0, 0, 0), -1, cv2.LINE_AA)
+                    cv2.circle(v, (int(u), int(w)), 3, YELLOW, -1, cv2.LINE_AA)
         if c:
             uv = qc.project(np.array([[c["x"], c["y"], geo.table_z + qc.CRO_COM_Z]]), geo.T, geo.K)[0]
             colour = GREEN if c["in_blue"] and c["in_white"] else RED
@@ -475,7 +496,8 @@ class RecordUI:
             oy0, oy1 = self._geo.oven_region[2], self._geo.oven_region[3]
             self._state.update(oven_coverage=O.tolist(), oven_outside=o_out,
                                oven_grid=np.linspace(oy1, oy0, qc.OVEN_GRID + 1).round(3).tolist(),
-                               oven_sim_x=round((self._geo.oven_region[0] + self._geo.oven_region[1]) / 2, 3))
+                               oven_sim_x=round((self._geo.oven_region[0] + self._geo.oven_region[1]) / 2, 3),
+                               door=dict(box=list(qc.OPEN_DOOR), margin=qc.DOOR_MARGIN, radius=qc.CRO_RADIUS))
             bx0, bx1, by0, by1 = self._geo.blue
             checked = [e for e in eps if not e["qc_pending"]]
             self._state.update(episodes=eps, coverage=G.tolist(), coverage_outside=outside,

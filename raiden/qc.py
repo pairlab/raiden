@@ -15,7 +15,8 @@ Used by ``scripts/qc_episodes.py`` (a watcher) and by ``rd record --ui``. For on
 * duration: outside ``min_s``/``max_s``, or far from the median of the other episodes.
 
 The placement limits come from the vla-benchmark twin (rig.json, layout.json and the task JSON), so the checks follow
-the sim's spawn regions.
+the sim's spawn regions. The scene camera that draws and reads them is the calibration file's (the twin's rig.json pose
+only as a fallback), so a re-calibrated camera moves the overlay with it.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 
+from raiden._config import CALIBRATION_FILE
 from raiden.camera_config import CameraConfig
 from raiden.cameras.realsense import RealSenseCamera
 
@@ -43,6 +45,11 @@ OVEN_FOOTPRINT = (-0.1518, 0.1100, -0.1937, 0.1930)  # x, y extents about the ov
 OVEN_KNOB_FACES = np.array([[-0.129, -0.150, 0.165], [-0.129, -0.150, 0.115], [-0.129, -0.150, 0.065]])
 OVEN_X_TOL = 0.015  # real oven x may differ this much from the sim's fixed x
 OVEN_GRID = 5  # bins over the sim's oven y range
+# The dropped door's footprint about the oven origin at yaw 0 (base frame): oven.xml's hinge is 0.110 in front of the
+# origin and the door's far edge 0.268; its width (model x -0.1725..0.1075) is base y -0.1075..0.1725. It matches the
+# real open door in the scene camera (10-21 episodes 0021, 0074, 0090).
+OPEN_DOOR = (-0.268, -0.110, -0.1075, 0.1725)
+DOOR_MARGIN = 0.02  # croissant edge to the open door; the 22 croissants of 10-21 in front of the door kept >= 26 mm
 STILL_RAD_S = 0.02
 QC_VERSION = 3  # results from an older version are checked again (2: oven position, 3: oven moved, 1 close)
 GRID_X, GRID_Y = 3, 6
@@ -74,7 +81,25 @@ class Geometry:
     K: np.ndarray = field(repr=False)
 
 
-def load_geometry(vla: Path = VLA_DEFAULT) -> Geometry:
+def scene_camera(calibration: Path, rig: dict) -> Tuple[np.ndarray, np.ndarray]:
+    """(T_base_cam, K) of the scene camera from the calibration file, else the twin's rig.json.
+
+    The calibration file is the one ``rd record`` copies into each episode (re-solved from the ChArUco page before a
+    session, vla-benchmark scripts/real_eval/page_calib.py); rig.json keeps the pose the twin was built with.
+    """
+    calib = Path(calibration)
+    if calib.exists():
+        sc = json.loads(calib.read_text()).get("cameras", {}).get("scene_camera", {})
+        ex = sc.get("extrinsics") or {}
+        if "rotation_matrix" in ex and "camera_matrix" in sc.get("intrinsics", {}):
+            T = np.eye(4)
+            T[:3, :3], T[:3, 3] = ex["rotation_matrix"], np.ravel(ex["translation_vector"])
+            return T, np.array(sc["intrinsics"]["camera_matrix"])
+    cam = rig["cameras"]["scene_camera"]
+    return np.array(cam["T_base_cam"]), np.array(cam["K"])
+
+
+def load_geometry(vla: Path = VLA_DEFAULT, calibration: Path = Path(CALIBRATION_FILE)) -> Geometry:
     rigd = Path(vla) / "mesa/task_suites/rigs/raiden_lab"
     rig, lay = json.load(open(rigd / "rig.json")), json.load(open(rigd / "layout.json"))
     (tx0, tx1), (ty0, ty1) = lay["table"]["atlas"]["x_range"], lay["table"]["atlas"]["y_range"]
@@ -82,14 +107,14 @@ def load_geometry(vla: Path = VLA_DEFAULT) -> Geometry:
     regions = json.load(open(Path(vla) / TASK_JSON))["regions"]
     x0, y0, x1, y1 = regions["table_object_0_init_region"]["ranges"][0]
     ox0, oy0, ox1, oy1 = regions["table_articulated_object_init_region"]["ranges"][0]
-    cam = rig["cameras"]["scene_camera"]
+    T, K = scene_camera(calibration, rig)
     return Geometry(
         white=(tx0 + 6 * IN, tx1, ty0 + 13 * IN, ty1 - 13 * IN),
         blue=(x0 + tc[0] - COM_MARGIN, x1 + tc[0] + COM_MARGIN, y0 + tc[1] - COM_MARGIN, y1 + tc[1] + COM_MARGIN),
         orange=(ox0 + tc[0] + OVEN_FOOTPRINT[0], ox1 + tc[0] + OVEN_FOOTPRINT[1],
                 oy0 + tc[1] + OVEN_FOOTPRINT[2], oy1 + tc[1] + OVEN_FOOTPRINT[3]),
         oven_region=(ox0 + tc[0], ox1 + tc[0], oy0 + tc[1], oy1 + tc[1]),
-        table_z=float(rig["table"]["z_in_base_at_origin"]), T=np.array(cam["T_base_cam"]), K=np.array(cam["K"]))
+        table_z=float(rig["table"]["z_in_base_at_origin"]), T=T, K=K)
 
 
 def project(P: np.ndarray, T: np.ndarray, K: np.ndarray) -> np.ndarray:
@@ -103,6 +128,15 @@ def box_outline(box, z: float, geo: Geometry, n: int = 60) -> np.ndarray:
     c = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]])
     e = np.linspace(0, 1, n)[:, None]
     pts = np.concatenate([a + e * (b - a) for a, b in zip(c[:-1], c[1:])])
+    return project(np.c_[pts, np.full(len(pts), z)], geo.T, geo.K)
+
+
+def round_box_outline(box, r: float, z: float, geo: Geometry, n: int = 12) -> np.ndarray:
+    """Pixel polyline of the points within r of a base-frame box (round corners) on the plane at height z."""
+    x0, x1, y0, y1 = box
+    a = np.linspace(0, np.pi / 2, n)
+    pts = np.concatenate([np.c_[cx + r * np.cos(a + k * np.pi / 2), cy + r * np.sin(a + k * np.pi / 2)]
+                          for k, (cx, cy) in enumerate(((x1, y1), (x0, y1), (x0, y0), (x1, y0)))])
     return project(np.c_[pts, np.full(len(pts), z)], geo.T, geo.K)
 
 
@@ -171,7 +205,23 @@ def croissant_position(img: np.ndarray, geo: Geometry) -> Optional[Tuple[float, 
     return float(p[0]), float(p[1]), int(st[k, 4])
 
 
-_KNOB_TEMPLATE = Path(__file__).with_name("oven_knob_face.png")  # 25 x 25 px, the top knob face in the scene camera
+# 25 x 25 px knob faces in the scene camera: a column per face of OVEN_KNOB_FACES (top, middle, bottom), a row per oven
+# position they were cut at (10-21 episodes 0112, 0180, 0202: oven y -0.098, +0.031, +0.088). Each face is matched
+# against its own column. Until 10-22 the top face (oven_knob_face.png) stood in for all three: the lower faces matched
+# it at ~0.45, so the oven at the robot's left fell under min_score.
+_KNOB_TEMPLATES = Path(__file__).with_name("oven_knob_faces.png")
+_KNOB_PX = 25
+_knob_sheet: Optional[np.ndarray] = None
+
+
+def _knob_maps(gray: np.ndarray) -> List[np.ndarray]:
+    """Per knob face, the best normalised cross-correlation of its templates at every template position."""
+    global _knob_sheet
+    if _knob_sheet is None:
+        _knob_sheet = cv2.imread(str(_KNOB_TEMPLATES), cv2.IMREAD_GRAYSCALE)
+    t, n = _knob_sheet, _KNOB_PX
+    return [np.max([cv2.matchTemplate(gray, t[r:r + n, i * n:(i + 1) * n], cv2.TM_CCOEFF_NORMED)
+                    for r in range(0, t.shape[0], n)], axis=0) for i in range(len(OVEN_KNOB_FACES))]
 
 
 def _sample(m: np.ndarray, uv: np.ndarray, half: int) -> np.ndarray:
@@ -183,20 +233,20 @@ def _sample(m: np.ndarray, uv: np.ndarray, half: int) -> np.ndarray:
     return out
 
 
-def oven_position(img: np.ndarray, geo: Geometry, min_score: float = 0.55) -> Optional[Tuple[float, float, float]]:
+def oven_position(img: np.ndarray, geo: Geometry, min_score: float = 0.65) -> Optional[Tuple[float, float, float]]:
     """Oven origin (x, y) in the base frame at yaw 0, and the mean knob match, from the three knob faces.
 
-    A real knob-face template is correlated over the image (normalised cross-correlation). Every oven position on a
-    3 mm grid over the table is scored by the best match within 4 px of each of its three projected faces (the model
-    and the real knobs differ by ~3 px), the weakest face counting double so one bright spot cannot win. The pose is
-    then solved from the three matched face pixels by least squares. None if the mean match is below min_score (oven
-    not in view or occluded).
+    Each face's templates (real frames) are correlated over the image (normalised cross-correlation). Every oven
+    position on a 3 mm grid over the table is scored by the best match within 4 px of each of its three projected faces
+    (the model and the real knobs differ by ~3 px), the weakest face counting double so one bright spot cannot win. The
+    pose is then solved from the three matched face pixels by least squares. None if the mean match is below min_score
+    (oven not in view or occluded). On the 10-21 episodes the oven in view scores >= 0.73 (0.85 before the arm moves
+    in), the same frames with its knobs painted out <= 0.54.
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    tpl = cv2.imread(str(_KNOB_TEMPLATE), cv2.IMREAD_GRAYSCALE)
-    half = tpl.shape[0] // 2
-    ncc = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
-    near = cv2.dilate(ncc, np.ones((9, 9), np.uint8))  # best match within 4 px
+    half = _KNOB_PX // 2
+    nccs = _knob_maps(gray)
+    nears = [cv2.dilate(m, np.ones((9, 9), np.uint8)) for m in nccs]  # best match within 4 px
 
     def faces(c):
         return [project(np.c_[c[:, 0] + f[0], c[:, 1] + f[1], np.full(len(c), geo.table_z + f[2])], geo.T, geo.K)
@@ -204,16 +254,16 @@ def oven_position(img: np.ndarray, geo: Geometry, min_score: float = 0.55) -> Op
 
     X, Y = np.meshgrid(np.arange(0.68, 0.88, 0.003), np.arange(-0.17, 0.17, 0.003), indexing="ij")
     c = np.stack([X.ravel(), Y.ravel()], 1)
-    per = np.stack([_sample(near, uv, half) for uv in faces(c)], 1)
+    per = np.stack([_sample(m, uv, half) for m, uv in zip(nears, faces(c))], 1)
     k = int(np.argmax(per.mean(1) + per.min(1)))
     score = float(per[k].mean())
     if score < min_score:
         return None
     # the matched face pixels: the correlation peak within 4 px of each predicted face
     peaks = []
-    for uv in faces(c[k:k + 1]):
+    for m, uv in zip(nccs, faces(c[k:k + 1])):
         u0, v0 = int(round(uv[0, 0])) - half, int(round(uv[0, 1])) - half
-        win = ncc[max(v0 - 4, 0):v0 + 5, max(u0 - 4, 0):u0 + 5]
+        win = m[max(v0 - 4, 0):v0 + 5, max(u0 - 4, 0):u0 + 5]
         dv, du = np.unravel_index(int(np.argmax(win)), win.shape)
         peaks.append((max(u0 - 4, 0) + du + half, max(v0 - 4, 0) + dv + half))
     peaks = np.array(peaks, float)
@@ -318,6 +368,21 @@ def oven_cell(y: float, geo: Geometry) -> Optional[int]:
     oy0, oy1 = geo.oven_region[2], geo.oven_region[3]
     j = int(np.floor((oy1 - y) / (oy1 - oy0) * OVEN_GRID))  # 0 = the robot's left (+y)
     return j if 0 <= j < OVEN_GRID else None
+
+
+def door_box(ox: float, oy: float) -> Tuple[float, float, float, float]:
+    """The open door's footprint (x0, x1, y0, y1) for the oven origin at (ox, oy), yaw 0."""
+    d = OPEN_DOOR
+    return ox + d[0], ox + d[1], oy + d[2], oy + d[3]
+
+
+def door_gap(x: float, y: float, ox: float, oy: float) -> float:
+    """Gap (m) between the croissant (centre of mass x, y; CRO_RADIUS footprint) and the open door's footprint for the
+    oven at (ox, oy); negative where they overlap."""
+    x0, x1, y0, y1 = door_box(ox, oy)
+    dx, dy = max(x0 - x, x - x1, 0.0), max(y0 - y, y - y1, 0.0)
+    d = np.hypot(dx, dy) if dx or dy else -min(x - x0, x1 - x, y - y0, y1 - y)
+    return float(d - CRO_RADIUS)
 
 
 def croissant_verdict(x: float, y: float, geo: Geometry) -> Tuple[bool, bool]:
