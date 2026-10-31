@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from multiprocessing.connection import Client
-from typing import Any, Tuple
+from typing import Any
 
 # NOT 5555: adb scans localhost 5554-5585 for emulators and its handshake wedges
 # multiprocessing.connection's authkey exchange, killing the server's accept loop.
@@ -12,7 +12,7 @@ DEFAULT_ADDRESS = "127.0.0.1:5599"
 _AUTHKEY = b"raiden-sim"
 
 
-def parse_address(address: str) -> Tuple[str, int]:
+def parse_address(address: str) -> tuple[str, int]:
     address = address or DEFAULT_ADDRESS
     if address in ("1", "true", "sim"):
         address = DEFAULT_ADDRESS
@@ -52,3 +52,23 @@ class SimConnection:
             self._conn.close()
         except OSError:
             pass
+
+
+def select_physics_level(address: str, level: str) -> dict:
+    """Select a server-owned overlay before starting the ordinary teleop/recorder."""
+    if not address:
+        raise ValueError("--physics-level requires --sim")
+    if level not in ("L0", "L1", "L2", "L3"):
+        raise ValueError("physics level must be L0, L1, L2, or L3")
+    connection = SimConnection(address)
+    try:
+        paused = connection.call("is_paused")
+        try:
+            connection.call("set_paused", paused=True)
+            selected = connection.call("set_ablation_level", level=level)
+            print(f"Simulator physics: {selected['level']}")
+            return selected
+        finally:
+            connection.call("set_paused", paused=paused)
+    finally:
+        connection.close()

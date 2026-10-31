@@ -21,12 +21,19 @@ class ActionLog:
 
     def __init__(self, address: str = DEFAULT_ADDRESS):
         self._c = SimConnection(address)
+        self._accepts_outcome = False
 
     def start(self) -> None:
-        self._c.call("start_action_log")
+        result = self._c.call("start_action_log")
+        if isinstance(result, dict):
+            self._accepts_outcome = result.get("metadata", {}).get("native_attempts", {}).get("accepts_outcome", False)
+
+    def _stop(self, outcome):
+        kwargs = {"outcome": outcome} if self._accepts_outcome else {}
+        return self._c.call("stop_action_log", **kwargs)
 
     def save(self, episode_dir: Path) -> None:
-        log = self._c.call("stop_action_log")
+        log = self._stop("operator_success")
         if not isinstance(log, dict) or not log:
             raise RuntimeError("simulator returned no native action log")
         dest = Path(episode_dir)
@@ -53,7 +60,7 @@ class ActionLog:
         np.savez_compressed(str(dest / FILENAME), **arrays)
 
     def discard(self) -> None:
-        self._c.call("stop_action_log")
+        self._stop("operator_failure")
 
     def close(self) -> None:
         self._c.close()

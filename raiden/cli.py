@@ -13,7 +13,6 @@ from raiden._config import (
     CALIBRATION_POSES_FILE,
     CAMERA_CONFIG,
     SPACEMOUSE_CONFIG,
-    WEIGHTS_DIR,
 )
 from raiden.calibration.recorder import run_calibration_pose_recording
 from raiden.calibration.runner import CalibrationRunner
@@ -85,6 +84,9 @@ class TeleopCommand:
     sim: str = ""
     """Drive the MESA digital twin instead of the robot: address of a running raiden_sim_server (e.g. 127.0.0.1:5599)"""
 
+    physics_level: Optional[Literal["L0", "L1", "L2", "L3"]] = None
+    """Sim only: select the versioned physics level before teleoperation. Server default is L0."""
+
 
 @dataclass
 class RecordCommand:
@@ -132,6 +134,9 @@ class RecordCommand:
     sim: str = ""
     """Drive the MESA digital twin instead of the robot: address of a running raiden_sim_server (e.g. 127.0.0.1:5599).
     Every episode records from a scene reset; success saves it, failure discards it, both reset the scene"""
+
+    physics_level: Optional[Literal["L0", "L1", "L2", "L3"]] = None
+    """Sim only: select the versioned physics level before recording. Server default is L0."""
 
     arms: Literal["bimanual", "single"] = "bimanual"
     """Which arms to use: both (bimanual) or left arm only (single)"""
@@ -481,6 +486,10 @@ def main():
                     spacemouse_path_l=sm.get("path_l", "/dev/hidraw6"),
                 ),
             )
+            if command.physics_level is not None:
+                from raiden.sim.client import select_physics_level
+
+                select_physics_level(command.sim, command.physics_level)
             run_bimanual_teleop(
                 bilateral_kp=command.bilateral_kp,
                 control=command.control,
@@ -508,6 +517,10 @@ def main():
                     spacemouse_path_l=sm.get("path_l", "/dev/hidraw6"),
                 ),
             )
+            if command.physics_level is not None:
+                from raiden.sim.client import select_physics_level
+
+                select_physics_level(command.sim, command.physics_level)
             run_recording(
                 s3_bucket=command.s3_bucket,
                 s3_prefix=command.s3_prefix,

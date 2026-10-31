@@ -140,6 +140,59 @@ def check_collection(tmp_path, fail_method=None):
 
 
 class SimCollectionTest(unittest.TestCase):
+    def test_operator_verdict_is_sent_only_when_the_server_supports_it(self):
+        calls = []
+
+        def call(method, **kwargs):
+            calls.append((method, kwargs))
+            if method == "start_action_log":
+                return {"metadata": {"native_attempts": {"accepts_outcome": True}}}
+
+        with patch("raiden.sim.action_log.SimConnection", return_value=SimpleNamespace(call=call)):
+            log = ActionLog()
+            log.start()
+            log.discard()
+        self.assertEqual(calls[-1], ("stop_action_log", {"outcome": "operator_failure"}))
+
+    def test_physics_level_selection_restores_pause_and_rejects_hardware(self):
+        from raiden.sim.client import select_physics_level
+
+        with self.assertRaisesRegex(ValueError, "requires --sim"):
+            select_physics_level("", "L2")
+        calls = []
+        connection = SimpleNamespace(close=lambda: calls.append("close"))
+
+        def call(method, **kwargs):
+            calls.append((method, kwargs))
+            if method == "is_paused":
+                return False
+            if method == "set_ablation_level":
+                return {"level": "L2", "values_sha256": "a" * 64}
+
+        connection.call = call
+        with patch("raiden.sim.client.SimConnection", return_value=connection):
+            self.assertEqual(select_physics_level("127.0.0.1:5599", "L2")["level"], "L2")
+        self.assertEqual(calls[-2:], [("set_paused", {"paused": False}), "close"])
+
+    def test_sim_follower_preserves_profile_gains_at_controller_startup(self):
+        from raiden.sim.follower import SimFollower
+
+        gains = np.arange(6) + 1.
+        calls = []
+
+        def call(method, **kwargs):
+            if method == "get_kp_kd":
+                return gains, gains * .1
+            if method == "get_metadata":
+                return {"physics_ablation": {"level": "L3"}}
+            calls.append((method, kwargs))
+
+        with patch("raiden.sim.follower.SimConnection", return_value=SimpleNamespace(call=call)):
+            follower = SimFollower()
+            follower.update_kp_kd(np.ones(7) * 80, np.ones(7) * 5)
+        np.testing.assert_array_equal(calls[-1][1]["kp"][:6], gains)
+        np.testing.assert_array_equal(calls[-1][1]["kd"][:6], gains * .1)
+
     def test_first_save_and_discard_starts_capture_after_fresh_reset(self):
         with tempfile.TemporaryDirectory() as directory:
             check_collection(Path(directory))

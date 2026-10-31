@@ -53,10 +53,13 @@ def validate_server(conn, episode: Path, *, allow_scene_change=False) -> dict:
         "twin_input_sha256", "scene", "calibration_sha256", "implementation_sha256",
         "controller", "torque_limits_Nm", "finger_stops_m", "finger_target",
         "joint_limits_rad", "joint_limit_margin_rad", "gravity_implementation",
+        "physics_ablation",
     )
     mismatches = []
     for key in identifiers:
         if key not in metadata:
+            if key == "physics_ablation" and key in live:
+                mismatches.append(key)
             continue
         recorded, current = metadata[key], live.get(key)
         if key == "scene":

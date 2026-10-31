@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Dict
-
 import numpy as np
 
 from raiden.sim.client import DEFAULT_ADDRESS, SimConnection
@@ -22,6 +20,7 @@ class SimFollower:
         kp, kd = self._c.call("get_kp_kd")
         self._kp = np.concatenate([np.asarray(kp, dtype=np.float64)[:6], [_GRIPPER_KP]])
         self._kd = np.concatenate([np.asarray(kd, dtype=np.float64)[:6], [_GRIPPER_KD]])
+        self._physics_level = self._c.call("get_metadata").get("physics_ablation", {}).get("level")
         self.gravity_comp_factor = 1.0
 
     # -- i2rt Robot API ---------------------------------------------------
@@ -31,7 +30,7 @@ class SimFollower:
     def get_joint_pos(self) -> np.ndarray:
         return np.asarray(self._c.call("get_joint_pos"), dtype=np.float64)
 
-    def get_observations(self) -> Dict[str, np.ndarray]:
+    def get_observations(self) -> dict[str, np.ndarray]:
         obs = self._c.call("get_observations")
         return {k: np.asarray(v, dtype=np.float64) for k, v in obs.items()}
 
@@ -44,6 +43,13 @@ class SimFollower:
         kp = np.asarray(kp, dtype=np.float64).reshape(-1)
         kd = np.asarray(kd, dtype=np.float64).reshape(-1)
         assert kp.shape == self._kp.shape == kd.shape
+        if self._physics_level is not None:
+            # RobotController initializes follower gains to hardware defaults.
+            # An explicitly selected simulator profile owns its arm gains.
+            if not (np.allclose(kp[:6], self._kp[:6]) and np.allclose(kd[:6], self._kd[:6])):
+                print(f"  Simulator {self._physics_level}: retaining the selected arm gains")
+            kp, kd = kp.copy(), kd.copy()
+            kp[:6], kd[:6] = self._kp[:6], self._kd[:6]
         self._kp, self._kd = kp.copy(), kd.copy()
         self._c.call("update_kp_kd", kp=kp, kd=kd)
 

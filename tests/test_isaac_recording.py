@@ -129,6 +129,30 @@ class IsaacRecordingTest(unittest.TestCase):
             REPLAY.validate_server(Live(), self.root)
         REPLAY.validate_server(Live(), self.root, allow_scene_change=True)
 
+    def test_replay_rejects_other_physics_level(self):
+        self.record()
+        metadata = json.loads((self.root / "sim_metadata.json").read_text())
+        metadata["physics_ablation"] = {"level": "L2", "compiled_sha256": "recorded"}
+        write_json(self.root / "sim_metadata.json", metadata)
+
+        class OtherLevel:
+            def call(self, method):
+                return {**metadata, "physics_ablation": {"level": "L3", "compiled_sha256": "other"}}
+
+        with self.assertRaisesRegex(ValueError, "physics_ablation"):
+            REPLAY.validate_server(OtherLevel(), self.root)
+
+    def test_replay_does_not_assume_unbound_legacy_data_matches_a_level(self):
+        self.record()
+        metadata = json.loads((self.root / "sim_metadata.json").read_text())
+
+        class BoundServer:
+            def call(self, method):
+                return {**metadata, "physics_ablation": {"level": "L3"}}
+
+        with self.assertRaisesRegex(ValueError, "physics_ablation"):
+            REPLAY.validate_server(BoundServer(), self.root)
+
     def test_replay_accepts_other_reset_realizations_but_keeps_scene_identity(self):
         self.record("states")
         metadata = json.loads((self.root / "sim_metadata.json").read_text())
