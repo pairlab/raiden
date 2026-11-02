@@ -48,7 +48,8 @@ rd record --control oculus --arms single --sim 127.0.0.1:5599 \
   --physics-level L1 --monitor --data-dir data/cvp35/L1
 ```
 
-`L0`–`L3` work with both `rd record` and `rd teleop`. The server must load the versioned
+`L0`–`L3` work with both `rd record` and `rd teleop`. Run the simulator server locally
+on the collection PC at port 5599; no SSH tunnel is needed. The server must load the versioned
 profile; [setup, measured levels and qualification](https://github.com/pairlab/vla-benchmark/blob/frank/cvp-35-physics-ablation/mesa_isaac/docs/physics_ablation.md)
 are documented in the simulator repository. Overlay servers retain discarded attempts and own their arm gains.
 
